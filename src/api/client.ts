@@ -36,6 +36,11 @@ export const api = {
     state: (id: string) => req<AgentState>(`/projects/${id}/state`),
     updateState: (id: string, data: Partial<AgentState>) =>
       req<AgentState>(`/projects/${id}/state`, { method: 'PATCH', body: JSON.stringify(data) }),
+    // AI 生成：透传当前所选 model/providerId（不传则后端回落到 default 旗舰）
+    generateSummary: (id: string, model?: string, providerId?: string) =>
+      req<{ summary: string }>(`/projects/${id}/generate-summary`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),
+    generateCover: (id: string, model?: string, providerId?: string) =>
+      req<{ cover: string }>(`/projects/${id}/generate-cover`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),
     messages: (id: string) => req<ChatMessage[]>(`/projects/${id}/messages`),
   },
   chapters: {

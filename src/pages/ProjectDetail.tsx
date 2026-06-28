@@ -40,7 +40,7 @@ const fmtDate = (t: number) => new Date(t).toLocaleString('zh-CN', {
 export default function ProjectDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { setCurrentProject, loadTasks } = useApp();
+  const { setCurrentProject, loadTasks, currentModel, currentProviderId } = useApp();
   const [project, setProject] = useState<Project | null>(null);
   const [tree, setTree] = useState<ChapterNode[]>([]);
   const [selected, setSelected] = useState<ChapterNode | null>(null);
@@ -117,7 +117,7 @@ export default function ProjectDetail() {
   // 改用 lastSavedTitleRef 在 load()/保存成功时更新，仅跟踪"服务端已持久化的标题"
   // 切到 大纲/状态 时若状态未加载则补拉
   useEffect(() => {
-    if ((tab === 'outline' || tab === 'state') && !agentState) loadState();
+    if ((tab === 'outline' || tab === 'state' || tab === 'brief') && !agentState) loadState();
   }, [tab, agentState, loadState]);
 
   // 联网搜索开关跟随项目配置
@@ -204,6 +204,55 @@ export default function ProjectDetail() {
       setProject(updated);
       setCurrentProject(updated);
       toast('已保存摘要');
+    } catch (e) { toast((e as Error).message, 'err'); }
+  };
+
+  // AI 生成摘要：基于项目信息调 LLM 生成一句话简介，落 project.summary
+  // 透传当前所选 model/providerId（不传则后端回落到 default 旗舰）
+  const [genSummaryBusy, setGenSummaryBusy] = useState(false);
+  const onGenerateSummary = async () => {
+    if (!project) return;
+    setGenSummaryBusy(true);
+    try {
+      const { summary: generated } = await api.projects.generateSummary(
+        project.id, currentModel || undefined, currentProviderId || undefined,
+      );
+      setSummary(generated);
+      const updated = await api.projects.get(project.id);
+      setProject(updated);
+      setCurrentProject(updated);
+      toast('已生成简介');
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setGenSummaryBusy(false); }
+  };
+
+  // AI 生成封面提示词：调 LLM 生成中英双段 prompt，落 agent_state.cover
+  const [coverDraft, setCoverDraft] = useState('');
+  const [genCoverBusy, setGenCoverBusy] = useState(false);
+  // 当 agentState 加载后，把 cover 同步到 coverDraft 供编辑
+  useEffect(() => { setCoverDraft(agentState?.cover || ''); }, [agentState?.cover]);
+  const onGenerateCover = async () => {
+    if (!project) return;
+    setGenCoverBusy(true);
+    try {
+      const { cover } = await api.projects.generateCover(
+        project.id, currentModel || undefined, currentProviderId || undefined,
+      );
+      setCoverDraft(cover);
+      // 同步本地 agentState（避免再次切 Tab 拉取）
+      setAgentState(s => s ? { ...s, cover } : s);
+      toast('已生成封面提示词');
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setGenCoverBusy(false); }
+  };
+  // 封面提示词失焦保存（走 PATCH /state）
+  const onBlurCover = async () => {
+    if (!project || !agentState) return;
+    if (coverDraft === agentState.cover) return;
+    try {
+      const updated = await api.projects.updateState(project.id, { cover: coverDraft });
+      setAgentState(updated);
+      toast('已保存封面提示词');
     } catch (e) { toast((e as Error).message, 'err'); }
   };
 
@@ -374,8 +423,48 @@ export default function ProjectDetail() {
                     <p className="font-display text-base text-paper">{project.title}</p>
                   </div>
                   <div>
-                    <p className="mb-1 text-[11px] uppercase tracking-wider text-paper-mute">项目摘要</p>
+                    <div className="mb-1 flex items-center justify-between">
+                      <p className="text-[11px] uppercase tracking-wider text-paper-mute">项目摘要</p>
+                      <button
+                        className="btn-ghost flex items-center gap-1 py-1 text-[11px] text-amber hover:text-amber-deep"
+                        onClick={onGenerateSummary}
+                        disabled={genSummaryBusy}
+                        title="基于项目信息 + 最近章节摘要 AI 生成一句话简介"
+                      >
+                        {genSummaryBusy ? <Spinner className="h-3 w-3" /> : <Sparkles size={12} />}
+                        {genSummaryBusy ? '生成中…' : 'AI 生成'}
+                      </button>
+                    </div>
                     <textarea className="input min-h-[110px] resize-y leading-relaxed" placeholder="一句话概括你的故事核心…" value={summary} onChange={e => setSummary(e.target.value)} onBlur={onBlurSummary} />
+                  </div>
+                  <div>
+                    <div className="mb-1 flex items-center justify-between">
+                      <p className="text-[11px] uppercase tracking-wider text-paper-mute">封面提示词</p>
+                      <button
+                        className="btn-ghost flex items-center gap-1 py-1 text-[11px] text-amber hover:text-amber-deep"
+                        onClick={onGenerateCover}
+                        disabled={genCoverBusy}
+                        title="基于项目信息 AI 生成中英双段封面绘图 prompt"
+                      >
+                        {genCoverBusy ? <Spinner className="h-3 w-3" /> : <Camera size={12} />}
+                        {genCoverBusy ? '生成中…' : 'AI 生成'}
+                      </button>
+                    </div>
+                    <textarea
+                      className="input min-h-[140px] resize-y font-mono text-xs leading-relaxed"
+                      placeholder="点击「AI 生成」产生封面提示词（中文描述 + 英文 Prompt），可直接复制到 SD/MJ 使用…"
+                      value={coverDraft}
+                      onChange={e => setCoverDraft(e.target.value)}
+                      onBlur={onBlurCover}
+                    />
+                    {coverDraft && (
+                      <div className="mt-1 flex justify-end">
+                        <button
+                          className="text-[10px] text-paper-mute hover:text-amber"
+                          onClick={() => { navigator.clipboard?.writeText(coverDraft); toast('已复制到剪贴板'); }}
+                        >复制全部</button>
+                      </div>
+                    )}
                   </div>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <div>
