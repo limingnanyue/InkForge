@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# pnpm 本地缓存（不应入库）
+.pnpm-store
+pnpm-store
+
 # 运行时数据
 api/data
 data
