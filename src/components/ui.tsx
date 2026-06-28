@@ -1,0 +1,126 @@
+/**
+ * 通用 UI 组件集
+ */
+import { useEffect, useState, useCallback, type ReactNode } from 'react';
+import { Loader2, X } from 'lucide-react';
+import { cn } from '@/lib/utils';
+
+// 旋转加载
+export function Spinner({ className }: { className?: string }) {
+  return <Loader2 className={cn('animate-spin', className)} />;
+}
+
+// 进度环（字数占比）
+export function ProgressRing({ value, size = 40, stroke = 3, label }: { value: number; size?: number; stroke?: number; label?: string }) {
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const offset = c - Math.min(1, Math.max(0, value)) * c;
+  return (
+    <div className="relative inline-flex items-center justify-center" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="-rotate-90">
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="var(--ink-400)" strokeWidth={stroke} />
+        <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="var(--amber)" strokeWidth={stroke}
+          strokeDasharray={c} strokeDashoffset={offset} strokeLinecap="round" style={{ transition: 'stroke-dashoffset 0.6s ease' }} />
+      </svg>
+      {label && <span className="absolute text-[10px] font-mono text-paper-dim">{label}</span>}
+    </div>
+  );
+}
+
+// 进度条
+export function ProgressBar({ value, className }: { value: number; className?: string }) {
+  return (
+    <div className={cn('h-1.5 w-full overflow-hidden rounded-full', className)} style={{ background: 'var(--ink-500)' }}>
+      <div className="h-full rounded-full transition-all duration-500"
+        style={{ width: `${Math.min(100, value * 100)}%`, background: 'linear-gradient(90deg, var(--amber-deep), var(--amber))' }} />
+    </div>
+  );
+}
+
+// 字数格式化
+export function fmtWords(n: number): string {
+  if (n >= 10000) return `${(n / 10000).toFixed(1)}万`;
+  return `${n}`;
+}
+
+// 时间相对
+export function fmtTime(t: number): string {
+  const diff = Date.now() - t;
+  if (diff < 60000) return '刚刚';
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}分钟前`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}小时前`;
+  return `${Math.floor(diff / 86400000)}天前`;
+}
+
+// 空状态
+export function EmptyState({ icon, title, desc, action }: { icon?: ReactNode; title: string; desc?: string; action?: ReactNode }) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center animate-fade-in">
+      {icon && <div className="text-paper-mute opacity-50">{icon}</div>}
+      <h3 className="font-display text-xl text-paper-dim">{title}</h3>
+      {desc && <p className="max-w-sm text-sm text-paper-mute">{desc}</p>}
+      {action && <div className="mt-2">{action}</div>}
+    </div>
+  );
+}
+
+// 模态框
+export function Modal({ open, onClose, title, children, className }: { open: boolean; onClose: () => void; title?: string; children: ReactNode; className?: string }) {
+  useEffect(() => {
+    if (!open) return;
+    const h = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [open, onClose]);
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(8,6,4,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+      <div className={cn('panel-elevated w-full max-w-lg animate-pop-in p-6 shadow-2xl', className)} onClick={e => e.stopPropagation()}>
+        {title && (
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="font-display text-lg text-paper">{title}</h2>
+            <button onClick={onClose} className="text-paper-mute hover:text-paper transition-colors"><X size={18} /></button>
+          </div>
+        )}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// 确认提示（轻量 toast）
+export function useToast() {
+  const [msg, setMsg] = useState<{ text: string; kind: 'ok' | 'err' } | null>(null);
+  useEffect(() => {
+    if (!msg) return;
+    const t = setTimeout(() => setMsg(null), 3000);
+    return () => clearTimeout(t);
+  }, [msg]);
+  // F1 修复：toast 用 useCallback 包裹，依赖稳定的 setMsg（useState setter 永远稳定）
+  // 原写法每次 render 都返回新函数引用 → 下游所有把 toast 写进 useCallback/useEffect 依赖的组件
+  // 会陷入「每次 render 都重跑 effect」的死循环，触发 SSE 反复 close/reopen、loadProjects/loadTasks 无限重发
+  const toast = useCallback((text: string, kind: 'ok' | 'err' = 'ok') => setMsg({ text, kind }), []);
+  const node = msg && (
+    <div className="fixed bottom-6 left-1/2 z-[60] -translate-x-1/2 animate-fade-up">
+      <div className={cn('rounded-md px-4 py-2.5 text-sm shadow-xl', msg.kind === 'ok' ? 'badge-green' : 'badge-red')} style={{ borderWidth: 1 }}>
+        {msg.text}
+      </div>
+    </div>
+  );
+  return { toast, node };
+}
+
+// 标签页
+export function Tabs({ tabs, active, onChange }: { tabs: { id: string; label: string }[]; active: string; onChange: (id: string) => void }) {
+  return (
+    <div className="flex gap-1 border-b" style={{ borderColor: 'var(--ink-500)' }}>
+      {tabs.map(t => (
+        <button key={t.id} onClick={() => onChange(t.id)}
+          className={cn('relative px-4 py-2.5 text-sm font-medium transition-colors', active === t.id ? 'text-amber' : 'text-paper-mute hover:text-paper-dim')}>
+          {t.label}
+          {active === t.id && <span className="absolute bottom-0 left-0 right-0 h-0.5" style={{ background: 'var(--amber)' }} />}
+        </button>
+      ))}
+    </div>
+  );
+}

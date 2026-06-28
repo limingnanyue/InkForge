@@ -1,0 +1,240 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   InkForge 墨铸 · 文人书房暗色工作室设计系统
+   ============================================================ */
+:root {
+  /* 墨色底（带暖色温的深炭黑） */
+  --ink-900: #0E0B08;
+  --ink-800: #14100B;
+  --ink-700: #1A1410;
+  --ink-600: #241A14;
+  --ink-500: #2E2519;
+  --ink-400: #3A2E1F;
+  /* 旧纸暖白 */
+  --paper: #F5E6C8;
+  --paper-dim: #D8C39A;
+  --paper-mute: #8A7A5A;
+  /* 灯下琥珀金 */
+  --amber: #D4A534;
+  --amber-bright: #E8BE4A;
+  --amber-mid: #C8961E;
+  --amber-deep: #8B6914;
+  /* 次强调 */
+  --cinnabar: #B23A48;  /* 朱砂红 */
+  --celadon: #5A8A6A;   /* 青瓷绿 */
+
+  --font-serif: 'Fraunces', 'Noto Serif SC', Georgia, serif;
+  --font-sans: 'Manrope', 'Noto Sans SC', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--ink-900);
+  color: var(--paper);
+  font-family: var(--font-sans);
+  font-feature-settings: 'ss01', 'cv01';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+/* 滚动条 —— 细琥珀金 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--ink-400); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--amber-deep); }
+
+/* 文本选区 */
+::selection { background: rgba(212, 165, 52, 0.3); color: var(--paper); }
+
+/* ===== 组件层 ===== */
+@layer components {
+  /* 衬线标题 */
+  .font-display { font-family: var(--font-serif); font-feature-settings: 'ss01'; }
+  .font-mono { font-family: var(--font-mono); }
+
+  /* 主按钮：琥珀金实底 + 内发光 */
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-5 py-2.5 text-sm font-medium transition-all duration-200;
+    background: linear-gradient(180deg, var(--amber-bright), var(--amber));
+    color: var(--ink-900);
+    box-shadow: 0 0 0 1px var(--amber-deep), 0 2px 12px -2px rgba(212, 165, 52, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+  .btn-primary:hover { box-shadow: 0 0 0 1px var(--amber), 0 4px 20px -2px rgba(212, 165, 52, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.3); transform: translateY(-1px); }
+  .btn-primary:active { transform: translateY(0); }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  /* 次按钮：描边透明 */
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-medium transition-all duration-200;
+    background: transparent;
+    color: var(--paper-dim);
+    border: 1px solid var(--ink-400);
+  }
+  .btn-ghost:hover { color: var(--amber); border-color: var(--amber-deep); background: rgba(212, 165, 52, 0.05); }
+
+  /* 面板 */
+  .panel {
+    background: var(--ink-800);
+    border: 1px solid var(--ink-500);
+    border-radius: 8px;
+  }
+  .panel-elevated {
+    background: linear-gradient(180deg, var(--ink-700), var(--ink-800));
+    border: 1px solid var(--ink-400);
+    border-radius: 8px;
+  }
+
+  /* 输入框 */
+  .input {
+    @apply w-full rounded-md px-3.5 py-2.5 text-sm transition-colors duration-150;
+    background: var(--ink-900);
+    border: 1px solid var(--ink-400);
+    color: var(--paper);
+  }
+  .input:focus { outline: none; border-color: var(--amber-deep); box-shadow: 0 0 0 3px rgba(212, 165, 52, 0.12); }
+  .input::placeholder { color: var(--paper-mute); }
+
+  /* 标签徽标 */
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded px-2 py-0.5 text-xs font-medium;
+  }
+  .badge-amber { background: rgba(212, 165, 52, 0.12); color: var(--amber); border: 1px solid rgba(212, 165, 52, 0.25); }
+  .badge-green { background: rgba(90, 138, 106, 0.12); color: var(--celadon); border: 1px solid rgba(90, 138, 106, 0.3); }
+  .badge-red { background: rgba(178, 58, 72, 0.12); color: var(--cinnabar); border: 1px solid rgba(178, 58, 72, 0.3); }
+  .badge-mute { background: var(--ink-600); color: var(--paper-mute); border: 1px solid var(--ink-400); }
+
+  /* 导航项 */
+  .nav-item {
+    @apply flex items-center gap-3 rounded-md px-3 py-2.5 text-sm font-medium transition-all duration-150;
+    color: var(--paper-mute);
+  }
+  .nav-item:hover { color: var(--paper-dim); background: var(--ink-700); }
+  .nav-item.active { color: var(--amber); background: rgba(212, 165, 52, 0.08); box-shadow: inset 2px 0 0 var(--amber); }
+}
+
+/* ============================================================
+   动效 —— react-bits 风格组件
+   ============================================================ */
+
+/* BlurText：标题模糊渐入 */
+@keyframes blur-in {
+  0% { filter: blur(12px); transform: translateY(8px); opacity: 0; }
+  100% { filter: blur(0); transform: translateY(0); opacity: 1; }
+}
+.animate-blur-in { animation: blur-in 0.9s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+/* 逐字渐入（用于标题字符） */
+@keyframes char-rise {
+  0% { filter: blur(8px); opacity: 0; transform: translateY(0.5em); }
+  100% { filter: blur(0); opacity: 1; transform: translateY(0); }
+}
+
+/* 流式打字光标 */
+@keyframes blink-caret {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.caret::after {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--amber);
+  animation: blink-caret 1s steps(2) infinite;
+}
+
+/* 进度条流光 */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, var(--amber-deep) 0%, var(--amber) 50%, var(--amber-deep) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 2s linear infinite;
+}
+
+/* 背景大气层：径向光晕 + 噪点 */
+.aura {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background:
+    radial-gradient(ellipse 60% 50% at 15% 0%, rgba(212, 165, 52, 0.08), transparent 60%),
+    radial-gradient(ellipse 50% 40% at 100% 100%, rgba(178, 58, 72, 0.05), transparent 60%),
+    radial-gradient(ellipse 80% 60% at 50% 120%, rgba(139, 105, 20, 0.06), transparent 60%);
+}
+.aura::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.4;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+}
+
+/* 渐入淡入 */
+@keyframes fade-up {
+  0% { opacity: 0; transform: translateY(12px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-up { animation: fade-up 0.5s ease-out both; }
+
+@keyframes fade-in {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+.animate-fade-in { animation: fade-in 0.4s ease-out both; }
+
+/* 缩放进入 */
+@keyframes pop-in {
+  0% { opacity: 0; transform: scale(0.96); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.animate-pop-in { animation: pop-in 0.3s ease-out both; }
+
+/* 浮动粒子背景（react-bits 风格） */
+@keyframes float-up {
+  0% { transform: translateY(100vh) translateX(0); opacity: 0; }
+  10% { opacity: 0.6; }
+  90% { opacity: 0.4; }
+  100% { transform: translateY(-10vh) translateX(20px); opacity: 0; }
+}
+
+/* 渐变文字 */
+.gradient-text {
+  background: linear-gradient(135deg, var(--amber-bright), var(--amber-deep) 80%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* 章节正文阅读样式 */
+.prose-ink {
+  font-family: var(--font-serif);
+  line-height: 2;
+  letter-spacing: 0.01em;
+  color: var(--paper);
+}
+.prose-ink p { text-indent: 2em; margin: 0 0 0.8em; }
+.prose-ink p:first-child { text-indent: 2em; }
+
+/* 响应式工具 */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }

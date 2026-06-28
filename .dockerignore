@@ -1,0 +1,19 @@
+# 任何不应进入镜像的内容
+node_modules
+.pnpm-store
+dist
+.git
+.gitignore
+.env
+.env.local
+.env.*.local
+*.log
+logs
+README.md
+.DS_Store
+.vscode
+.idea
+.trae
+.vercel
+api/data
+data
