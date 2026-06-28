@@ -19,8 +19,9 @@ const MAX_SHORT = 200_000;
  * - 复用项目现有大纲章节（若有），从第一个未完成章节续写
  * - 若项目无章节，daemon 会自动生成大纲后开始
  * 可被 generate 路由与 chat 路由（守护进程意图）共同调用
+ * model/providerId：可选，前端从全局 store currentModel/currentProviderId 透传
  */
-export function createContinueTask(projectId: string, webSearch?: boolean): { task: Task; project: Project } | null {
+export function createContinueTask(projectId: string, webSearch?: boolean, model?: string, providerId?: string): { task: Task; project: Project } | null {
   const project = projectRepo.get(projectId);
   if (!project) return null;
 
@@ -56,6 +57,9 @@ export function createContinueTask(projectId: string, webSearch?: boolean): { ta
       idea,
       title: project.title,
       webSearch: finalWebSearch,
+      // 任务级模型选择（不传则回落到 default provider 旗舰模型）
+      ...(model ? { model } : {}),
+      ...(providerId ? { providerId } : {}),
     },
   });
 
@@ -68,7 +72,7 @@ export function createContinueTask(projectId: string, webSearch?: boolean): { ta
 }
 
 router.post('/', (req: Request, res: Response) => {
-  const { projectId, title, kind, targetWords, config, idea, webSearch } = req.body || {};
+  const { projectId, title, kind, targetWords, config, idea, webSearch, model, providerId } = req.body || {};
   if (!kind || !['book', 'short'].includes(kind)) return fail(res, 'INVALID', 'kind 必须为 book 或 short');
 
   const limit = kind === 'book' ? MAX_BOOK : MAX_SHORT;
@@ -101,6 +105,9 @@ router.post('/', (req: Request, res: Response) => {
       idea: idea || config?.genre || project.title,
       title: project.title,
       webSearch: finalWebSearch,
+      // 任务级模型选择（不传则回落到 default provider 旗舰模型）
+      ...(model ? { model } : {}),
+      ...(providerId ? { providerId } : {}),
     },
   });
 
@@ -109,9 +116,9 @@ router.post('/', (req: Request, res: Response) => {
 
 // 继续写作：基于已有项目派发续写任务到守护进程
 router.post('/continue', (req: Request, res: Response) => {
-  const { projectId, webSearch } = req.body || {};
+  const { projectId, webSearch, model, providerId } = req.body || {};
   if (!projectId) return fail(res, 'INVALID', '项目 ID 必填');
-  const result = createContinueTask(projectId, webSearch);
+  const result = createContinueTask(projectId, webSearch, model, providerId);
   if (!result) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   ok(res, result);
 });

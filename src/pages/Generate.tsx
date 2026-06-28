@@ -1,13 +1,14 @@
 /**
  * 一键生成 —— 向导式成书/成短篇
  */
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { BookOpen, FileText, ArrowLeft, Sparkles, Hash } from 'lucide-react';
+import { BookOpen, FileText, ArrowLeft, Sparkles, Hash, Cpu } from 'lucide-react';
 import { api } from '@/api/client';
 import BlurText from '@/components/BlurText';
 import { Spinner, useToast } from '@/components/ui';
 import GenreSelect from '@/components/GenreSelect';
+import { useApp } from '@/stores/app';
 import { cn } from '@/lib/utils';
 import type { GenerateKind, GenerateConfig } from '@shared/types';
 
@@ -38,6 +39,19 @@ export default function Generate() {
   const [busy, setBusy] = useState(false);
   const navigate = useNavigate();
   const { toast, node } = useToast();
+  // 任务级模型选择：从全局 store 取当前所选 model/providerId，submit 时透传到 generate 接口
+  // 原 bug：daemon.runTask 始终用 default provider 旗舰模型，前端所选模型被忽略
+  const { providers, currentModel, currentProviderId, setCurrentModel, defaultProviderId, loadProviders } = useApp();
+
+  useEffect(() => { loadProviders(); }, [loadProviders]);
+
+  // 兜底：若 store.currentModel 仍空，用默认 provider 旗舰模型补一次（与 Studio 一致）
+  useEffect(() => {
+    if (!currentModel && providers.length) {
+      const def = providers.find(p => p.id === (currentProviderId || defaultProviderId)) || providers[0];
+      if (def?.models?.length) setCurrentModel(def.models[0], def.id);
+    }
+  }, [currentModel, providers, currentProviderId, defaultProviderId, setCurrentModel]);
 
   const set = (k: keyof Form, v: any) => setForm(f => ({ ...f, [k]: v }));
 
@@ -51,6 +65,7 @@ export default function Generate() {
     if (!form.idea.trim()) { toast('请填写核心创意', 'err'); return; }
     if (form.targetWords > KIND_PRESET[kind].cap) { toast(`目标字数上限 ${KIND_PRESET[kind].cap}`, 'err'); return; }
     if (!form.genre.trim()) { toast('请选择或输入题材', 'err'); return; }
+    if (!currentModel || !currentProviderId) { toast('请先选择模型', 'err'); return; }
     setBusy(true);
     const config: GenerateConfig = {
       genre: form.genre.trim(),
@@ -64,6 +79,9 @@ export default function Generate() {
         kind, targetWords: form.targetWords, config,
         idea: form.idea.trim(), title: form.title.trim() || undefined,
         webSearch,
+        // 透传当前所选模型，daemon 会优先用此 model/providerId 而非 default 旗舰
+        model: currentModel,
+        providerId: currentProviderId || undefined,
       });
       toast('已派发到守护进程');
       navigate('/daemon');
@@ -93,7 +111,9 @@ export default function Generate() {
         ) : (
           <Step2 kind={kind} form={form} set={set} estChapters={estChapters} busy={busy}
             onBack={() => setStep(1)} onSubmit={submit}
-            webSearch={webSearch} setWebSearch={setWebSearch} />
+            webSearch={webSearch} setWebSearch={setWebSearch}
+            providers={providers} currentModel={currentModel} currentProviderId={currentProviderId}
+            onPickModel={(m, pid) => setCurrentModel(m, pid)} />
         )}
       </div>
       {node}
@@ -134,12 +154,18 @@ function Step1({ onPick }: { onPick: (k: GenerateKind) => void }) {
   );
 }
 
-function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch, setWebSearch }: {
+function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch, setWebSearch, providers, currentModel, currentProviderId, onPickModel }: {
   kind: GenerateKind; form: Form; set: (k: keyof Form, v: any) => void;
   estChapters: number; busy: boolean; onBack: () => void; onSubmit: () => void;
   webSearch: boolean; setWebSearch: (v: boolean) => void;
+  providers: { id: string; name: string; models: string[] }[];
+  currentModel: string | null;
+  currentProviderId: string | null;
+  onPickModel: (model: string, providerId: string) => void;
 }) {
   const cap = KIND_PRESET[kind].cap;
+  // 编码当前所选：${providerId}::${model}，与 Studio 顶栏下拉一致
+  const modelValue = currentProviderId && currentModel ? `${currentProviderId}::${currentModel}` : '';
   return (
     <div className="panel-elevated animate-fade-up p-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -170,6 +196,22 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
           <input className="input" placeholder="主角与对手，用逗号分隔" value={form.characters} onChange={e => set('characters', e.target.value)} />
         </Field>
       </div>
+      {/* 任务级模型选择：从全局 store 选当前 provider + model，submit 时透传到 generate 接口 */}
+      {/* daemon 会优先用此 model/providerId，不再固定用 default 旗舰 */}
+      <Field label="使用模型">
+        <div className="flex items-center gap-2">
+          <Cpu size={14} className="shrink-0 text-amber" />
+          <select className="input" value={modelValue} onChange={e => {
+            const [pid, m] = e.target.value.split('::');
+            if (pid && m) onPickModel(m, pid);
+          }}>
+            {providers.length === 0 && <option value="">无可用模型，请先到模型中心配置</option>}
+            {providers.flatMap(p => p.models.map(m => (
+              <option key={p.id + m} value={`${p.id}::${m}`}>{p.name} · {m}</option>
+            )))}
+          </select>
+        </div>
+      </Field>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Field label="钩子风格">
           <select className="input" value={form.hookStyle} onChange={e => set('hookStyle', e.target.value)}>

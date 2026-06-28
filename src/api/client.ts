@@ -109,8 +109,8 @@ export const api = {
   generate: {
     trigger: (data: GenerateRequest) =>
       req<{ task: Task; project: Project }>('/generate', { method: 'POST', body: JSON.stringify(data) }),
-    continue: (projectId: string, webSearch?: boolean) =>
-      req<{ task: Task; project: Project }>('/generate/continue', { method: 'POST', body: JSON.stringify({ projectId, webSearch }) }),
+    continue: (projectId: string, webSearch?: boolean, model?: string, providerId?: string) =>
+      req<{ task: Task; project: Project }>('/generate/continue', { method: 'POST', body: JSON.stringify({ projectId, webSearch, model, providerId }) }),
   },
   tasks: {
     list: (projectId?: string) => req<Task[]>(`/tasks${projectId ? `?projectId=${projectId}` : ''}`),

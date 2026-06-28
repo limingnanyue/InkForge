@@ -162,11 +162,25 @@ export function stopWorker(): void {
 
 // ============ 任务分发 ============
 async function runTask(task: Task): Promise<void> {
-  const provider = providerRepo.getDefault();
-  const model = provider?.models[0] || 'gpt-4o-mini';
+  // 任务级模型选择：优先用 task.config 里的 model/providerId（前端一键生成传入）
+  // 不传则回落到 default provider 的旗舰模型
+  // 原 bug：始终用 default provider 旗舰模型，忽略前端所选 currentModel/currentProviderId
+  const cfg = task.config as { model?: string; providerId?: string; webSearch?: boolean };
+  let provider = cfg.providerId ? providerRepo.get(cfg.providerId) : providerRepo.getDefault();
+  if (!provider && cfg.providerId) {
+    // 指定的 provider 已被删除 → 回落到 default，避免任务直接失败
+    logTask(task.id, 'warn', `指定的 provider ${cfg.providerId} 不存在，回落到默认 provider`);
+    provider = providerRepo.getDefault();
+  }
+  const model = cfg.model || provider?.models[0] || 'gpt-4o-mini';
+  // 校验 model 在 provider.models 列表中（防配置漂移），不在则回落到旗舰
+  const validModel = provider && provider.models.includes(model) ? model : (provider?.models[0] || model);
+  if (cfg.model && validModel !== cfg.model) {
+    logTask(task.id, 'warn', `模型 ${cfg.model} 不在该 provider 列表中，回落到旗舰 ${validModel}`);
+  }
   const providerId = provider?.id;
   // 任务级联网搜索开关（由 GenerateRequest.webSearch 传入）
-  const webSearch = !!(task.config as { webSearch?: boolean }).webSearch;
+  const webSearch = !!cfg.webSearch;
 
   switch (task.type) {
     case 'book':

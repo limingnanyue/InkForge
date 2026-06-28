@@ -240,6 +240,10 @@ export interface GenerateRequest {
   config: GenerateConfig;
   idea?: string;
   webSearch?: boolean; // 生成时是否启用联网搜索取材
+  // 任务级模型选择（不传则回落到 default provider 旗舰模型）
+  // 用法：前端从全局 store currentModel/currentProviderId 透传到 generate 接口
+  model?: string;
+  providerId?: string;
 }
 
 // 导出
