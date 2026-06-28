@@ -172,11 +172,12 @@ async function runTask(task: Task): Promise<void> {
     logTask(task.id, 'warn', `指定的 provider ${cfg.providerId} 不存在，回落到默认 provider`);
     provider = providerRepo.getDefault();
   }
-  const model = cfg.model || provider?.models[0] || 'gpt-4o-mini';
-  // 校验 model 在 provider.models 列表中（防配置漂移），不在则回落到旗舰
-  const validModel = provider && provider.models.includes(model) ? model : (provider?.models[0] || model);
-  if (cfg.model && validModel !== cfg.model) {
-    logTask(task.id, 'warn', `模型 ${cfg.model} 不在该 provider 列表中，回落到旗舰 ${validModel}`);
+  // G1 修复：原 validModel 是死变量，pipeline 仍传未校验的 model
+  // 现在把校验结果直接赋给 model，配置漂移时真正回落到旗舰
+  const rawModel = cfg.model || provider?.models[0] || 'gpt-4o-mini';
+  const model = provider && provider.models.includes(rawModel) ? rawModel : (provider?.models[0] || rawModel);
+  if (cfg.model && model !== cfg.model) {
+    logTask(task.id, 'warn', `模型 ${cfg.model} 不在该 provider 列表中，回落到旗舰 ${model}`);
   }
   const providerId = provider?.id;
   // 任务级联网搜索开关（由 GenerateRequest.webSearch 传入）

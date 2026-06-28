@@ -166,6 +166,11 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
   const cap = KIND_PRESET[kind].cap;
   // 编码当前所选：${providerId}::${model}，与 Studio 顶栏下拉一致
   const modelValue = currentProviderId && currentModel ? `${currentProviderId}::${currentModel}` : '';
+  // U5 修复：用 indexOf 切第一个 '::' 分隔点，避免 model 名含 '::' 时被 split 全切断裂
+  const handleModelChange = (v: string) => {
+    const sep = v.indexOf('::');
+    if (sep > 0) onPickModel(v.slice(sep + 2), v.slice(0, sep));
+  };
   return (
     <div className="panel-elevated animate-fade-up p-6">
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -201,11 +206,9 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
       <Field label="使用模型">
         <div className="flex items-center gap-2">
           <Cpu size={14} className="shrink-0 text-amber" />
-          <select className="input" value={modelValue} onChange={e => {
-            const [pid, m] = e.target.value.split('::');
-            if (pid && m) onPickModel(m, pid);
-          }}>
-            {providers.length === 0 && <option value="">无可用模型，请先到模型中心配置</option>}
+          <select className="input" value={modelValue} onChange={e => handleModelChange(e.target.value)} disabled={providers.length === 0}>
+            {/* U4 修复：providers 为空或 currentModel 未就绪时显示占位 option，避免下拉视觉选中与实际状态不符 */}
+            {(!currentModel || providers.length === 0) && <option value="">请选择模型…</option>}
             {providers.flatMap(p => p.models.map(m => (
               <option key={p.id + m} value={`${p.id}::${m}`}>{p.name} · {m}</option>
             )))}

@@ -206,8 +206,12 @@ export default function Studio() {
           <div className="flex items-center gap-1.5 text-xs text-paper-mute">
             <Cpu size={14} />
             <select className="bg-transparent py-1 text-xs outline-none" value={currentProviderId ? `${currentProviderId}::${currentModel}` : ''} onChange={e => {
-              const [pid, m] = e.target.value.split('::');
-              if (pid && m) setCurrentModel(m, pid);
+              const sep = e.target.value.indexOf('::');
+              if (sep > 0) {
+                const pid = e.target.value.slice(0, sep);
+                const m = e.target.value.slice(sep + 2);
+                setCurrentModel(m, pid);
+              }
             }}>
               {providers.length === 0 && <option value="">无可用模型</option>}
               {providers.flatMap(p => p.models.map(m => (

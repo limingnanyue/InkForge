@@ -56,7 +56,7 @@ export default function Settings() {
       if (!style) { style = document.createElement('style'); style.id = 'theme-override'; document.head.appendChild(style); }
       style.textContent = `
         :root{--ink-900:#F5E6C8;--ink-800:#EAD7AF;--ink-700:#E0CCA0;--ink-600:#D4BC8C;--ink-500:#C8AC78;--ink-400:#B89A60;
-        --paper:#2A2118;--paper-dim:#4A3E2E;--paper-mute:#7A6A52;--amber:#8B6914;--amber-bright:#A57F1E;}
+        --paper:#2A2118;--paper-dim:#4A3E2E;--paper-mute:#7A6A52;--amber:#8B6914;--amber-bright:#A57F1E;--amber-deep:#5C4709;}
         body{color:var(--paper);background:var(--ink-900);}
         .aura{display:none;}`;
     } else if (style) { style.remove(); }

@@ -78,14 +78,14 @@ router.patch('/:id/state', (req: Request, res: Response) => {
 // 用法：前端 ProjectDetail 简介 Tab 加「AI 生成」按钮，调这两个接口
 
 // 解析请求里的 model/providerId，不传则回落到 default provider 旗舰（与 daemon.runTask 一致）
+// G3 修复：原逻辑仅当 model 与 providerId 同时存在才校验，二者仅传其一时全部丢弃用户选择
+// 现分两段：先定 provider（指定 providerId 不存在则回落 default），再定 model（不在 provider.models 则回落旗舰）
 function pickLLM(req: Request): { model: string; providerId?: string } {
   const { model, providerId } = req.body || {};
-  if (model && providerId) {
-    const p = providerRepo.get(providerId);
-    if (p && p.models.includes(model)) return { model, providerId };
-  }
-  const p = providerRepo.getDefault();
-  return { model: p?.models[0] || 'gpt-4o-mini', providerId: p?.id };
+  const p = (providerId && providerRepo.get(providerId)) || providerRepo.getDefault();
+  if (!p) throw new Error('未配置任何 LLM 提供商');
+  const validModel = model && p.models.includes(model) ? model : p.models[0];
+  return { model: validModel, providerId: p.id };
 }
 
 // POST /:id/generate-summary
@@ -94,13 +94,13 @@ router.post('/:id/generate-summary', async (req: Request, res: Response) => {
   const project = projectRepo.get(req.params.id);
   if (!project) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   const state = stateRepo.get(project.id);
-  const chapters = chapterRepo.listByProject(project.id);
   const { model, providerId } = pickLLM(req);
 
-  // 章节摘要取最近 5 章作为内容样本（避免 prompt 过长）
+  // G2 修复：原 chapters.length - 5 + i + 1 在章数<5 时为负/0，且 chapters 与 chapterSummaries 不同源
+  // 改用 ChapterSummary.idx（= chapter.orderIdx）作为权威序号
   const recentSummaries = (state?.chapterSummaries || [])
     .slice(-5)
-    .map((s, i) => `第${chapters.length - 5 + i + 1}章：${s.summary || ''}`)
+    .map(s => `第${(s.idx ?? 0) + 1}章：${s.summary || ''}`)
     .filter(Boolean)
     .join('\n');
 
@@ -148,7 +148,8 @@ router.post('/:id/generate-cover', async (req: Request, res: Response) => {
 - 标题：${project.title}
 - 题材：${project.genre || '通用'}
 - 创意：${state?.idea || '（无）'}
-- 文风：${state?.setting || '（无设定）'}
+- 世界观设定：${state?.setting || '（无设定）'}
+- 文风：${(req.body?.tone as string) || '通用'}
 
 要求输出两段：
 1. 【中文描述】封面画面构思，30-80 字，描述主体、场景、氛围、关键视觉元素

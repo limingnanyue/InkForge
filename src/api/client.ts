@@ -39,8 +39,8 @@ export const api = {
     // AI 生成：透传当前所选 model/providerId（不传则后端回落到 default 旗舰）
     generateSummary: (id: string, model?: string, providerId?: string) =>
       req<{ summary: string }>(`/projects/${id}/generate-summary`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),
-    generateCover: (id: string, model?: string, providerId?: string) =>
-      req<{ cover: string }>(`/projects/${id}/generate-cover`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),
+    generateCover: (id: string, model?: string, providerId?: string, tone?: string) =>
+      req<{ cover: string }>(`/projects/${id}/generate-cover`, { method: 'POST', body: JSON.stringify({ model, providerId, tone }) }),
     messages: (id: string) => req<ChatMessage[]>(`/projects/${id}/messages`),
   },
   chapters: {

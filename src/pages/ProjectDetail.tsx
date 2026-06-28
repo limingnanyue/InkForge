@@ -75,7 +75,7 @@ export default function ProjectDetail() {
     if (!project) return;
     setContinueBusy(true);
     try {
-      await api.generate.continue(project.id);
+      await api.generate.continue(project.id, undefined, currentModel || undefined, currentProviderId || undefined);
       toast('已派发续写任务到守护进程');
       navigate('/daemon');
     } catch (e) { toast((e as Error).message, 'err'); }
@@ -117,7 +117,7 @@ export default function ProjectDetail() {
   // 改用 lastSavedTitleRef 在 load()/保存成功时更新，仅跟踪"服务端已持久化的标题"
   // 切到 大纲/状态 时若状态未加载则补拉
   useEffect(() => {
-    if ((tab === 'outline' || tab === 'state' || tab === 'brief') && !agentState) loadState();
+    if ((tab === 'outline' || tab === 'state') && !agentState) loadState();
   }, [tab, agentState, loadState]);
 
   // 联网搜索开关跟随项目配置
@@ -229,8 +229,13 @@ export default function ProjectDetail() {
   // AI 生成封面提示词：调 LLM 生成中英双段 prompt，落 agent_state.cover
   const [coverDraft, setCoverDraft] = useState('');
   const [genCoverBusy, setGenCoverBusy] = useState(false);
-  // 当 agentState 加载后，把 cover 同步到 coverDraft 供编辑
-  useEffect(() => { setCoverDraft(agentState?.cover || ''); }, [agentState?.cover]);
+  // G6 修复：脏标记防 coverDraft 被重拉的 agentState.cover 覆盖未保存编辑
+  // 触发场景：用户编辑 textarea 未 blur → 切 Tab 触发 loadState 重拉 → effect 把 coverDraft 重置为服务端旧值
+  const coverDirtyRef = useRef(false);
+  // 当 agentState 加载后，把 cover 同步到 coverDraft 供编辑（仅当用户未在编辑时）
+  useEffect(() => {
+    if (!coverDirtyRef.current) setCoverDraft(agentState?.cover || '');
+  }, [agentState?.cover]);
   const onGenerateCover = async () => {
     if (!project) return;
     setGenCoverBusy(true);
@@ -239,6 +244,7 @@ export default function ProjectDetail() {
         project.id, currentModel || undefined, currentProviderId || undefined,
       );
       setCoverDraft(cover);
+      coverDirtyRef.current = false;  // 生成的新值已是服务端最新，清脏标记
       // 同步本地 agentState（避免再次切 Tab 拉取）
       setAgentState(s => s ? { ...s, cover } : s);
       toast('已生成封面提示词');
@@ -252,6 +258,7 @@ export default function ProjectDetail() {
     try {
       const updated = await api.projects.updateState(project.id, { cover: coverDraft });
       setAgentState(updated);
+      coverDirtyRef.current = false;  // 保存成功，清脏标记
       toast('已保存封面提示词');
     } catch (e) { toast((e as Error).message, 'err'); }
   };
@@ -426,7 +433,7 @@ export default function ProjectDetail() {
                     <div className="mb-1 flex items-center justify-between">
                       <p className="text-[11px] uppercase tracking-wider text-paper-mute">项目摘要</p>
                       <button
-                        className="btn-ghost flex items-center gap-1 py-1 text-[11px] text-amber hover:text-amber-deep"
+                        className="btn-ghost flex items-center gap-1 py-1 text-[11px] text-amber hover:text-amber-bright"
                         onClick={onGenerateSummary}
                         disabled={genSummaryBusy}
                         title="基于项目信息 + 最近章节摘要 AI 生成一句话简介"
@@ -441,7 +448,7 @@ export default function ProjectDetail() {
                     <div className="mb-1 flex items-center justify-between">
                       <p className="text-[11px] uppercase tracking-wider text-paper-mute">封面提示词</p>
                       <button
-                        className="btn-ghost flex items-center gap-1 py-1 text-[11px] text-amber hover:text-amber-deep"
+                        className="btn-ghost flex items-center gap-1 py-1 text-[11px] text-amber hover:text-amber-bright"
                         onClick={onGenerateCover}
                         disabled={genCoverBusy}
                         title="基于项目信息 AI 生成中英双段封面绘图 prompt"
@@ -451,17 +458,21 @@ export default function ProjectDetail() {
                       </button>
                     </div>
                     <textarea
-                      className="input min-h-[140px] resize-y font-mono text-xs leading-relaxed"
+                      className="input min-h-[140px] resize-y font-mono text-sm leading-relaxed"
                       placeholder="点击「AI 生成」产生封面提示词（中文描述 + 英文 Prompt），可直接复制到 SD/MJ 使用…"
                       value={coverDraft}
-                      onChange={e => setCoverDraft(e.target.value)}
+                      onChange={e => { coverDirtyRef.current = true; setCoverDraft(e.target.value); }}
                       onBlur={onBlurCover}
                     />
                     {coverDraft && (
                       <div className="mt-1 flex justify-end">
                         <button
                           className="text-[10px] text-paper-mute hover:text-amber"
-                          onClick={() => { navigator.clipboard?.writeText(coverDraft); toast('已复制到剪贴板'); }}
+                          onClick={() => {
+                            navigator.clipboard?.writeText(coverDraft)
+                              .then(() => toast('已复制到剪贴板'))
+                              .catch(() => toast('复制失败，请手动选择文本复制', 'err'));
+                          }}
                         >复制全部</button>
                       </div>
                     )}
