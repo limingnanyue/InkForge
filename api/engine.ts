@@ -175,10 +175,9 @@ export function buildChapterAnchor(
   baseWordTarget = 2500,
   coreEmotion?: string,
 ): string {
-  const prevChapters = chapterRepo.listByProject(projectId);
-  const prevTail = currentIdx > 0 && prevChapters[currentIdx - 1]?.content
-    ? prevChapters[currentIdx - 1].content.slice(-300)
-    : '（首章，无需承接）';
+  // BUG-1 修复：原 listByProject 全量加载只为取 prevChapters[currentIdx-1].content.slice(-300)，
+  // 2000 章循环 = O(N²) 全表扫描。改用 getTail 仅查单行 content
+  const prevTail = (currentIdx > 0 ? chapterRepo.getTail(projectId, currentIdx - 1) : '') || '（首章，无需承接）';
 
   // 本章定位块：章节定位类型 + 字数预算 + 核心情绪（与 write prompt 的【本章定位】字段对位）
   let positioningBlock = '';
@@ -360,6 +359,192 @@ export async function* runSkill(params: GenerateParams): AsyncGenerator<string> 
   });
 }
 
+// ============ 世界观 + 角色档案生成（一键生成的 setup 阶段）============
+// oh-story 方法论：扫榜后必须先立人设/世界观，再生成大纲。
+// 此阶段产出的 setting/characters 落库后，会进入 buildContextPrompt 的稳定段（systemStable），
+// 后续大纲生成与每章正文生成都能引用，避免正文人设漂移。
+// 原 bug：daemon 仅在 scan 阶段写 state.idea，从未写 state.setting / state.characters
+// → 项目详情页「大纲/状态」Tab 的「世界观设定」「角色」永远空白。
+export async function generateSetup(opts: {
+  projectId: string;
+  model: string;
+  providerId?: string;
+  config: GenerateConfig;
+  idea: string;
+  scanInsight?: string;
+  webSearch?: boolean;
+}): Promise<{ setting: string; characters: string }> {
+  const { projectId, model, providerId, config, idea, scanInsight, webSearch } = opts;
+
+  const prompt = `请为以下作品生成「世界观设定」与「角色档案」，供后续大纲与正文创作参考。
+
+【核心创意】${idea}
+【题材风格】${config.genre}
+【主要角色（用户提供）】${config.characters || '（未指定，请自行设计主角 + 对手 + 关键配角）'}
+【钩子风格】${config.hookStyle}
+【节奏要求】${config.pace}
+【结局走向】${config.ending}
+${scanInsight ? `【扫榜洞察】\n${scanInsight}` : ''}
+
+要求输出两段，严格遵循以下格式（不要其他文字、不要 markdown 代码块）：
+
+===世界观设定===
+- 世界背景（时代/地点/社会结构，100 字内）
+- 核心规则（修炼体系/科技设定/魔法/禁忌等，2-4 条）
+- 阵营与势力（主要势力 2-3 个，含立场与冲突）
+- 关键设定伏笔（2-3 条，供后续埋设）
+
+===角色档案===
+按主角 / 对手 / 关键配角 顺序，每个角色输出：
+- 姓名：xxx
+- 身份：xxx
+- 性格：xxx（核心性格 2-3 个标签 + 一句话阐释）
+- 能力：xxx（关键能力/资源/缺陷）
+- 弧线：xxx（V形/递进/延迟满足等 + 拐点说明）
+- 关系：xxx（与谁有恩怨/师徒/情愫等）
+（角色之间用空行分隔）`;
+
+  const ctxPrompt = buildContextPrompt(projectId);
+  const systemStable = ctxPrompt
+    ? `${ctxPrompt}\n\n你是网文世界观与角色设计师，遵循 oh-story-claudecode 方法论。擅长构建可长篇延展的设定与立体人设。`
+    : '你是网文世界观与角色设计师，遵循 oh-story-claudecode 方法论。擅长构建可长篇延展的设定与立体人设。';
+  const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
+
+  const { complete } = await import('./llm.js');
+  const { text } = await complete({
+    providerId, model, messages, systemStable, projectId,
+    temperature: 0.8, maxTokens: 4096,
+    webSearch,
+    searchQuery: webSearch ? `${config.genre} 世界观 设定 套路` : undefined,
+  });
+
+  // 解析两段：===世界观设定=== 与 ===角色档案=== 之间
+  const settingMatch = text.match(/=+ ?世界观设定 ?=+([\s\S]*?)(?===\s*角色档案)/i);
+  const charactersMatch = text.match(/=+ ?角色档案 ?=+([\s\S]*?)$/i);
+  let setting = (settingMatch ? settingMatch[1] : '').trim();
+  let characters = (charactersMatch ? charactersMatch[1] : '').trim();
+  // 兜底：若 LLM 没按格式输出，把全文给 setting，避免状态字段仍为空
+  if (!setting && !characters) {
+    setting = text.trim();
+  } else if (setting && !characters) {
+    // 角色段解析失败但世界观段成功 → 留空 characters（不污染）
+  }
+
+  stateRepo.update(projectId, {
+    setting: setting.slice(0, 4000),
+    characters: characters.slice(0, 6000),
+  });
+  return { setting, characters };
+}
+
+// ============ 章节质量门（post-generation gate）============
+// 生成后检测：① 字数门 ② 跑题门。不达标 → 返回 needRewrite，daemon 决定是否重写
+// 重写上限由调用方控制（默认 1 次），避免死循环 + 浪费 token
+export interface ChapterQualityResult {
+  ok: boolean;
+  needRewrite: boolean;
+  issues: string[];       // 命中的问题列表（用于日志和反馈）
+  score: number;          // 0-1 综合评分
+}
+export async function checkChapterQuality(opts: {
+  projectId: string;
+  model: string;
+  providerId?: string;
+  chapterIdx: number;        // 章节序号（0-based）
+  chapterTitle: string;
+  outline: string;           // 本章大纲
+  positioning?: ChapterPositioning;
+  coreEmotion?: string;
+  content: string;           // 生成的正文
+  wordBudget: number;         // 字数预算
+}): Promise<ChapterQualityResult> {
+  const { projectId, model, providerId, chapterIdx, chapterTitle, outline, positioning, coreEmotion, content, wordBudget } = opts;
+  const issues: string[] = [];
+  const actualLen = content.length;
+
+  // —— Gate 1：字数门 ——
+  // 字数严重不足（< 预算 60%）→ needRewrite
+  // 字数轻微不足（60%-90%）→ 警告但不重写（LLM 可能情节点写完就收束）
+  // 字数超标（> 预算 1.5×）→ 警告但不重写（不致命，且重写不一定能短下来）
+  const minHard = Math.round(wordBudget * 0.6);
+  if (actualLen < minHard) {
+    issues.push(`字数严重不足：${actualLen} 字 < 预算 ${wordBudget} 字的 60%（${minHard} 字）`);
+  } else if (actualLen < wordBudget * 0.9) {
+    issues.push(`字数偏少：${actualLen} 字 < 预算 ${wordBudget} 字的 90%（轻微，不重写）`);
+  } else if (actualLen > wordBudget * 1.5) {
+    issues.push(`字数超标：${actualLen} 字 > 预算 ${wordBudget} 字的 1.5 倍（轻微，不重写）`);
+  }
+
+  // —— Gate 2：跑题门（调 LLM 判断）——
+  // 仅当字数门通过（>= 60%）才跑跑题门，避免短文本被误判
+  // LLM 返回 JSON：{ score: 0-1, reason: string }
+  // score >= 0.6 视为达标，< 0.6 → needRewrite
+  let topicScore = 1.0;  // 默认通过（LLM 调用失败时不阻断生成）
+  if (actualLen >= minHard) {
+    const prompt = `请判断以下章节正文是否符合大纲要求。
+
+【章节信息】第 ${chapterIdx + 1} 章《${chapterTitle}》
+【章节定位】${positioning || '未指定'}
+【核心情绪】${coreEmotion || '未指定'}
+【本章大纲】
+${outline}
+
+【正文片段】（前 1500 字）
+${content.slice(0, 1500)}
+
+请从以下维度评分（0-1）：
+1. 大纲符合度：是否完成大纲设定的情节点（0-1）
+2. 章节定位符合度：是否体现 ${positioning || '通用'} 的特征（0-1）
+3. 剧情推进度：是否有实质推进，非重复/非注水（0-1）
+4. 人设一致性：角色行为是否符合前文人设（0-1，无法判断时给 0.7）
+
+输出 JSON：{"score": <0-1 综合分>, "reason": "<一句话说明不符合之处>"}
+只输出 JSON，不要其他文字。`;
+
+    const ctxPrompt = buildContextPrompt(projectId);
+    const systemStable = ctxPrompt
+      ? `${ctxPrompt}\n\n你是严苛的网文质检编辑，擅长判断章节是否跑题。输出必须是合法 JSON。`
+      : '你是严苛的网文质检编辑，擅长判断章节是否跑题。输出必须是合法 JSON。';
+    const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
+
+    try {
+      const { complete } = await import('./llm.js');
+      const { text } = await complete({
+        providerId, model, messages, systemStable, projectId,
+        temperature: 0.3, maxTokens: 256,  // 质检只需短输出，省 token
+      });
+      const match = text.match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        if (typeof parsed.score === 'number') {
+          topicScore = parsed.score;
+          if (parsed.score < 0.6) {
+            issues.push(`跑题风险：综合分 ${parsed.score.toFixed(2)} < 0.6${parsed.reason ? `（${parsed.reason}）` : ''}`);
+          } else if (parsed.score < 0.8 && parsed.reason) {
+            issues.push(`质量轻微不达标：${parsed.score.toFixed(2)}（${parsed.reason}，不重写）`);
+          }
+        }
+      }
+    } catch (e) {
+      // 质检 LLM 调用失败：不阻断生成，记 warn
+      issues.push(`跑题门检测失败（LLM 调用异常：${(e as Error).message.slice(0, 80)}），跳过`);
+    }
+  }
+
+  // —— 综合判定 ——
+  const wordHardFail = actualLen < minHard;
+  const topicHardFail = topicScore < 0.6;
+  const needRewrite = wordHardFail || topicHardFail;
+  const score = Math.min(actualLen / wordBudget, 1) * 0.5 + topicScore * 0.5;
+
+  return {
+    ok: !needRewrite,
+    needRewrite,
+    issues,
+    score,
+  };
+}
+
 // ============ 大纲生成（成书/成短篇核心）============
 // oh-story 三层结构：全书大纲 → 卷纲（长篇 >20 章时）→ 细纲（每章定位 + 字数预算）
 // 章节定位六类分布：高压 18% / 普通 45% / 试错 8% / 关系 8% / 低压 10% / 信息 5%（剩余补普通）
@@ -404,6 +589,70 @@ export function buildVolumeOutlines(chapterCount: number): VolumeOutline[] {
   }));
 }
 
+// 单次 LLM 调用生成大纲的安全章数阈值。
+// 超过此阈值会触发分卷生成：每卷 20 章，逐卷调 LLM 后合并。
+// 依据：每章 JSON ≈ 130 tokens × 200 章 = 26000 tokens，cap 32000 仍有余量
+const OUTLINE_SINGLE_CALL_MAX_CHAPTERS = 200;
+
+// 单卷大纲生成（被 generateOutline 编排，也可独立用于小卷）
+async function generateOutlineForVolume(opts: {
+  projectId: string;
+  model: string;
+  providerId?: string;
+  config: GenerateConfig;
+  idea: string;
+  volIndex: number;            // 卷序号（0-based）
+  volTotal: number;            // 总卷数
+  volChapterCount: number;     // 本卷章数
+  globalStartIdx: number;     // 本卷第一章的全局序号（0-based）
+  emotionArc: string;          // 本卷情绪弧线
+  premiseHint: string;        // 本卷核心冲突提示
+  prevVolumeTail?: string;     // 上一卷最后一章标题+钩子（用于承接）
+  webSearch?: boolean;
+}): Promise<ParsedOutlineItem[]> {
+  const { projectId, model, providerId, config, idea, volIndex, volTotal, volChapterCount, globalStartIdx, emotionArc, premiseHint, prevVolumeTail, webSearch } = opts;
+  const dist = computePositioningDistribution(volChapterCount);
+  const distLine = `高压章 ${dist['high-pressure']} 章 / 普通推进章 ${dist['normal-progress']} 章 / 修炼试错章 ${dist['trial-error']} 章 / 关系回收章 ${dist['relationship']} 章 / 低压生活章 ${dist['low-pressure']} 章 / 信息整理章 ${dist['info-organize']} 章`;
+
+  const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 2000-3000 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
+
+【核心创意】${idea}
+【题材风格】${config.genre}
+【主要角色】${config.characters}
+【钩子风格】${config.hookStyle}
+【节奏要求】${config.pace}
+【结局走向】${config.ending}
+【本卷情绪弧线】${emotionArc}
+【本卷核心冲突】${premiseHint}
+${prevVolumeTail ? `\n【上一卷结尾（必须自然承接，不得重复）】\n${prevVolumeTail}` : ''}
+
+【章节定位六类分布约束】（本卷内分布，oh-story：防止每章都像短篇、防止情绪扎堆）
+${distLine}
+按上述分布为本卷每章分配 positioning，不得让高压章连续超过 2 章，不得让低压章连续超过 2 章。
+
+要求：
+- 输出 JSON 数组，每个元素：{"title":"章节标题","outline":"本章大纲(50-100字)","hook":"章末钩子","positioning":"high-pressure|normal-progress|trial-error|relationship|low-pressure|info-organize","coreEmotion":"本章核心情绪(爽感释放/震撼/痛快/怅然/燃/治愈/期待/心动等)"}
+- 节奏紧凑，每章都有推进与爽点
+- 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
+- positioning 分布严格符合上方约束
+- 只输出 JSON，不要其他文字`;
+
+  const ctxPrompt = buildContextPrompt(projectId);
+  const systemStable = ctxPrompt
+    ? `${ctxPrompt}\n\n你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。`
+    : '你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。';
+  const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
+  const { complete } = await import('./llm.js');
+  // 单卷最多 20 章，maxTokens 给 8192 足够（20 章 × 150 tokens = 3000，留余量）
+  const volMaxTokens = Math.min(16384, Math.max(4096, volChapterCount * 200));
+  const { text } = await complete({
+    providerId, model, messages, systemStable, projectId, temperature: 0.8, maxTokens: volMaxTokens,
+    webSearch,
+    searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路 第${volIndex + 1}卷` : undefined,
+  });
+  return parseOutline(text);
+}
+
 export async function generateOutline(opts: {
   projectId: string;
   model: string;
@@ -412,18 +661,20 @@ export async function generateOutline(opts: {
   config: GenerateConfig;
   idea: string;
   webSearch?: boolean;
+  onVolumeProgress?: (done: number, total: number) => void;
 }): Promise<string> {
-  const { projectId, model, providerId, targetWords, config, idea, webSearch } = opts;
+  const { projectId, model, providerId, targetWords, config, idea, webSearch, onVolumeProgress } = opts;
   const chapterCount = Math.max(1, Math.ceil(targetWords / 2500));
-  const dist = computePositioningDistribution(chapterCount);
-  const volumes = computeVolumeRanges(chapterCount);
 
-  const distLine = `高压章 ${dist['high-pressure']} 章 / 普通推进章 ${dist['normal-progress']} 章 / 修炼试错章 ${dist['trial-error']} 章 / 关系回收章 ${dist['relationship']} 章 / 低压生活章 ${dist['low-pressure']} 章 / 信息整理章 ${dist['info-organize']} 章`;
-  const volLine = volumes.length > 0
-    ? `\n【卷纲】共 ${volumes.length} 卷，每卷 ~20 章，卷情绪弧线依次：${volumes.map((v, i) => `第${i + 1}卷(${v.range[0] + 1}-${v.range[1] + 1}章,${v.emotionArc})`).join('；')}`
-    : '';
-
-  const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 2000-3000 字）。
+  // —— 单次调用足够时走原逻辑（小卷，<= 200 章）——
+  if (chapterCount <= OUTLINE_SINGLE_CALL_MAX_CHAPTERS) {
+    const dist = computePositioningDistribution(chapterCount);
+    const volumes = computeVolumeRanges(chapterCount);
+    const distLine = `高压章 ${dist['high-pressure']} 章 / 普通推进章 ${dist['normal-progress']} 章 / 修炼试错章 ${dist['trial-error']} 章 / 关系回收章 ${dist['relationship']} 章 / 低压生活章 ${dist['low-pressure']} 章 / 信息整理章 ${dist['info-organize']} 章`;
+    const volLine = volumes.length > 0
+      ? `\n【卷纲】共 ${volumes.length} 卷，每卷 ~20 章，卷情绪弧线依次：${volumes.map((v, i) => `第${i + 1}卷(${v.range[0] + 1}-${v.range[1] + 1}章,${v.emotionArc})`).join('；')}`
+      : '';
+    const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 2000-3000 字）。
 
 【核心创意】${idea}
 【题材风格】${config.genre}
@@ -443,28 +694,56 @@ ${distLine}
 - positioning 分布严格符合上方约束
 - 只输出 JSON，不要其他文字`;
 
-  // —— 缓存优化：项目设定 + 大纲架构师角色 作为稳定段 ——
-  const ctxPrompt = buildContextPrompt(projectId);
-  const systemStable = ctxPrompt
-    ? `${ctxPrompt}\n\n你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。`
-    : '你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。';
-  const messages: ChatCompletionMessage[] = [
-    { role: 'user', content: prompt },
-  ];
-  const { complete } = await import('./llm.js');
-  // E1 修复：maxTokens 按章数动态放大
-  // 原 8192 仅能输出 ~40 章 JSON，百万字书（400 章）会严重截断 → parseOutline 兜底只恢复部分章节
-  // 每章 JSON 元素约 150-200 字 ≈ 100-130 tokens，按 chapterCount × 150 估算，cap 32000（多数模型上限）
-  // 模型若不支持该输出长度会自动截断，parseOutline 截断兜底已覆盖该场景
-  const outlineMaxTokens = Math.min(32000, Math.max(8192, chapterCount * 150));
-  const { text: acc } = await complete({
-    providerId, model, messages, systemStable, projectId, temperature: 0.8, maxTokens: outlineMaxTokens,
-    webSearch,
-    searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路` : undefined,
-  });
-  // 提取 JSON
-  const match = acc.match(/\[[\s\S]*\]/);
-  return match ? match[0] : acc;
+    const ctxPrompt = buildContextPrompt(projectId);
+    const systemStable = ctxPrompt
+      ? `${ctxPrompt}\n\n你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。`
+      : '你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。';
+    const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
+    const { complete } = await import('./llm.js');
+    const outlineMaxTokens = Math.min(32000, Math.max(8192, chapterCount * 150));
+    const { text: acc } = await complete({
+      providerId, model, messages, systemStable, projectId, temperature: 0.8, maxTokens: outlineMaxTokens,
+      webSearch,
+      searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路` : undefined,
+    });
+    const match = acc.match(/\[[\s\S]*\]/);
+    return match ? match[0] : acc;
+  }
+
+  // —— 分卷生成（超长篇，> 200 章）——
+  // 500 万字 = 2000 章 = 100 卷，单卷 20 章逐次调 LLM 后合并
+  // 解决：原单次调用 maxTokens cap 32000 只能产 ~213 章 JSON，超长篇必然截断
+  const volumes = computeVolumeRanges(chapterCount);
+  const allChapters: ParsedOutlineItem[] = [];
+  const volPremiseHints = (i: number) =>
+    i === 0 ? '开篇立人设、抛核心冲突与主线伏笔' :
+    (i === volumes.length - 1 ? '终局决战、回收所有主线伏笔、收束情绪弧线' :
+    '中段推进、新伏笔集群、关系深化');
+
+  for (let vi = 0; vi < volumes.length; vi++) {
+    const vol = volumes[vi];
+    const volChapterCount = vol.range[1] - vol.range[0] + 1;
+    const prevTail = vi > 0 && allChapters.length > 0
+      ? `第 ${allChapters.length} 章《${allChapters[allChapters.length - 1].title}》：${allChapters[allChapters.length - 1].outline}\n章末钩子：${allChapters[allChapters.length - 1].hook}`
+      : undefined;
+
+    const volChapters = await generateOutlineForVolume({
+      projectId, model, providerId, config, idea,
+      volIndex: vi, volTotal: volumes.length,
+      volChapterCount, globalStartIdx: vol.range[0],
+      emotionArc: vol.emotionArc, premiseHint: volPremiseHints(vi),
+      prevVolumeTail: prevTail, webSearch,
+    });
+
+    if (volChapters.length === 0) {
+      // 单卷解析失败：抛错让 daemon 走重试，不静默吞掉
+      throw new Error(`第 ${vi + 1} 卷大纲解析失败（LLM 输出未含合法 JSON 数组）`);
+    }
+    allChapters.push(...volChapters);
+    onVolumeProgress?.(vi + 1, volumes.length);
+  }
+
+  return JSON.stringify(allChapters);
 }
 
 // 解析大纲 JSON（向后兼容：positioning/coreEmotion 为可选字段）

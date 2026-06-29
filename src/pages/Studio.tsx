@@ -97,6 +97,9 @@ export default function Studio() {
   const send = useCallback(async () => {
     if (!input.trim() || streaming) return;
     if (!currentProject) { toast('请先选择或创建项目', 'err'); return; }
+    // BUG-1 修复：捕获当前请求序号，流式完成后校验项目是否已切换，
+    // 避免「项目 A 发起对话 → 流式中切到 B → A 的流结束 setMessages(A) 后到」覆盖 B 的列表
+    const reqSeq = loadSeqRef.current;
     const text = input.trim();
     setInput('');
     setStreaming(true);
@@ -124,11 +127,11 @@ export default function Studio() {
     streamHandleRef.current = handle;
     try {
       await handle.done;
-      // 刷新消息
+      // 刷新消息（BUG-1：校验项目未切换才 set，避免串号覆盖）
       const msgs = await apiClient.projects.messages(currentProject.id);
-      if (mountedRef.current) setMessages(msgs);
+      if (mountedRef.current && reqSeq === loadSeqRef.current) setMessages(msgs);
       const s = await apiClient.projects.state(currentProject.id);
-      if (mountedRef.current) setState(s);
+      if (mountedRef.current && reqSeq === loadSeqRef.current) setState(s);
     } catch (e) {
       if (mountedRef.current) toast((e as Error).message, 'err');
     } finally {
@@ -282,7 +285,7 @@ export default function Studio() {
             {rightTab === 'state' ? (
               <StatePanel state={state} project={currentProject} />
             ) : (
-              <TaskPanel tasks={tasks} />
+              <TaskPanel tasks={tasks} toast={toast} />
             )}
           </div>
         </aside>
@@ -305,7 +308,7 @@ function Welcome({ onCreate }: { onCreate: () => void }) {
         <a href="/generate" className="btn-primary"><Sparkles size={16} /> 一键成书</a>
       </div>
       <div className="mt-10 grid grid-cols-3 gap-4 text-xs text-paper-mute animate-fade-in" style={{ animationDelay: '0.9s' }}>
-        {[['百万字', '长篇成书'], ['二十万字', '短篇速成'], ['守护进程', '断点续传']].map(([a, b]) => (
+        {[['500 万字', '长篇成书'], ['二十万字', '短篇速成'], ['守护进程', '断点续传']].map(([a, b]) => (
           <div key={a} className="rounded-md border p-3" style={{ borderColor: 'var(--ink-500)' }}>
             <div className="font-display text-lg text-amber">{a}</div>
             <div className="mt-1">{b}</div>
@@ -383,20 +386,19 @@ function StateCard({ label, icon, content }: { label: string; icon: React.ReactN
   );
 }
 
-function TaskPanel({ tasks }: { tasks: Task[] }) {
+function TaskPanel({ tasks, toast }: { tasks: Task[]; toast: (msg: string, type?: 'ok' | 'err') => void }) {
   if (!tasks.length) return <p className="text-xs text-paper-mute">暂无任务</p>;
   return (
     <div className="space-y-2">
-      {tasks.slice(0, 20).map(t => <TaskRow key={t.id} task={t} />)}
+      {tasks.slice(0, 20).map(t => <TaskRow key={t.id} task={t} toast={toast} />)}
     </div>
   );
 }
 
-function TaskRow({ task }: { task: Task }) {
+function TaskRow({ task, toast }: { task: Task; toast: (msg: string, type?: 'ok' | 'err') => void }) {
   const statusColor: Record<string, string> = { running: 'badge-amber', queued: 'badge-mute', done: 'badge-green', failed: 'badge-red', paused: 'badge-mute' };
   const statusText: Record<string, string> = { running: '运行中', queued: '排队', done: '完成', failed: '失败', paused: '已暂停' };
   const [retrying, setRetrying] = useState(false);
-  const { toast } = useToast();
   const onRetry = async () => {
     setRetrying(true);
     try {

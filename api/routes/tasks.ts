@@ -3,7 +3,7 @@
  */
 import { Router, type Request, type Response } from 'express';
 import { taskRepo, taskLogRepo } from '../repos.js';
-import { onStream } from '../daemon.js';
+import { onStream, cancelToken } from '../daemon.js';
 
 const router = Router();
 
@@ -25,17 +25,38 @@ router.get('/:id/logs', (req: Request, res: Response) => {
 });
 
 router.post('/:id/pause', (req: Request, res: Response) => {
+  const cur = taskRepo.get(req.params.id);
+  if (!cur) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: '任务不存在' } });
+  // 状态守卫：仅 running/queued 可 pause。done/failed 状态调 pause 会丢失完成/失败语义
+  if (cur.status !== 'running' && cur.status !== 'queued') {
+    return res.status(409).json({ ok: false, error: { code: 'INVALID_STATUS', message: `当前状态 ${cur.status} 不可暂停` } });
+  }
+  // running 中：通过 cancel token 让 worker 在章节边界主动停止
+  if (cur.status === 'running') cancelToken(req.params.id);
   const task = taskRepo.update(req.params.id, { status: 'paused' });
   ok(res, task);
 });
 
+// resume：仅 paused/failed 状态可继续，从 checkpoint 续传（与 continue 端点一致）
+// 原 bug：直接置 queued 无状态校验，对 done 任务调 resume 会重新入队，worker 从 checkpoint 续传会重复生成
 router.post('/:id/resume', (req: Request, res: Response) => {
-  const task = taskRepo.update(req.params.id, { status: 'queued' });
+  const task = taskRepo.resumeFromCheckpoint(req.params.id);
+  if (!task) return res.status(409).json({ ok: false, error: { code: 'INVALID_STATUS', message: '仅已暂停或失败的任务可继续' } });
   ok(res, task);
 });
 
 // 失败重试：保留 checkpoint 续传，retry_count+1（超 max_retries 则 409）
 router.post('/:id/retry', (req: Request, res: Response) => {
+  // 状态守卫：仅 failed 可 retry。
+  //   running → retryCount+1 后 worker 失败重试时基于已被 +1 的 retryCount 再 +1，跳过一次重试机会
+  //   queued   → 任务尚未开始何来重试，语义错误
+  //   done     → 已完成不应重试，对 refine-book 等长任务会无谓累加 retryCount
+  //   paused   → 应走 resume，不应走 retry
+  const cur = taskRepo.get(req.params.id);
+  if (!cur) return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: '任务不存在' } });
+  if (cur.status !== 'failed') {
+    return res.status(409).json({ ok: false, error: { code: 'INVALID_STATUS', message: `当前状态 ${cur.status} 不可重试，仅 failed 可重试` } });
+  }
   const task = taskRepo.retry(req.params.id);
   if (!task) return res.status(409).json({ ok: false, error: { code: 'RETRY_EXHAUSTED', message: '重试次数已耗尽（max_retries）' } });
   ok(res, task);
@@ -49,6 +70,8 @@ router.post('/:id/continue', (req: Request, res: Response) => {
 });
 
 router.post('/:id/cancel', (req: Request, res: Response) => {
+  // 通过 cancel token 让运行中的 worker 在章节边界主动停止，再删除任务
+  cancelToken(req.params.id);
   taskRepo.delete(req.params.id);
   ok(res, { id: req.params.id });
 });

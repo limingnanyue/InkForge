@@ -72,6 +72,13 @@ export const chapterRepo = {
     const rows = db.prepare('SELECT * FROM chapter WHERE project_id=? ORDER BY order_idx ASC, created_at ASC').all(projectId) as any[];
     return rows.map(rowToChapter);
   },
+  // BUG-1 修复：只取指定 order_idx 章节正文末尾 300 字符（仅加载单行，避免全表扫描）
+  // buildChapterAnchor 每章调用，原 listByProject 全量加载导致 O(N²)
+  getTail(projectId: string, idx: number): string {
+    const row = db.prepare('SELECT content FROM chapter WHERE project_id=? AND order_idx=? LIMIT 1').get(projectId, idx) as { content: string | null } | undefined;
+    const content = row?.content ?? '';
+    return content ? content.slice(-300) : '';
+  },
   get(id: string): Chapter | null {
     const row = db.prepare('SELECT * FROM chapter WHERE id=?').get(id) as any;
     return row ? rowToChapter(row) : null;
@@ -204,7 +211,7 @@ export const taskRepo = {
       `UPDATE task SET status=?, progress=?, message=?, checkpoint_json=?, retry_count=?, updated_at=? WHERE id=?`
     ).run(
       data.status ?? cur.status, data.progress ?? cur.progress, data.message ?? cur.message,
-      JSON.stringify(data.checkpoint ?? cur.checkpoint), data.retryCount ?? cur.retryCount, now(), id
+      JSON.stringify(data.checkpoint ? { ...cur.checkpoint, ...data.checkpoint } : cur.checkpoint), data.retryCount ?? cur.retryCount, now(), id
     );
     return this.get(id);
   },

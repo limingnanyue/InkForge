@@ -11,7 +11,7 @@ const ok = (res: Response, data?: unknown) => res.json({ ok: true, data });
 const fail = (res: Response, code: string, message: string, status = 400) =>
   res.status(status).json({ ok: false, error: { code, message } });
 
-const MAX_BOOK = 1_000_000;
+const MAX_BOOK = 5_000_000;   // 升级：长篇上限 500 万字（2000 章 / 100 卷）
 const MAX_SHORT = 200_000;
 
 /**
@@ -63,9 +63,10 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
     },
   });
 
-  // 预设 checkpoint.outlineJson：daemon 会跳过 generateOutline，直接从现有大纲续写
+  // 预设 checkpoint：phase=chapter 直接跳过 scan/setup/outline（避免续写时重跑扫榜污染已有 idea）
+  // daemon 会跳过 generateOutline，直接从现有大纲续写
   if (outlineJson) {
-    taskRepo.update(task.id, { checkpoint: { outlineJson } });
+    taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson } });
   }
 
   return { task: taskRepo.get(task.id)!, project };

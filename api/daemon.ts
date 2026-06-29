@@ -6,9 +6,30 @@
  */
 import { EventEmitter } from 'events';
 import { taskRepo, taskLogRepo, chapterRepo, projectRepo, stateRepo, providerRepo } from './repos.js';
-import { runSkill, generateOutline, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines } from './engine.js';
+import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality } from './engine.js';
 import { complete } from './llm.js';
 import type { Task, StreamEvent } from '@shared/types';
+
+// ============ Cancel Token（worker 主动停止信号）============
+// 任务开始时 registerToken，cancel/pause 端点调 cancelToken 把 cancelled=true
+// 章节循环每次迭代 + withHeartbeat 的 next() 检查 isCancelled，命中则抛 CANCEL_ERROR
+// 任务结束（无论成功/失败/抛错）在 finally 块清理 token，防 Map 无限增长
+const cancelTokens = new Map<string, { cancelled: boolean }>();
+
+const CANCEL_ERROR = 'TASK_CANCELLED';
+
+export function cancelToken(taskId: string): void {
+  const t = cancelTokens.get(taskId);
+  if (t) t.cancelled = true;
+}
+
+function registerToken(taskId: string): void {
+  cancelTokens.set(taskId, { cancelled: false });
+}
+
+function isCancelled(taskId: string): boolean {
+  return cancelTokens.get(taskId)?.cancelled === true;
+}
 
 // ============ 事件总线 ============
 export const bus = new EventEmitter();
@@ -35,19 +56,26 @@ function progress(taskId: string, progress: number, message: string): void {
 
 // M7：长流式 chunk 累加包装，每 30s 调一次 taskRepo.heartbeat 防 claimNext 误回收
 // 用法：for await (const chunk of withHeartbeat(task.id, stream)) { content += chunk; }
+// BUG-3 修复：原 next()「先检查 30s → 发心跳 → 再 await inner.next()」，单次 inner.next()
+// 阻塞 4-5 分钟时期间完全无心跳，逼近 claimNext 5min 回收阈值。改用 setInterval 与 inner.next()
+// 并发：每 30s 发一次心跳，inner.next() 返回后 clearInterval。本函数无 abortSignal 入参
+// （cancel 由任务删除/状态变更实现，loop 顶层 catch 处理），finally 必然清理 interval。
 function withHeartbeat<T>(taskId: string, iter: AsyncIterable<T>): AsyncIterable<T> {
   return {
     [Symbol.asyncIterator]() {
       const inner = iter[Symbol.asyncIterator]();
-      let lastBeat = Date.now();
       return {
         next: async () => {
-          const now = Date.now();
-          if (now - lastBeat > 30_000) {
-            try { taskRepo.heartbeat(taskId); } catch { /* ignore */ }
-            lastBeat = now;
+          // 流式读取期间响应 cancel/pause：命中则抛 CANCEL_ERROR，让 for-await 上层 catch 退出
+          if (isCancelled(taskId)) throw new Error(CANCEL_ERROR);
+          const beatInterval = setInterval(() => {
+            try { taskRepo.heartbeat(taskId); } catch (e) { console.warn('[heartbeat] 失败', (e as Error).message); }
+          }, 30_000);
+          try {
+            return await inner.next();
+          } finally {
+            clearInterval(beatInterval);
           }
-          return inner.next();
         },
         return: (v?: T) => inner.return?.(v) ?? Promise.resolve({ value: undefined as any, done: true }),
         throw: (e?: any) => inner.throw?.(e) ?? Promise.resolve({ value: undefined as any, done: true }),
@@ -89,7 +117,12 @@ async function loop(): Promise<void> {
     try {
       const retryTag = task.retryCount > 0 ? `（第 ${task.retryCount + 1} 次尝试）` : '';
       logTask(task.id, 'info', `开始执行任务：${task.type}${retryTag}`);
-      await runTask(task);
+      registerToken(task.id);
+      try {
+        await runTask(task);
+      } finally {
+        cancelTokens.delete(task.id);
+      }
       // 任务执行完后再次确认任务仍存在（项目可能在执行中被删除，触发 task 级联删除）
       // D5 修复：get 单独 try/catch，DB 异常时不让已成功的任务走重试路径
       // 原 bug：get 抛错 → 冒泡到外层 catch → 把已成功的任务标记为失败重试 → 浪费 token 重做
@@ -115,6 +148,21 @@ async function loop(): Promise<void> {
       }
     } catch (e) {
       const msg = (e as Error).message;
+      // Cancel/Pause：worker 被信号停止，不重试，保持 paused/已删除状态（checkpoint 保留可 resume 续传）
+      if (msg === CANCEL_ERROR) {
+        try {
+          const fresh = taskRepo.get(task.id);
+          if (fresh) {
+            // pause 场景：任务仍存在（status=paused），记录日志
+            logTask(task.id, 'info', `任务已${fresh.status === 'paused' ? '暂停' : '取消'}，worker 在章节边界停止`);
+            emit({ type: 'task:log', taskId: task.id, level: 'warn', message: '任务已停止（checkpoint 保留，可 resume 续传）' });
+          }
+          // cancel 场景：任务已删除，task_log 随级联删除，无法写日志，只跳过重试
+        } catch (e2) {
+          console.error(`[daemon] 读取取消任务 ${task.id} 出错:`, (e2 as Error).message);
+        }
+        continue;
+      }
       // BUG-8：catch 分支的 DB 操作也单独包 try/catch，避免二次抛出杀 loop
       let fresh: Task | null = null;
       try {
@@ -196,10 +244,17 @@ async function runTask(task: Task): Promise<void> {
     case 'refine':
       await runRefine(task, model, providerId);
       break;
+    case 'refine-book':
+      await runRefineBook(task, model, providerId);
+      break;
+    default: {
+      // 防未来新增 TaskType 时 worker 卡 running → claimNext 5min 回收 → 再 claim → 死循环
+      throw new Error(`未知任务类型：${task.type}`);
+    }
   }
 }
 
-// ============ 一键成书流水线（百万字）============
+// ============ 一键成书流水线（最高 500 万字）============
 async function runBookPipeline(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
   const cfg = task.config as {
     projectId: string; targetWords: number; config: any; idea: string; title: string;
@@ -223,15 +278,44 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       temperature: 0.7, maxTokens: 512,
     });
     stateRepo.update(projectId, { idea: cfg.idea + '\n\n【扫榜洞察】\n' + scanResult });
-    taskRepo.update(task.id, { checkpoint: { phase: 'outline' } });
+    taskRepo.update(task.id, { checkpoint: { phase: 'setup', scanInsight: scanResult } });
     logTask(task.id, 'info', '扫榜完成');
+  }
+
+  // setup 阶段：生成世界观设定 + 角色档案，落库后进入 buildContextPrompt 稳定段
+  // 原 bug：daemon 跳过此阶段，state.setting/state.characters 永远为空 →
+  //   项目详情页「大纲/状态」Tab 的「世界观设定」「角色」永远空白
+  if (phase === 'scan' || phase === 'setup') {
+    const cp = task.checkpoint as { scanInsight?: string };
+    progress(task.id, 0.08, webSearch ? '生成世界观 + 角色档案 + 联网取材中…' : '生成世界观 + 角色档案…');
+    // 已有 setting 则跳过（断点续传时避免重做）
+    const curState = stateRepo.get(projectId);
+    if (!curState?.setting) {
+      await generateSetup({
+        projectId, model, providerId, config: cfg.config, idea: cfg.idea,
+        scanInsight: cp.scanInsight, webSearch,
+      });
+      logTask(task.id, 'info', '世界观 + 角色档案生成完成');
+    }
+    taskRepo.update(task.id, { checkpoint: { phase: 'outline' } });
   }
 
   // 大纲阶段
   let outline = checkpoint.outlineJson;
   if (!outline) {
-    progress(task.id, 0.1, '生成分章大纲…');
-    outline = await generateOutline({ projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch });
+    const totalChapters = Math.max(1, Math.ceil(targetWords / 2500));
+    // 超长篇（>200 章）会触发分卷生成，每卷一条日志避免长时间无输出被误判卡死
+    if (totalChapters > 200) {
+      logTask(task.id, 'info', `超长篇（${totalChapters} 章）启用分卷大纲生成，预计 ${Math.ceil(totalChapters / 20)} 卷`);
+    }
+    progress(task.id, 0.1, totalChapters > 200 ? `分卷大纲生成中（共 ${Math.ceil(totalChapters / 20)} 卷）…` : '生成分章大纲…');
+    outline = await generateOutline({
+      projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch,
+      onVolumeProgress: (done, total) => {
+        logTask(task.id, 'info', `大纲分卷生成 ${done}/${total} 卷完成`);
+        progress(task.id, 0.1 + 0.05 * (done / total), `大纲分卷 ${done}/${total}…`);
+      },
+    });
     taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline } });
     logTask(task.id, 'info', '大纲生成完成');
   }
@@ -275,12 +359,16 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // 补全缺失的章节摘要（保证上下文流畅）；传 chapters 让重启补全也带上 positioning/coreEmotion
     // onProgress 每章一条日志：避免 80 章回填时长时间无输出被误判卡死
     const recon = await reconcileState(projectId, model, providerId, chapters, (done, total) => {
+      // reconcileState 含串行 LLM 调用（80 章回填可能 40-80 分钟），每章回填后发心跳
+      // 否则 task.updated_at 停滞超过 claimNext 的 5 分钟阈值，多 worker 下任务会被误回收
+      taskRepo.heartbeat(task.id);
       if (total > 0) logTask(task.id, 'info', `补全剧情记忆 ${done}/${total}（重启回填）`);
     });
     if (recon.backfilled > 0) logTask(task.id, 'info', `补全 ${recon.backfilled} 章缺失记忆完成`);
   }
 
   for (let i = startIdx; i < chapters.length; i++) {
+    if (isCancelled(task.id)) throw new Error(CANCEL_ERROR);
     const ch = chapters[i];
     progress(task.id, 0.1 + (0.8 * (i / chapters.length)), `正在生成第 ${i + 1}/${chapters.length} 章《${ch.title}》`);
 
@@ -310,17 +398,58 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // maxTokens 按定位系数微调：高压章 1.1×，信息/低压章 0.8-0.85×（贴合字数预算Σ契约）
     const TOKEN_MULT: Record<string, number> = { 'high-pressure': 1.1, 'normal-progress': 1.0, 'trial-error': 0.9, 'relationship': 1.0, 'low-pressure': 0.85, 'info-organize': 0.8 };
     const chapterMaxTokens = Math.round(2500 * (ch.positioning ? (TOKEN_MULT[ch.positioning] ?? 1.0) : 1.0));
+    // 章节字数预算（用于质量门判定）
+    const wordBudget = chapterMaxTokens;  // token 与字数近似 1:1（中文）
+
+    // 章节质量门：生成 → 质检 → 不达标重写一次（避免死循环 + 浪费 token，最多 1 次重写）
     try {
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch }))) {
-        content += chunk;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        content = '';
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch }))) {
+          content += chunk;
+        }
+        // 质量门检测（字数门 + 跑题门）
+        try {
+          const quality = await checkChapterQuality({
+            projectId, model, providerId,
+            chapterIdx: i, chapterTitle: ch.title, outline: ch.outline,
+            positioning: ch.positioning, coreEmotion: ch.coreEmotion,
+            content, wordBudget,
+          });
+          if (quality.ok) {
+            if (quality.issues.length > 0) {
+              logTask(task.id, 'info', `第 ${i + 1} 章质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
+            }
+            break;  // 通过，跳出重写循环
+          }
+          // 不达标：attempt === 0 时重写一次，attempt === 1 时保留最后结果
+          if (attempt === 0) {
+            logTask(task.id, 'warn', `第 ${i + 1} 章质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+            continue;  // 重写一次
+          }
+          // 重写后仍不达标：保留最后一次结果，标记 warn，不阻断流程
+          logTask(task.id, 'warn', `第 ${i + 1} 章重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
+          break;
+        } catch (e) {
+          // 质检异常：不阻断，用当前 content 继续
+          logTask(task.id, 'warn', `第 ${i + 1} 章质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
+          break;
+        }
       }
     } catch (e) {
       // 生成失败：回滚 chapter 状态，避免卡在 generating 永远显示"生成中"
       // try/catch 包裹：状态回滚自身若失败（如 DB 约束）不应覆盖原始 LLM 异常
-      try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch { /* 忽略 */ }
+      try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
       throw e;
     }
     chapterRepo.update(chapter.id, { content, status: 'done' });
+    // 同步把刚生成的正文写回 fresh[i] 快照，让下一章的 prevHistory 能取到本章正文
+    // 原 BUG：fresh 是循环开始前的快照，循环内 DB 已更新但 fresh 不变 →
+    //   fresh[i-1].content 永远是空值 → 从第 2 章起 prevHistory 永远为空
+    //   → 上一章承接信息丢失，跨章一致性变差，OpenAI/Anthropic 缓存命中也失效
+    if (fresh[i]) {
+      fresh[i] = { ...fresh[i], content, status: 'done' as const };
+    }
 
     // 每章后立即更新防跑偏三件套（章节摘要/伏笔/角色状态）
     // oh-story：传入大纲里的 positioning + coreEmotion，落库到 ChapterSummary 供三层归档展示
@@ -363,7 +492,21 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   };
   const { projectId, targetWords } = cfg;
   const segmentCount = Math.max(1, Math.ceil(targetWords / 5000));
-  const checkpoint = task.checkpoint as { segmentIdx?: number; outlineJson?: string };
+  const checkpoint = task.checkpoint as { segmentIdx?: number; outlineJson?: string; setupDone?: boolean };
+
+  // setup 阶段：生成世界观 + 角色档案（短篇同样需要，让正文人设有据可循）
+  // 原 bug：短篇 pipeline 直接生成大纲，state.setting/state.characters 永远为空
+  if (!checkpoint.setupDone) {
+    const curState = stateRepo.get(projectId);
+    if (!curState?.setting) {
+      progress(task.id, 0.05, webSearch ? '生成世界观 + 角色档案 + 联网取材中…' : '生成世界观 + 角色档案…');
+      await generateSetup({
+        projectId, model, providerId, config: cfg.config, idea: cfg.idea, webSearch,
+      });
+      logTask(task.id, 'info', '世界观 + 角色档案生成完成');
+    }
+    taskRepo.update(task.id, { checkpoint: { setupDone: true } });
+  }
 
   // 生成短篇大纲（分段）—— 断点续传
   let outlineJson = checkpoint.outlineJson;
@@ -381,7 +524,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       temperature: 0.8, maxTokens: 8192,  // 与 book pipeline 一致；2048 会让 LLM 输出在段数多时被截断（无闭合 ]）
     });
     outlineJson = outlineText;
-    taskRepo.update(task.id, { checkpoint: { outlineJson } });
+    taskRepo.update(task.id, { checkpoint: { setupDone: true, outlineJson } });
   }
   const segments = parseOutline(outlineJson).map(s => ({ ...s, hook: '' }));
   if (segments.length === 0) {
@@ -403,10 +546,14 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   if (startIdx < segments.length) {
     logTask(task.id, 'info', `重启筛查：已完成 ${startIdx}/${segments.length} 段，从第 ${startIdx + 1} 段续写`);
     // 传 segments 让重启补全也带上 positioning/coreEmotion（与 book 流水线一致）
-    await reconcileState(projectId, model, providerId, segments);
+    // onProgress 加心跳：reconcileState 串行 LLM 调用耗时长，防 claimNext 5min 阈值误回收
+    await reconcileState(projectId, model, providerId, segments, () => {
+      taskRepo.heartbeat(task.id);
+    });
   }
 
   for (let i = startIdx; i < segments.length; i++) {
+    if (isCancelled(task.id)) throw new Error(CANCEL_ERROR);
     const seg = segments[i];
     progress(task.id, 0.1 + 0.8 * (i / segments.length), `生成第 ${i + 1}/${segments.length} 段《${seg.title}》`);
     let chapter = existingShort[i];
@@ -418,17 +565,51 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     const segPrevHistory = i > 0 && existingShort[i - 1]?.content
       ? [{ role: 'assistant' as const, content: existingShort[i - 1].content.slice(0, 4000) }]
       : [];
+    // 短篇质量门：生成 → 质检 → 不达标重写一次（与 book 流水线一致，wordBudget=5000）
     try {
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 5000 字（4500-5500 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: 5000, webSearch }))) {
-        content += chunk;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        content = '';
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 5000 字（4500-5500 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: 5000, webSearch }))) {
+          content += chunk;
+        }
+        // 质量门检测（字数门 + 跑题门）
+        try {
+          const quality = await checkChapterQuality({
+            projectId, model, providerId,
+            chapterIdx: i, chapterTitle: seg.title, outline: seg.outline,
+            positioning: seg.positioning, coreEmotion: seg.coreEmotion,
+            content, wordBudget: 5000,
+          });
+          if (quality.ok) {
+            if (quality.issues.length > 0) {
+              logTask(task.id, 'info', `第 ${i + 1} 段质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
+            }
+            break;
+          }
+          if (attempt === 0) {
+            logTask(task.id, 'warn', `第 ${i + 1} 段质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+            continue;
+          }
+          logTask(task.id, 'warn', `第 ${i + 1} 段重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
+          break;
+        } catch (e) {
+          logTask(task.id, 'warn', `第 ${i + 1} 段质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
+          break;
+        }
       }
     } catch (e) {
       // 生成失败：回滚段状态，避免卡在 generating
       // try/catch 包裹：状态回滚自身若失败（如 DB 约束）不应覆盖原始 LLM 异常
-      try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch { /* 忽略 */ }
+      try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
       throw e;
     }
     chapterRepo.update(chapter.id, { content, status: 'done' });
+    // 同步把刚生成的正文写回 existingShort[i] 快照，让下一段的 segPrevHistory 能取到本段正文
+    // 原 BUG：existingShort 是循环开始前的快照，循环内 DB 已更新但快照不变 →
+    //   existingShort[i-1].content 永远是空值 → 从第 2 段起 segPrevHistory 永远为空
+    if (existingShort[i]) {
+      existingShort[i] = { ...existingShort[i], content, status: 'done' as const };
+    }
     // 每段后更新防跑偏记忆（传 positioning/coreEmotion 与 book 流水线一致）
     // 失败不阻断正文落库：状态更新失败只 warn，不让单段状态失败导致整任务重试
     try {
@@ -467,12 +648,38 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   let content = '';
   // D1 修复：流失败时回滚 status='failed'，避免 chapter 永远卡 'generating' 显示「生成中」
   // 与 runBookPipeline / runShortPipeline 行为一致
+  // 单章质量门：与流水线一致，不达标重写一次（wordBudget=2500）
   try {
-    for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 2000-3000 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: 2500, webSearch }))) {
-      content += chunk;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      content = '';
+      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 2000-3000 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: 2500, webSearch }))) {
+        content += chunk;
+      }
+      try {
+        const quality = await checkChapterQuality({
+          projectId: chapter.projectId, model, providerId,
+          chapterIdx: chapter.orderIdx, chapterTitle: chapter.title, outline: chapter.outline,
+          content, wordBudget: 2500,
+        });
+        if (quality.ok) {
+          if (quality.issues.length > 0) {
+            logTask(task.id, 'info', `《${chapter.title}》质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
+          }
+          break;
+        }
+        if (attempt === 0) {
+          logTask(task.id, 'warn', `《${chapter.title}》质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+          continue;
+        }
+        logTask(task.id, 'warn', `《${chapter.title}》重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
+        break;
+      } catch (e) {
+        logTask(task.id, 'warn', `《${chapter.title}》质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
+        break;
+      }
     }
   } catch (e) {
-    try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch { /* 忽略回滚失败 */ }
+    try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
     throw e;
   }
   chapterRepo.update(chapter.id, { content, status: 'done' });
@@ -480,8 +687,9 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   // 单章无 positioning（大纲里没有），传 undefined 走默认定位
   try {
     await updateStateFromGeneration(chapter.projectId, model, providerId, chapter.orderIdx);
-  } catch {
+  } catch (e) {
     // 状态更新失败不阻断单章生成主流程
+    console.warn('[chapter-status-update] 失败', (e as Error).message);
   }
 }
 
@@ -501,6 +709,87 @@ async function runRefine(task: Task, model: string, providerId?: string): Promis
   }
   chapterRepo.snapshot(chapter.id);
   if (refined.length > 100) chapterRepo.update(chapter.id, { content: refined });
+}
+
+// ============ 整书去 AI 味精修（守护进程批量任务）============
+// 遍历项目所有 done 章节，逐章跑 refine skill 去 AI 味
+// 支持断点续传：checkpoint.lastChapterId 记录上次精修到哪一章，重试/续传时跳过已精修章节
+// 与 runBookPipeline 一致的工程化：心跳防回收 + cancel token + 章节边界检查
+async function runRefineBook(task: Task, model: string, providerId?: string): Promise<void> {
+  const cfg = task.config as { projectId: string };
+  const projectId = cfg.projectId;
+
+  // 每次启动重新拉取最新章节列表（避免两次运行之间章节被删/改导致下标错位）
+  const allChapters = chapterRepo.listByProject(projectId).filter(c => c.content && c.content.length > 100);
+  if (allChapters.length === 0) throw new Error('项目无已生成内容的章节，无可精修对象');
+  const total = allChapters.length;
+
+  // 断点续传：用 lastChapterId 定位（比下标稳定，章节删改不会错位）
+  // refinedCount 用于前端显示「已精修 N/M」
+  const checkpoint = task.checkpoint as { lastChapterId?: string; totalChapters?: number; refinedCount?: number };
+  let startIdx = 0;
+  if (checkpoint.lastChapterId) {
+    const lastDoneIdx = allChapters.findIndex(c => c.id === checkpoint.lastChapterId);
+    if (lastDoneIdx >= 0) startIdx = lastDoneIdx + 1;  // 从下一章开始
+  }
+
+  // 已全部精修过
+  if (startIdx >= total) {
+    logTask(task.id, 'info', `整书精修已完成（共 ${total} 章），无需重做`);
+    progress(task.id, 1, '整书精修已完成');
+    return;
+  }
+
+  logTask(task.id, 'info', `整书精修启动：共 ${total} 章，从第 ${startIdx + 1} 章开始`);
+
+  for (let i = startIdx; i < total; i++) {
+    if (isCancelled(task.id)) throw new Error(CANCEL_ERROR);
+    const ch = allChapters[i];
+    progress(task.id, 0.05 + 0.9 * (i / total), `精修第 ${i + 1}/${total} 章《${ch.title}》`);
+
+    // 跳过空内容（理论上前面 filter 已过滤，双保险）
+    if (!ch.content || ch.content.length < 100) {
+      logTask(task.id, 'warn', `第 ${i + 1} 章内容过短（${ch.content?.length || 0} 字），跳过精修`);
+      taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, totalChapters: total, refinedCount: i + 1 } });
+      continue;
+    }
+
+    let refined = '';
+    // 精修 maxTokens 按原文字数 × 1.1（与 runRefine 一致，防注水扩写）
+    const refineMaxTokens = Math.max(2000, Math.round((ch.wordCount || ch.content.length) * 1.1));
+    try {
+      for await (const chunk of withHeartbeat(task.id, runSkill({
+        projectId, skill: 'refine', model, providerId,
+        userPrompt: `精修以下正文：\n${ch.content}`,
+        maxTokens: refineMaxTokens, webSearch: false,  // 精修不应联网
+      }))) {
+        refined += chunk;
+      }
+    } catch (e) {
+      // cancel 信号：不推进 checkpoint，直接抛出让 loop 识别（与 runBookPipeline 一致）
+      if ((e as Error).message === CANCEL_ERROR) throw e;
+      // 单章精修失败：不阻断整书流程，记 warn 继续下一章
+      logTask(task.id, 'warn', `第 ${i + 1} 章精修失败（跳过，不影响其他章）：${(e as Error).message.slice(0, 100)}`);
+      taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, totalChapters: total, refinedCount: i + 1 } });
+      continue;
+    }
+
+    // 精修结果过短（< 100 字）视为失败，不覆盖原内容
+    if (refined.length < 100) {
+      logTask(task.id, 'warn', `第 ${i + 1} 章精修结果过短（${refined.length} 字），保留原文不覆盖`);
+    } else {
+      // 精修前先存快照（与 runRefine 一致，保留精修前版本供回滚）
+      chapterRepo.snapshot(ch.id);
+      chapterRepo.update(ch.id, { content: refined });
+      logTask(task.id, 'info', `第 ${i + 1} 章精修完成：${ch.content.length} 字 → ${refined.length} 字`);
+    }
+
+    // checkpoint 推进（每章后立即写，断点续传粒度 = 1 章）
+    taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, totalChapters: total, refinedCount: i + 1 } });
+  }
+
+  progress(task.id, 1, `整书精修完成（共 ${total} 章）`);
+  logTask(task.id, 'info', `整书精修完成（共 ${total} 章）`);
 }
 
 function sleep(ms: number): Promise<void> {

@@ -20,8 +20,9 @@ const REPOS = [
 ];
 
 export default function Settings() {
-  const [theme, setTheme] = useState<Theme>('dark');
-  const [fs, setFs] = useState(15);
+  // BUG-6 修复：主题/字号从 localStorage 初始化，刷新不丢失
+  const [theme, setTheme] = useState<Theme>(() => { try { return (localStorage.getItem('inkforge.theme') as Theme) || 'dark'; } catch { return 'dark'; } });
+  const [fs, setFs] = useState(() => { try { return Number(localStorage.getItem('inkforge.fontSize')) || 15; } catch { return 15; } });
   const [conn, setConn] = useState<'checking' | 'ok' | 'fail'>('checking');
   const [tableCount, setTableCount] = useState<number | null>(null);
   const [clearOpen, setClearOpen] = useState(false);
@@ -60,9 +61,12 @@ export default function Settings() {
         body{color:var(--paper);background:var(--ink-900);}
         .aura{display:none;}`;
     } else if (style) { style.remove(); }
+    // BUG-6 修复：主题写入 localStorage 持久化
+    try { localStorage.setItem('inkforge.theme', theme); } catch {}
   }, [theme]);
 
-  useEffect(() => { document.documentElement.style.fontSize = `${fs}px`; }, [fs]);
+  // BUG-6 修复：字号写入 localStorage 持久化
+  useEffect(() => { document.documentElement.style.fontSize = `${fs}px`; try { localStorage.setItem('inkforge.fontSize', String(fs)); } catch {} }, [fs]);
 
   // 连通性验证
   useEffect(() => {
@@ -77,7 +81,21 @@ export default function Settings() {
   }, []);
 
   const clearCache = () => {
-    try { localStorage.clear(); sessionStorage.clear(); } catch { /* ignore */ }
+    // BUG-6 修复：白名单保留用户偏好键，避免 localStorage.clear() 误清
+    // inkforge.currentModel / currentProviderId / theme / fontSize / cover.style / cover.author。
+    // Modal 文案承诺「不影响服务器数据与项目内容」，故偏好需写回。
+    const PRESERVE = [
+      'inkforge.currentModel', 'inkforge.currentProviderId',
+      'inkforge.theme', 'inkforge.fontSize',
+      'inkforge.cover.style', 'inkforge.cover.author',
+    ];
+    try {
+      const saved: Record<string, string> = {};
+      for (const k of PRESERVE) { const v = localStorage.getItem(k); if (v !== null) saved[k] = v; }
+      localStorage.clear();
+      for (const k of PRESERVE) { if (k in saved) localStorage.setItem(k, saved[k]); }
+    } catch { /* localStorage 不可用，忽略 */ }
+    try { sessionStorage.clear(); } catch { /* ignore */ }
     toast('本地缓存已清空');
     setClearOpen(false);
   };

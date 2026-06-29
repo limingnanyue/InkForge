@@ -22,6 +22,8 @@ fs.mkdirSync(EXPORT_DIR, { recursive: true });
 export const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// 多 worker 并发时 SQLITE_BUSY 不立即抛错，等待 5s 重试（better-sqlite3 默认 busy_timeout=0）
+db.pragma('busy_timeout = 5000');
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS project (
@@ -212,31 +214,33 @@ function migrateLegacySchema(): void {
   // 副作用：旧 status='generating' 的卡死章节会被强制回滚为 'draft'，避免再次启动后被 CHECK 拒绝写入 'failed'
   const chapterSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chapter'").get() as { sql: string } | undefined;
   if (chapterSchema && !chapterSchema.sql.includes("'failed'")) {
-    db.exec('BEGIN');
-    db.exec(`CREATE TABLE chapter_new (
-      id TEXT PRIMARY KEY,
-      project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
-      parent_id TEXT REFERENCES chapter(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      outline TEXT DEFAULT '',
-      content TEXT DEFAULT '',
-      order_idx INTEGER NOT NULL DEFAULT 0,
-      word_count INTEGER NOT NULL DEFAULT 0,
-      status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','generating','done','failed')),
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      CHECK(parent_id IS NULL OR parent_id != id)
-    )`);
-    // 旧 generating 状态视为无效（启动时无人持有），回滚为 draft
-    db.exec(`INSERT INTO chapter_new (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, created_at, updated_at)
-             SELECT id, project_id, parent_id, title, outline, content, order_idx, word_count,
-                    CASE WHEN status='generating' THEN 'draft' ELSE status END, created_at, updated_at
-             FROM chapter`);
-    db.exec('DROP TABLE chapter');
-    db.exec('ALTER TABLE chapter_new RENAME TO chapter');
-    db.exec('CREATE INDEX IF NOT EXISTS idx_chapter_project ON chapter(project_id)');
-    db.exec('CREATE INDEX IF NOT EXISTS idx_chapter_parent ON chapter(parent_id)');
-    db.exec('COMMIT');
+    // 用 better-sqlite3 的 transaction 包装：异常时自动 ROLLBACK
+    // 原裸 BEGIN/COMMIT 无 try/catch，中途失败事务保持打开（better-sqlite3 不自动回滚裸 BEGIN）
+    db.transaction(() => {
+      db.exec(`CREATE TABLE chapter_new (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        parent_id TEXT REFERENCES chapter(id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        outline TEXT DEFAULT '',
+        content TEXT DEFAULT '',
+        order_idx INTEGER NOT NULL DEFAULT 0,
+        word_count INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','generating','done','failed')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK(parent_id IS NULL OR parent_id != id)
+      )`);
+      // 旧 generating 状态视为无效（启动时无人持有），回滚为 draft
+      db.exec(`INSERT INTO chapter_new (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, created_at, updated_at)
+               SELECT id, project_id, parent_id, title, outline, content, order_idx, word_count,
+                      CASE WHEN status='generating' THEN 'draft' ELSE status END, created_at, updated_at
+               FROM chapter`);
+      db.exec('DROP TABLE chapter');
+      db.exec('ALTER TABLE chapter_new RENAME TO chapter');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_chapter_project ON chapter(project_id)');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_chapter_parent ON chapter(parent_id)');
+    })();
   }
 }
 

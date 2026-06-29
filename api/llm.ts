@@ -143,6 +143,8 @@ export async function* streamComplete(opts: LLMOptions): AsyncGenerator<string> 
 
   // 串接 onUsage：内部捕获 usage 用于入库，同时透传给调用方回调
   let captured: Usage | null = null;
+  // BUG-5: 累积输出文本，供 provider 未上报 usage 时按字符粗估 token 用量
+  let acc = '';
   const userOnUsage = opts.onUsage;
   const optsWithUsage: LLMOptions = {
     ...opts,
@@ -156,10 +158,10 @@ export async function* streamComplete(opts: LLMOptions): AsyncGenerator<string> 
   try {
     switch (provider.kind) {
       case 'anthropic':
-        yield* streamAnthropic(provider, optsWithUsage);
+        for await (const c of streamAnthropic(provider, optsWithUsage)) { acc += c; yield c; }
         break;
       case 'gemini':
-        yield* streamGemini(provider, optsWithUsage);
+        for await (const c of streamGemini(provider, optsWithUsage)) { acc += c; yield c; }
         break;
       case 'openai':
       case 'deepseek':
@@ -173,7 +175,7 @@ export async function* streamComplete(opts: LLMOptions): AsyncGenerator<string> 
       case 'ollama':
       case 'custom':
       default:
-        yield* streamOpenAICompatible(provider, optsWithUsage);
+        for await (const c of streamOpenAICompatible(provider, optsWithUsage)) { acc += c; yield c; }
         break;
     }
   } finally {
@@ -187,11 +189,28 @@ export async function* streamComplete(opts: LLMOptions): AsyncGenerator<string> 
           model: opts.model,
           usage: captured,
         });
-      } catch { /* 静默 */ }
+      } catch (e) { console.warn('[usage-insert] 失败', (e as Error).message); }
     } else {
-      // 未捕获到 usage：provider 未上报（国产厂商在 stream_options 不支持时常见）
-      // 告警便于排查统计缺失，不阻断主流程
-      console.warn(`[usage] ${provider.name}/${opts.model} 未上报 token 用量，统计将缺失此次调用`);
+      // BUG-5: 未捕获到 usage（provider 不支持 stream_options.include_usage，国产厂商/自定义网关常见）
+      // 按 acc.length / 1.5 粗估 token（中文 1 token ≈ 1.5 字符），input 约为 output 的 30%（system+history）
+      // model 加 ` (estimated)` 后缀标记，避免与真实 usage 混淆；acc 为本次流式累计的输出文本
+      const outputTokens = Math.round(acc.length / 1.5);
+      const inputTokens = Math.round(outputTokens * 0.3);
+      const estimated: Usage = {
+        inputTokens,
+        outputTokens,
+        totalTokens: inputTokens + outputTokens,
+      };
+      try {
+        usageRepo.record({
+          projectId: opts.projectId ?? null,
+          providerId: provider.id,
+          providerName: provider.name,
+          model: `${opts.model} (estimated)`,
+          usage: estimated,
+        });
+      } catch (e) { console.warn('[usage-insert] 失败', (e as Error).message); }
+      console.warn(`[usage] ${provider.name}/${opts.model} 未上报 token 用量，已按字符粗估入库（output≈${outputTokens}, input≈${inputTokens}）`);
     }
   }
 }

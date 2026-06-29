@@ -126,7 +126,7 @@ export interface ChatMessage {
 }
 
 // 守护进程任务
-export type TaskType = 'book' | 'short' | 'chapter' | 'refine';
+export type TaskType = 'book' | 'short' | 'chapter' | 'refine' | 'refine-book';
 export type TaskStatus = 'queued' | 'running' | 'paused' | 'done' | 'failed';
 
 export interface Task {

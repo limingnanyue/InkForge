@@ -12,7 +12,7 @@ import type { Task, TaskLog } from '@shared/types';
 
 const STATUS_BADGE: Record<string, string> = { running: 'badge-amber', queued: 'badge-mute', paused: 'badge-mute', done: 'badge-green', failed: 'badge-red' };
 const STATUS_TEXT: Record<string, string> = { running: '运行中', queued: '排队', paused: '已暂停', done: '完成', failed: '失败' };
-const TYPE_TEXT: Record<string, string> = { book: '成书', short: '成短篇', chapter: '章节生成', refine: '精修' };
+const TYPE_TEXT: Record<string, string> = { book: '成书', short: '成短篇', chapter: '章节生成', refine: '精修', 'refine-book': '整书精修' };
 
 interface DaemonStatus { running: number; queued: number; done: number; failed: number; total: number; }
 
@@ -32,6 +32,13 @@ function fmtCheckpoint(task: Task): string | null {
   if (task.type === 'short') {
     const seg = cp.segmentIdx as number | undefined;
     return seg != null ? `片段 ${seg}` : null;
+  }
+  if (task.type === 'refine-book') {
+    const done = cp.refinedCount as number | undefined;
+    const total = cp.totalChapters as number | undefined;
+    if (done != null && total != null) return `已精修 ${done}/${total} 章`;
+    if (total != null) return `共 ${total} 章`;
+    return null;
   }
   return null;
 }
@@ -124,7 +131,7 @@ export default function Daemon() {
           {tasks.map((t, i) => (
             <TaskRow key={t.id} task={t} index={i} expanded={expanded === t.id}
               onToggle={() => setExpanded(prev => prev === t.id ? null : t.id)}
-              onAction={refresh} />
+              onAction={refresh} toast={toast} />
           ))}
         </div>
       )}
@@ -146,15 +153,16 @@ function StatCard({ label, value, color, index }: { label: string; value: number
   );
 }
 
-function TaskRow({ task, expanded, onToggle, onAction, index }: {
+function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
   task: Task; expanded: boolean; onToggle: () => void; onAction: () => void; index: number;
+  toast: (msg: string, type?: 'ok' | 'err') => void;
 }) {
-  const { toast } = useToast();
   const [logs, setLogs] = useState<TaskLog[] | null>(null);
   const [logLoading, setLogLoading] = useState(false);
 
   const loadLogs = async () => {
-    if (logs) return;
+    // BUG-8 修复：去掉「if (logs) return」永久缓存，每次展开都重新拉取，
+    // 否则任务持续运行产生的新日志在折叠再展开后看到的仍是首次展开时的旧日志
     setLogLoading(true);
     try { setLogs(await api.tasks.logs(task.id)); }
     catch (e) { toast((e as Error).message, 'err'); }

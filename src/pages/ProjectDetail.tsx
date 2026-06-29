@@ -1,7 +1,7 @@
 /**
  * 项目详情 —— 章节树编辑器
  */
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play } from 'lucide-react';
 import { api } from '@/api/client';
@@ -10,7 +10,7 @@ import { Spinner, ProgressBar, fmtWords, Modal, useToast } from '@/components/ui
 import GenreSelect from '@/components/GenreSelect';
 import type { Project, Chapter, ChapterNode, AgentState, ProjectType } from '@shared/types';
 import { cn } from '@/lib/utils';
-import ChapterTree, { flatten, countAll, countSnapshots, mutateNode } from './ChapterTree';
+import ChapterTree, { flatten, countSnapshots, mutateNode } from './ChapterTree';
 
 const STATUS: Record<string, [string, string]> = {
   draft: ['badge-mute', '草稿'], generating: ['badge-amber', '生成中'], done: ['badge-green', '完成'],
@@ -57,6 +57,11 @@ export default function ProjectDetail() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [continueBusy, setContinueBusy] = useState(false);
+  const [refineBookBusy, setRefineBookBusy] = useState(false);
+
+  // BUG1 修复：缓存 flatten 结果，避免 countAll(tree) 与移动端下拉在每次 render 多次全树遍历
+  const flatTree = useMemo(() => flatten(tree), [tree]);
+  const chapterCount = useMemo(() => flatTree.length, [flatTree]);
 
   const confirmDelete = async () => {
     if (!project) return;
@@ -80,6 +85,19 @@ export default function ProjectDetail() {
       navigate('/daemon');
     } catch (e) { toast((e as Error).message, 'err'); }
     finally { setContinueBusy(false); }
+  };
+
+  // 整书去 AI 味精修：批量精修项目所有已生成章节，入队守护进程任务
+  // 透传当前所选 model/providerId（不传则后端回落到 default 旗舰）
+  const refineBook = async () => {
+    if (!project) return;
+    setRefineBookBusy(true);
+    try {
+      await api.projects.refineBook(project.id, currentModel || undefined, currentProviderId || undefined);
+      toast('已派发整书精修任务到守护进程');
+      navigate('/daemon');
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setRefineBookBusy(false); }
   };
 
   const load = useCallback(async () => {
@@ -139,15 +157,21 @@ export default function ProjectDetail() {
     if (saveRef.current) window.clearTimeout(saveRef.current);
     const sid = selected.id;
     saveRef.current = window.setTimeout(async () => {
-      try { await api.chapters.update(sid, patch); } catch (e) { toast((e as Error).message, 'err'); }
+      try {
+        await api.chapters.update(sid, patch);
+        // BUG1 修复：setTree 延迟到防抖保存成功后执行，避免每次按键都 mutateNode（O(n) 全树复制）
+        setTree(prev => mutateNode(prev, sid, n => Object.assign(n, patch)));
+      } catch (e) { toast((e as Error).message, 'err'); }
     }, 800);
   };
+  // BUG-5 修复：组件卸载时清理防抖定时器，避免编辑后立刻返回作品库时 800ms 定时器
+  // 仍触发 api.chapters.update（对已删除章节 404，对仍存在章节写脏值）
+  useEffect(() => () => { if (saveRef.current) window.clearTimeout(saveRef.current); }, []);
 
   const onEdit = (patch: Partial<Chapter>) => {
     if (!selected) return;
-    const sid = selected.id;
+    // BUG1 修复：打字时只更新 selected 本地态，不立即 setTree（避免每键 O(n) 复制整棵树）
     setSelected({ ...selected, ...patch });
-    setTree(prev => mutateNode(prev, sid, n => Object.assign(n, patch)));
     scheduleSave(patch);
   };
 
@@ -156,7 +180,7 @@ export default function ProjectDetail() {
   const newChapter = async () => {
     if (!id) return;
     try {
-      const c = await api.projects.addChapter(id, { title: `第 ${countAll(tree) + 1} 章`, parentId: null, outline: '', content: '' });
+      const c = await api.projects.addChapter(id, { title: `第 ${chapterCount + 1} 章`, parentId: null, outline: '', content: '' });
       await load();
       setSelected({ ...c, children: [] });
       toast('已新建章节');
@@ -197,6 +221,8 @@ export default function ProjectDetail() {
 
   // 摘要失焦保存
   const onBlurSummary = async () => {
+    // BUG4 修复：生成期间（含 textarea 被 disabled 触发的程序化 blur）跳过，避免覆盖 AI 刚生成的值
+    if (genSummaryBusy) return;
     if (!project) return;
     if (summary === project.summary) return;
     try {
@@ -227,11 +253,47 @@ export default function ProjectDetail() {
   };
 
   // AI 生成封面提示词：调 LLM 生成中英双段 prompt，落 agent_state.cover
+  // 升级：支持风格预设 / 书名覆盖 / 作者署名，跨项目记忆风格与作者
+  const COVER_STYLE_OPTIONS: Array<{ key: string; label: string }> = [
+    { key: 'realistic',  label: '写实摄影' },
+    { key: 'anime',      label: '动漫' },
+    { key: 'oil',        label: '油画' },
+    { key: 'watercolor', label: '水彩' },
+    { key: 'cyberpunk',  label: '赛博朋克' },
+    { key: 'fantasy',    label: '奇幻' },
+    { key: 'aesthetic',  label: '唯美插画' },
+    { key: 'retro',      label: '复古' },
+    { key: 'monochrome', label: '黑白' },
+    { key: 'inkwash',    label: '东方水墨' },
+  ];
   const [coverDraft, setCoverDraft] = useState('');
   const [genCoverBusy, setGenCoverBusy] = useState(false);
+  // 风格 / 作者：跨项目记忆（localStorage 持久化）
+  const [coverStyle, setCoverStyle] = useState<string>(() => {
+    try { return localStorage.getItem('inkforge.cover.style') || 'realistic'; }
+    catch { return 'realistic'; }
+  });
+  const [coverAuthor, setCoverAuthor] = useState<string>(() => {
+    try { return localStorage.getItem('inkforge.cover.author') || ''; }
+    catch { return ''; }
+  });
+  // 书名：默认跟随 project.title，用户手动改动后保留用户值
+  const [coverBookTitle, setCoverBookTitle] = useState<string>('');
+  const coverTitleTouchedRef = useRef(false);
   // G6 修复：脏标记防 coverDraft 被重拉的 agentState.cover 覆盖未保存编辑
   // 触发场景：用户编辑 textarea 未 blur → 切 Tab 触发 loadState 重拉 → effect 把 coverDraft 重置为服务端旧值
   const coverDirtyRef = useRef(false);
+  // 切换项目时重置书名 touched 标记与 coverDraft 脏标记，让新书名跟随新 project.title，避免旧值残留串到新项目
+  useEffect(() => {
+    coverTitleTouchedRef.current = false;
+    setCoverBookTitle('');
+    coverDirtyRef.current = false;
+  }, [id]);
+  useEffect(() => {
+    if (!coverTitleTouchedRef.current && project) {
+      setCoverBookTitle(project.title);
+    }
+  }, [project?.title, project]);
   // 当 agentState 加载后，把 cover 同步到 coverDraft 供编辑（仅当用户未在编辑时）
   useEffect(() => {
     if (!coverDirtyRef.current) setCoverDraft(agentState?.cover || '');
@@ -240,9 +302,18 @@ export default function ProjectDetail() {
     if (!project) return;
     setGenCoverBusy(true);
     try {
-      const { cover } = await api.projects.generateCover(
-        project.id, currentModel || undefined, currentProviderId || undefined,
-      );
+      // 持久化风格 / 作者（跨项目复用，避免每次重选）
+      try {
+        localStorage.setItem('inkforge.cover.style', coverStyle);
+        localStorage.setItem('inkforge.cover.author', coverAuthor);
+      } catch { /* localStorage 不可用，忽略 */ }
+      const { cover } = await api.projects.generateCover(project.id, {
+        model: currentModel || undefined,
+        providerId: currentProviderId || undefined,
+        style: coverStyle,
+        bookTitle: coverBookTitle.trim() || project.title,
+        author: coverAuthor.trim() || undefined,
+      });
       setCoverDraft(cover);
       coverDirtyRef.current = false;  // 生成的新值已是服务端最新，清脏标记
       // 同步本地 agentState（避免再次切 Tab 拉取）
@@ -253,6 +324,8 @@ export default function ProjectDetail() {
   };
   // 封面提示词失焦保存（走 PATCH /state）
   const onBlurCover = async () => {
+    // BUG4 修复：生成期间跳过，避免覆盖 AI 刚生成的封面提示词
+    if (genCoverBusy) return;
     if (!project || !agentState) return;
     if (coverDraft === agentState.cover) return;
     try {
@@ -309,8 +382,11 @@ export default function ProjectDetail() {
             <p className="mt-1 text-[10px] text-paper-mute">{fmtWords(project.currentWords)} / {fmtWords(project.targetWords)}</p>
           </div>
           <button className="btn-ghost py-1.5 text-xs" onClick={() => navigate('/studio')}>工作台</button>
-          <button className="btn-primary py-1.5 text-xs" onClick={continueWriting} disabled={continueBusy} title="派发续写任务到守护进程">
+          <button className="btn-primary py-1.5 text-xs" onClick={continueWriting} disabled={continueBusy || refineBookBusy} title="派发续写任务到守护进程">
             {continueBusy ? <Spinner className="h-3.5 w-3.5" /> : <Play size={13} />} 继续写作
+          </button>
+          <button className="btn-ghost py-1.5 text-xs text-amber" onClick={refineBook} disabled={refineBookBusy || continueBusy || chapterCount === 0} title={chapterCount === 0 ? '项目无章节，无法精修' : '批量精修所有章节去 AI 味（守护进程任务）'}>
+            {refineBookBusy ? <Spinner className="h-3.5 w-3.5" /> : <Wand2 size={13} />} 整书精修
           </button>
           <button className="btn-ghost py-1.5 text-xs" onClick={() => navigate('/export')}>导出</button>
           <button className="btn-ghost py-1.5 text-xs text-cinnabar" title="删除项目" onClick={() => setDeleteOpen(true)}>
@@ -363,7 +439,7 @@ export default function ProjectDetail() {
               <ChapterTree nodes={tree} collapsed={collapsed} setCollapsed={setCollapsed} selectedId={selected?.id} onSelect={onSelect} />}
           </div>
           <div className="border-t px-3 py-2 text-[11px] text-paper-mute" style={{ borderColor: 'var(--ink-600)' }}>
-            共 {countAll(tree)} 章 · 快照 {snapshotCount}
+            共 {chapterCount} 章 · 快照 {snapshotCount}
           </div>
         </aside>
 
@@ -412,8 +488,8 @@ export default function ProjectDetail() {
 
         {/* 移动端章节下拉 */}
         <div className="border-t px-3 py-2 md:hidden" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
-          <select className="input py-1.5 text-sm" value={selected?.id || ''} onChange={e => { const n = flatten(tree).find(x => x.id === e.target.value); if (n) onSelect(n); }}>
-            {flatten(tree).map(n => <option key={n.id} value={n.id}>{n.title}</option>)}
+          <select className="input py-1.5 text-sm" value={selected?.id || ''} onChange={e => { const n = flatTree.find(x => x.id === e.target.value); if (n) onSelect(n); }}>
+            {flatTree.map(n => <option key={n.id} value={n.id}>{n.title}</option>)}
           </select>
         </div>
         </>
@@ -442,7 +518,7 @@ export default function ProjectDetail() {
                         {genSummaryBusy ? '生成中…' : 'AI 生成'}
                       </button>
                     </div>
-                    <textarea className="input min-h-[110px] resize-y leading-relaxed" placeholder="一句话概括你的故事核心…" value={summary} onChange={e => setSummary(e.target.value)} onBlur={onBlurSummary} />
+                    <textarea className="input min-h-[110px] resize-y leading-relaxed" placeholder="一句话概括你的故事核心…" value={summary} onChange={e => setSummary(e.target.value)} onBlur={onBlurSummary} disabled={genSummaryBusy} />
                   </div>
                   <div>
                     <div className="mb-1 flex items-center justify-between">
@@ -457,12 +533,49 @@ export default function ProjectDetail() {
                         {genCoverBusy ? '生成中…' : 'AI 生成'}
                       </button>
                     </div>
+                    {/* 生成参数：风格 / 书名 / 作者（升级） */}
+                    <div className="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                      <div>
+                        <label className="mb-1 block text-[10px] text-paper-mute">风格</label>
+                        <select
+                          className="input py-1.5 text-xs"
+                          value={coverStyle}
+                          onChange={e => setCoverStyle(e.target.value)}
+                          disabled={genCoverBusy}
+                        >
+                          {COVER_STYLE_OPTIONS.map(o => (
+                            <option key={o.key} value={o.key}>{o.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[10px] text-paper-mute">书名（默认取标题）</label>
+                        <input
+                          className="input py-1.5 text-xs"
+                          value={coverBookTitle}
+                          placeholder={project?.title || ''}
+                          onChange={e => { coverTitleTouchedRef.current = true; setCoverBookTitle(e.target.value); }}
+                          disabled={genCoverBusy}
+                        />
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[10px] text-paper-mute">作者（可选）</label>
+                        <input
+                          className="input py-1.5 text-xs"
+                          value={coverAuthor}
+                          placeholder="署名，如：墨铸"
+                          onChange={e => setCoverAuthor(e.target.value)}
+                          disabled={genCoverBusy}
+                        />
+                      </div>
+                    </div>
                     <textarea
                       className="input min-h-[140px] resize-y font-mono text-sm leading-relaxed"
                       placeholder="点击「AI 生成」产生封面提示词（中文描述 + 英文 Prompt），可直接复制到 SD/MJ 使用…"
                       value={coverDraft}
                       onChange={e => { coverDirtyRef.current = true; setCoverDraft(e.target.value); }}
                       onBlur={onBlurCover}
+                      disabled={genCoverBusy}
                     />
                     {coverDraft && (
                       <div className="mt-1 flex justify-end">

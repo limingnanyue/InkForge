@@ -39,8 +39,15 @@ export const api = {
     // AI 生成：透传当前所选 model/providerId（不传则后端回落到 default 旗舰）
     generateSummary: (id: string, model?: string, providerId?: string) =>
       req<{ summary: string }>(`/projects/${id}/generate-summary`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),
-    generateCover: (id: string, model?: string, providerId?: string, tone?: string) =>
-      req<{ cover: string }>(`/projects/${id}/generate-cover`, { method: 'POST', body: JSON.stringify({ model, providerId, tone }) }),
+    // 封面提示词升级：支持 style（风格预设）/ bookTitle（书名覆盖）/ author（作者署名）/ tone（文风）
+    generateCover: (id: string, params: {
+      model?: string; providerId?: string;
+      style?: string; bookTitle?: string; author?: string; tone?: string;
+    }) =>
+      req<{ cover: string }>(`/projects/${id}/generate-cover`, { method: 'POST', body: JSON.stringify(params) }),
+    // 整书去 AI 味精修：入队守护进程批量任务，透传模型选择
+    refineBook: (id: string, model?: string, providerId?: string) =>
+      req<Task>(`/projects/${id}/refine-book`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),
     messages: (id: string) => req<ChatMessage[]>(`/projects/${id}/messages`),
   },
   chapters: {
@@ -92,7 +99,8 @@ export const api = {
             let dataLine = '';
             for (const ln of lines) {
               if (ln.startsWith('event:')) event = ln.slice(6).trim();
-              else if (ln.startsWith('data:')) dataLine = ln.slice(5).trim();
+              // BUG-7 修复：多行 data 按 SSE 规范用 \n 拼接（原覆盖式赋值只保留最后一行导致截断）
+              else if (ln.startsWith('data:')) dataLine = dataLine ? dataLine + '\n' + ln.slice(5).trim() : ln.slice(5).trim();
             }
             if (!dataLine) continue;
             try {
@@ -102,6 +110,9 @@ export const api = {
               else if (event === 'done' && obj.content) { full = obj.content; }
               else if (event === 'error' && obj.message) throw new Error(obj.message);
             } catch (e) {
+              // BUG-7 修复：JSON.parse 失败（SyntaxError，message 含 JSON）时 continue 跳过该块，
+              // 不再 throw 终止整个 while 循环；仅业务异常（如 event:error 的 message）才 throw
+              if (e instanceof Error && e.message && e.message.includes('JSON')) continue;
               if (e instanceof Error && e.message) throw e;
             }
           }

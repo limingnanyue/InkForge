@@ -20,7 +20,7 @@ interface Form {
 }
 
 const KIND_PRESET: Record<GenerateKind, { label: string; cap: number; default: number; desc: string; icon: typeof BookOpen }> = {
-  book: { label: '成书', cap: 1_000_000, default: 300_000, desc: '长篇连载，多卷结构', icon: BookOpen },
+  book: { label: '成书', cap: 5_000_000, default: 300_000, desc: '长篇连载，多卷结构（最高 500 万字）', icon: BookOpen },
   short: { label: '成短篇', cap: 200_000, default: 60_000, desc: '短篇速成，单线推进', icon: FileText },
 };
 
@@ -35,6 +35,8 @@ export default function Generate() {
     hookStyle: '强冲突', pace: '中等', ending: '圆满',
     viewpoint: '第三人称', tone: '爽文',
   });
+  // BUG3 修复：targetWords 用独立字符串 state 暂存，允许清空重输；onBlur 写入 form.targetWords，submit 校验此原始值
+  const [targetWordsInput, setTargetWordsInput] = useState<string>(String(300_000));
   const [webSearch, setWebSearch] = useState(false);
   const [busy, setBusy] = useState(false);
   const navigate = useNavigate();
@@ -58,14 +60,19 @@ export default function Generate() {
   const pickKind = (k: GenerateKind) => {
     setKind(k);
     setForm(f => ({ ...f, targetWords: KIND_PRESET[k].default }));
+    setTargetWordsInput(String(KIND_PRESET[k].default));
     setStep(2);
   };
 
   const submit = async () => {
     if (!form.idea.trim()) { toast('请填写核心创意', 'err'); return; }
-    if (form.targetWords > KIND_PRESET[kind].cap) { toast(`目标字数上限 ${KIND_PRESET[kind].cap}`, 'err'); return; }
+    // BUG5 修复：基于未 clamp 的 targetWordsInput 校验，避免 onChange/onBlur 已 clamp 导致校验失效（死代码）
+    const n = Number(targetWordsInput);
+    if (isNaN(n) || n < 1000) { toast('字数不能少于 1000', 'err'); return; }
+    if (n > KIND_PRESET[kind].cap) { toast(`字数不能超过 ${KIND_PRESET[kind].cap}`, 'err'); return; }
     if (!form.genre.trim()) { toast('请选择或输入题材', 'err'); return; }
     if (!currentModel || !currentProviderId) { toast('请先选择模型', 'err'); return; }
+    setForm({ ...form, targetWords: n });
     setBusy(true);
     const config: GenerateConfig = {
       genre: form.genre.trim(),
@@ -76,7 +83,7 @@ export default function Generate() {
     };
     try {
       await api.generate.trigger({
-        kind, targetWords: form.targetWords, config,
+        kind, targetWords: n, config,
         idea: form.idea.trim(), title: form.title.trim() || undefined,
         webSearch,
         // 透传当前所选模型，daemon 会优先用此 model/providerId 而非 default 旗舰
@@ -113,7 +120,8 @@ export default function Generate() {
             onBack={() => setStep(1)} onSubmit={submit}
             webSearch={webSearch} setWebSearch={setWebSearch}
             providers={providers} currentModel={currentModel} currentProviderId={currentProviderId}
-            onPickModel={(m, pid) => setCurrentModel(m, pid)} />
+            onPickModel={(m, pid) => setCurrentModel(m, pid)}
+            targetWordsInput={targetWordsInput} setTargetWordsInput={setTargetWordsInput} />
         )}
       </div>
       {node}
@@ -154,7 +162,7 @@ function Step1({ onPick }: { onPick: (k: GenerateKind) => void }) {
   );
 }
 
-function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch, setWebSearch, providers, currentModel, currentProviderId, onPickModel }: {
+function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch, setWebSearch, providers, currentModel, currentProviderId, onPickModel, targetWordsInput, setTargetWordsInput }: {
   kind: GenerateKind; form: Form; set: (k: keyof Form, v: any) => void;
   estChapters: number; busy: boolean; onBack: () => void; onSubmit: () => void;
   webSearch: boolean; setWebSearch: (v: boolean) => void;
@@ -162,6 +170,8 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
   currentModel: string | null;
   currentProviderId: string | null;
   onPickModel: (model: string, providerId: string) => void;
+  targetWordsInput: string;
+  setTargetWordsInput: (v: string) => void;
 }) {
   const cap = KIND_PRESET[kind].cap;
   // 编码当前所选：${providerId}::${model}，与 Studio 顶栏下拉一致
@@ -178,8 +188,9 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
           <input className="input" placeholder="如：风起观星台" value={form.title} onChange={e => set('title', e.target.value)} />
         </Field>
         <Field label={`目标字数（上限 ${cap.toLocaleString()}）`}>
-          <input type="number" min={1000} step={1000} className="input" value={form.targetWords}
-            onChange={e => set('targetWords', Math.min(cap, Math.max(1000, Number(e.target.value) || 0)))} />
+          <input type="number" min={1000} step={1000} className="input" value={targetWordsInput}
+            onChange={e => setTargetWordsInput(e.target.value)}
+            onBlur={() => { const v = Number(targetWordsInput); set('targetWords', Math.min(cap, Math.max(1000, v || 0))); }} />
         </Field>
       </div>
       <Field label="核心创意">

@@ -88,7 +88,10 @@ router.post('/', async (req: Request, res: Response) => {
     }
 
     // 加载多轮对话历史（最近 8 轮，避免上下文爆炸；旧前缀稳定 → 缓存命中）
-    const history = messageRepo.listByProject(projectId)
+    // BUG-2 修复：原 listByProject(projectId) 不传 limit 全量加载后 .slice(-17,-1)
+    // 长对话全量加载浪费内存。repos.ts 的 limit 参数语义为「取最近 N 条」(ORDER BY created_at DESC LIMIT N 再 ASC)
+    // 传 17：取最近 17 条（含刚保存的当前 user），slice(-17,-1) 去掉当前 user 后得 16 条历史
+    const history = messageRepo.listByProject(projectId, 17)
       .filter(m => m.role === 'user' || m.role === 'assistant')
       .slice(-17, -1) // 去掉刚保存的当前 user 消息，取之前最多 16 条（8 轮）
       .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));

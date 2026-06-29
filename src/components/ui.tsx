@@ -1,7 +1,7 @@
 /**
  * 通用 UI 组件集
  */
-import { useEffect, useState, useCallback, type ReactNode } from 'react';
+import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { Loader2, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -66,20 +66,39 @@ export function EmptyState({ icon, title, desc, action }: { icon?: ReactNode; ti
 
 // 模态框
 export function Modal({ open, onClose, title, children, className }: { open: boolean; onClose: () => void; title?: string; children: ReactNode; className?: string }) {
+  const rootRef = useRef<HTMLDivElement>(null);
+  const prevFocusRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     if (!open) return;
-    const h = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
+    // 记录关闭后要还原焦点的元素
+    prevFocusRef.current = document.activeElement as HTMLElement;
+    // 把焦点移进 Modal（关闭按钮 X 或第一个可聚焦元素）
+    const focusable = rootRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    focusable?.[0]?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { onClose(); return; }
+      if (e.key !== 'Tab') return;
+      const items = Array.from(rootRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])') ?? []);
+      if (items.length === 0) return;
+      const firstEl = items[0];
+      const lastEl = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === firstEl) { e.preventDefault(); lastEl.focus(); }
+      else if (!e.shiftKey && document.activeElement === lastEl) { e.preventDefault(); firstEl.focus(); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      prevFocusRef.current?.focus();
+    };
   }, [open, onClose]);
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(8,6,4,0.7)', backdropFilter: 'blur(4px)' }} onClick={onClose}>
+    <div ref={rootRef} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(8,6,4,0.7)', backdropFilter: 'blur(4px)' }} role="dialog" aria-modal="true" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
       <div className={cn('panel-elevated w-full max-w-lg animate-pop-in p-6 shadow-2xl', className)} onClick={e => e.stopPropagation()}>
         {title && (
           <div className="mb-4 flex items-center justify-between">
             <h2 className="font-display text-lg text-paper">{title}</h2>
-            <button onClick={onClose} className="text-paper-mute hover:text-paper transition-colors"><X size={18} /></button>
+            <button onClick={onClose} aria-label="关闭" className="text-paper-mute hover:text-paper transition-colors"><X size={18} /></button>
           </div>
         )}
         {children}
@@ -113,9 +132,9 @@ export function useToast() {
 // 标签页
 export function Tabs({ tabs, active, onChange }: { tabs: { id: string; label: string }[]; active: string; onChange: (id: string) => void }) {
   return (
-    <div className="flex gap-1 border-b" style={{ borderColor: 'var(--ink-500)' }}>
+    <div className="flex gap-1 border-b" role="tablist" style={{ borderColor: 'var(--ink-500)' }}>
       {tabs.map(t => (
-        <button key={t.id} onClick={() => onChange(t.id)}
+        <button key={t.id} role="tab" aria-selected={active === t.id} onClick={() => onChange(t.id)}
           className={cn('relative px-4 py-2.5 text-sm font-medium transition-colors', active === t.id ? 'text-amber' : 'text-paper-mute hover:text-paper-dim')}>
           {t.label}
           {active === t.id && <span className="absolute bottom-0 left-0 right-0 h-0.5" style={{ background: 'var(--amber)' }} />}
