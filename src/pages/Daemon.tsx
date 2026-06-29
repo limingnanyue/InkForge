@@ -30,8 +30,10 @@ function fmtCheckpoint(task: Task): string | null {
     return [phaseText, chPart].filter(Boolean).join(' · ') || null;
   }
   if (task.type === 'short') {
+    // H2 修复(第十三轮): 读 segmentTotal,显示"片段 N/M"
     const seg = cp.segmentIdx as number | undefined;
-    return seg != null ? `片段 ${seg}` : null;
+    const segTotal = cp.segmentTotal as number | undefined;
+    return seg != null ? `片段 ${seg}${segTotal != null ? `/${segTotal}` : ''}` : null;
   }
   if (task.type === 'refine-book') {
     const done = cp.refinedCount as number | undefined;

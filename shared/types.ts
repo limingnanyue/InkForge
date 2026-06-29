@@ -41,6 +41,12 @@ export interface Chapter {
   status: ChapterStatus;
   createdAt: number;
   updatedAt: number;
+  // M5 修复(第十三轮): oh-story 章节定位六类持久化到 chapter 表
+  // 原: 大纲解析得到的 positioning/coreEmotion 仅存内存 chapters 数组,
+  //     chapterRepo.create 不写入 → 重启后 chapterRepo.listByProject 返回的 Chapter 无 positioning →
+  //     前端 UI 无法稳定展示标签(章节树/编辑器顶栏)
+  positioning?: ChapterPositioning;
+  coreEmotion?: string;
 }
 
 export interface ChapterNode extends Chapter {

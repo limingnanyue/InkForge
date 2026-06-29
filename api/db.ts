@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS chapter (
   status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','generating','done','failed')),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
+  -- M5 修复(第十三轮): oh-story 章节定位六类持久化,前端可在章节树/编辑器稳定展示标签
+  positioning TEXT DEFAULT NULL,
+  core_emotion TEXT DEFAULT NULL,
   -- C2 修复：禁止章节 parent_id 指向自身（防 ChapterTree 无限递归）
   -- 注意：SQLite 表级 CHECK 必须放在所有列定义之后，否则报 syntax error
   CHECK(parent_id IS NULL OR parent_id != id)
@@ -213,6 +216,11 @@ function migrateLegacySchema(): void {
   // H1 修复(第十二轮): agent_state 加 outline 列存全书大纲,防长篇主线遗忘
   if (!stateCols.includes('outline')) db.exec("ALTER TABLE agent_state ADD COLUMN outline TEXT DEFAULT ''");
 
+  // M5 修复(第十三轮): 旧库 chapter 表补 positioning/core_emotion 列,让 oh-story 章节定位六类持久化
+  const chapterCols = (db.prepare("PRAGMA table_info(chapter)").all() as { name: string }[]).map(c => c.name);
+  if (!chapterCols.includes('positioning')) db.exec("ALTER TABLE chapter ADD COLUMN positioning TEXT DEFAULT NULL");
+  if (!chapterCols.includes('core_emotion')) db.exec("ALTER TABLE chapter ADD COLUMN core_emotion TEXT DEFAULT NULL");
+
   // C1 修复：旧库 chapter 表的 CHECK 不含 'failed' 时重建表（SQLite 不支持 ALTER CHECK）
   // 副作用：旧 status='generating' 的卡死章节会被强制回滚为 'draft'，避免再次启动后被 CHECK 拒绝写入 'failed'
   const chapterSchema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='chapter'").get() as { sql: string } | undefined;
@@ -232,13 +240,18 @@ function migrateLegacySchema(): void {
         status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','generating','done','failed')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
+        positioning TEXT DEFAULT NULL,
+        core_emotion TEXT DEFAULT NULL,
         CHECK(parent_id IS NULL OR parent_id != id)
       )`);
       // 旧 generating 状态视为无效（启动时无人持有），回滚为 draft
-      db.exec(`INSERT INTO chapter_new (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, created_at, updated_at)
-               SELECT id, project_id, parent_id, title, outline, content, order_idx, word_count,
-                      CASE WHEN status='generating' THEN 'draft' ELSE status END, created_at, updated_at
-               FROM chapter`);
+      // 注意：旧库可能无 positioning/core_emotion 列（C1 重建先于 M5 ALTER 时），用 COALESCE 兜底
+      const hasOldPositioning = chapterCols.includes('positioning');
+      const selectCols = hasOldPositioning
+        ? 'id, project_id, parent_id, title, outline, content, order_idx, word_count, CASE WHEN status=\'generating\' THEN \'draft\' ELSE status END, created_at, updated_at, positioning, core_emotion'
+        : 'id, project_id, parent_id, title, outline, content, order_idx, word_count, CASE WHEN status=\'generating\' THEN \'draft\' ELSE status END, created_at, updated_at, NULL, NULL';
+      db.exec(`INSERT INTO chapter_new (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, created_at, updated_at, positioning, core_emotion)
+               SELECT ${selectCols} FROM chapter`);
       db.exec('DROP TABLE chapter');
       db.exec('ALTER TABLE chapter_new RENAME TO chapter');
       db.exec('CREATE INDEX IF NOT EXISTS idx_chapter_project ON chapter(project_id)');

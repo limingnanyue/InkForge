@@ -6,9 +6,9 @@
  */
 import { EventEmitter } from 'events';
 import { taskRepo, taskLogRepo, chapterRepo, projectRepo, stateRepo, providerRepo } from './repos.js';
-import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality } from './engine.js';
+import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality, checkPositioningDistribution } from './engine.js';
 import { complete } from './llm.js';
-import type { Task, StreamEvent, ProviderKind } from '@shared/types';
+import type { Task, StreamEvent, ProviderKind, ProjectType } from '@shared/types';
 
 // ============ Cancel Token（worker 主动停止信号）============
 // 任务开始时 registerToken，cancel/pause 端点调 cancelToken 把 cancelled=true
@@ -257,13 +257,18 @@ async function runTask(task: Task): Promise<void> {
 // H1 修复：从项目已完成章节平均字数推断每章字数预算
 // 用途：续写任务、单章生成任务未显式传 chapterWordBudget 时，从历史章节推断
 //      避免新生成章节字数与原章节不一致（原项目用 3500 生成，续写回落 2500 导致割裂）
-function inferChapterWordBudget(projectId: string): number {
+// M2 修复(第十三轮): 加 projectType 参数,short 项目无历史时回落 5000(与 short pipeline 一致)
+// 原: 无历史一律回落 2500 → 短篇单章生成走 2500,与 short pipeline 的 5000 不一致,字数割裂
+function inferChapterWordBudget(projectId: string, projectType?: ProjectType): number {
   const chapters = chapterRepo.listByProject(projectId);
   const doneChapters = chapters.filter(c => c.content && c.wordCount > 100);
-  if (doneChapters.length === 0) return 2500;
+  // 无历史时按项目类型回落:short 5000 / book/script 2500
+  if (doneChapters.length === 0) return projectType === 'short' ? 5000 : 2500;
   const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
-  // M3 修复(第十一轮): clamp 边界同步扩展, book 1500-10000(原 8000), short 由调用方处理
-  return Math.max(1500, Math.min(10000, Math.round(avg)));
+  // M3 修复(第十一轮): clamp 边界同步扩展, book 1500-10000(原 8000), short 2000-12000
+  const min = projectType === 'short' ? 2000 : 1500;
+  const max = projectType === 'short' ? 12000 : 10000;
+  return Math.max(min, Math.min(max, Math.round(avg)));
 }
 
 // H4 修复：maxTokens 按 provider kind 放大 token/字 系数
@@ -406,6 +411,17 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   const chapters = parseOutline(outline);
   if (chapters.length === 0) throw new Error('大纲解析失败，请重试');
 
+  // H3 修复(第十三轮): 章节定位六类分布校验
+  // oh-story 方法论核心:防止每章都像短篇、防止情绪扎堆
+  // 原: 仅 prompt 文字约束 LLM,无代码校验 → LLM 可全输出 normal-progress,引擎不发现
+  // 现: 解析后统计实际分布,偏差 > 30% 打 warn 日志(不强制重生成,避免卡死循环)
+  const dist = checkPositioningDistribution(chapters);
+  if (dist.ok) {
+    logTask(task.id, 'info', `章节定位分布: 高压${dist.actual['high-pressure']}/普通${dist.actual['normal-progress']}/试错${dist.actual['trial-error']}/关系${dist.actual['relationship']}/低压${dist.actual['low-pressure']}/信息${dist.actual['info-organize']} (符合 oh-story 比例)`);
+  } else {
+    logTask(task.id, 'warn', `章节定位分布偏离 oh-story 目标: ${dist.warnings.join('; ')}`);
+  }
+
   // oh-story：长篇 >20 章时生成卷级大纲并落库（供 buildDynamicContext 注入【卷级总览】）
   const existingState = stateRepo.get(projectId);
   if (!existingState?.volumeOutlines || existingState.volumeOutlines.length === 0) {
@@ -425,7 +441,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   const existingMap = new Map(existing.map(c => [c.orderIdx, c]));
   for (let i = 0; i < chapters.length; i++) {
     if (!existingMap.has(i)) {
-      chapterRepo.create({ projectId, title: chapters[i].title, outline: chapters[i].outline, orderIdx: i });
+      chapterRepo.create({ projectId, title: chapters[i].title, outline: chapters[i].outline, orderIdx: i, positioning: chapters[i].positioning, coreEmotion: chapters[i].coreEmotion });
     }
   }
   const fresh = chapterRepo.listByProject(projectId);
@@ -463,7 +479,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // BUG-1 修复：用 freshMap.get(i) 而非 fresh[i]，章节删除后下标错位
     let chapter = freshMap.get(i);
     if (!chapter) {
-      chapter = chapterRepo.create({ projectId, title: ch.title, outline: ch.outline, orderIdx: i });
+      chapter = chapterRepo.create({ projectId, title: ch.title, outline: ch.outline, orderIdx: i, positioning: ch.positioning, coreEmotion: ch.coreEmotion });
       freshMap.set(i, chapter);  // 同步到 Map，后续循环可直接取
     }
 
@@ -555,16 +571,20 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 
     // 每章后立即更新防跑偏三件套（章节摘要/伏笔/角色状态）
     // oh-story：传入大纲里的 positioning + coreEmotion，落库到 ChapterSummary 供三层归档展示
-    // 失败不阻断正文落库：状态更新失败只 warn，不让单章状态失败导致整任务重试（与 runChapterGeneration 一致）
+    // M1 注释修正(第十三轮): try/catch 吞异常后 chapterIdx 仍推进,看似违背 BUG-4 注释(声称"成功之后推进"),
+    //   实为 best-effort 策略:失败时 reconcileState 重启会补做缺失摘要,正文已落库不丢,跨章一致性短期变差但可恢复
+    //   若改为失败时不推进 → 单章状态抽风会导致整任务重试(浪费已生成正文 + 重做整章)
+    //   权衡:保持当前行为(失败也推进),修正注释避免误导
     try {
       logTask(task.id, 'info', `更新剧情记忆 · 防跑偏（第 ${i + 1} 章）`);
       await updateStateFromGeneration(projectId, model, providerId, i, ch.positioning, ch.coreEmotion);
     } catch (e) {
-      logTask(task.id, 'warn', `第 ${i + 1} 章状态更新失败（不影响正文）：${(e as Error).message.slice(0, 100)}`);
+      logTask(task.id, 'warn', `第 ${i + 1} 章状态更新失败（不影响正文,reconcileState 重启会补做）：${(e as Error).message.slice(0, 100)}`);
     }
-    // BUG-4 修复：checkpoint chapterIdx 推进必须在 updateStateFromGeneration 成功之后
-    // 否则 updateState 抛错 → 重试时 startIdx 按"已 done"计算会跳过本章状态更新，导致章节有正文但缺摘要/伏笔
-    taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline, chapterIdx: i + 1 } });
+    // H1 修复(第十三轮): checkpoint 加 totalChapters, 前端 Daemon.tsx 显示"已完成 N/M 章"
+    // 原: 只写 chapterIdx,UI 无法显示总章数,200 章长篇作者无法判断整体进度
+    // taskRepo.update 的 checkpoint 是浅合并(repos.ts),不会覆盖其他字段
+    taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline, chapterIdx: i + 1, totalChapters: chapters.length } });
   }
 
   // 精修阶段（抽样精修最近几章）
@@ -678,7 +698,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     // BUG-1 修复：用 existingShortMap.get(i) 而非 existingShort[i]
     let chapter = existingShortMap.get(i);
     if (!chapter) {
-      chapter = chapterRepo.create({ projectId, title: seg.title, outline: seg.outline, orderIdx: i });
+      chapter = chapterRepo.create({ projectId, title: seg.title, outline: seg.outline, orderIdx: i, positioning: seg.positioning, coreEmotion: seg.coreEmotion });
       existingShortMap.set(i, chapter);
     }
     chapterRepo.update(chapter.id, { status: 'generating' });
@@ -743,8 +763,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     } catch (e) {
       logTask(task.id, 'warn', `第 ${i + 1} 段状态更新失败（不影响正文）：${(e as Error).message.slice(0, 100)}`);
     }
-    // BUG-4 修复：checkpoint 推进必须在 updateState 成功之后，避免重试跳过状态更新
-    taskRepo.update(task.id, { checkpoint: { segmentIdx: i + 1, outlineJson } });
+    // H2 修复(第十三轮): checkpoint 加 segmentTotal, 前端 Daemon.tsx 显示"片段 N/M"
+    // 原: 只写 segmentIdx,UI 无法显示总段数
+    taskRepo.update(task.id, { checkpoint: { segmentIdx: i + 1, segmentTotal: segments.length, outlineJson } });
   }
 
   // 精修：精修最近 2 段（短篇段较长，精修多段保证质量）
@@ -769,7 +790,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
 async function runChapterGeneration(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
   const cfg = task.config as { projectId: string; chapterId: string; prompt: string; chapterWordBudget?: number };
   // 单章字数预算：用户可指定，否则从项目历史章节平均字数推断（H1：防字数不一致）
-  const chapterWordBudget = cfg.chapterWordBudget ?? inferChapterWordBudget(cfg.projectId);
+  // M2 修复(第十三轮): 传 projectType,short 项目无历史回落 5000(与 short pipeline 一致)
+  const project = projectRepo.get(cfg.projectId);
+  const chapterWordBudget = cfg.chapterWordBudget ?? inferChapterWordBudget(cfg.projectId, project?.type);
   const chapter = chapterRepo.get(cfg.chapterId);
   if (!chapter) throw new Error('章节不存在');
   chapterRepo.update(chapter.id, { status: 'generating' });

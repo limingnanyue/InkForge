@@ -5,7 +5,7 @@ import { db, cryptoRandomId } from './db.js';
 import type {
   Project, Chapter, AgentState, Task, TaskLog, ChatMessage,
   Provider, ExportRecord, ChapterNode, Usage, TokenUsageRecord, UsageStats,
-  MarketScan,
+  MarketScan, ChapterPositioning,
 } from '@shared/types';
 import type { Genre, GenreCategory } from '../shared/genres.js';
 
@@ -83,17 +83,18 @@ export const chapterRepo = {
     const row = db.prepare('SELECT * FROM chapter WHERE id=?').get(id) as any;
     return row ? rowToChapter(row) : null;
   },
-  create(data: { projectId: string; parentId?: string | null; title: string; outline?: string; content?: string; orderIdx?: number }): Chapter {
+  create(data: { projectId: string; parentId?: string | null; title: string; outline?: string; content?: string; orderIdx?: number; positioning?: Chapter['positioning']; coreEmotion?: string }): Chapter {
     const t = now();
     const id = cryptoRandomId();
     const content = data.content || '';
+    // M5 修复(第十三轮): 透传 positioning/coreEmotion(oh-story 章节定位六类持久化)
     db.prepare(
-      `INSERT INTO chapter (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-    ).run(id, data.projectId, data.parentId ?? null, data.title, data.outline || '', content, data.orderIdx ?? 0, countWords(content), 'draft', t, t);
+      `INSERT INTO chapter (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, positioning, core_emotion, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(id, data.projectId, data.parentId ?? null, data.title, data.outline || '', content, data.orderIdx ?? 0, countWords(content), 'draft', data.positioning ?? null, data.coreEmotion ?? null, t, t);
     return this.get(id)!;
   },
-  update(id: string, data: Partial<Pick<Chapter, 'title' | 'outline' | 'content' | 'orderIdx' | 'status'>>): Chapter | null {
+  update(id: string, data: Partial<Pick<Chapter, 'title' | 'outline' | 'content' | 'orderIdx' | 'status' | 'positioning' | 'coreEmotion'>>): Chapter | null {
     const cur = this.get(id);
     if (!cur) return null;
     const title = data.title ?? cur.title;
@@ -101,9 +102,13 @@ export const chapterRepo = {
     const content = data.content ?? cur.content;
     const orderIdx = data.orderIdx ?? cur.orderIdx;
     const status = data.status ?? cur.status;
+    // M5 修复(第十三轮): 同步透传 positioning/coreEmotion
+    // 默认 undefined 不覆盖已有值;显式传 null 才清空
+    const positioning = data.positioning === undefined ? cur.positioning : data.positioning;
+    const coreEmotion = data.coreEmotion === undefined ? cur.coreEmotion : data.coreEmotion;
     db.prepare(
-      `UPDATE chapter SET title=?, outline=?, content=?, order_idx=?, word_count=?, status=?, updated_at=? WHERE id=?`
-    ).run(title, outline, content, orderIdx, countWords(content), status, now(), id);
+      `UPDATE chapter SET title=?, outline=?, content=?, order_idx=?, word_count=?, status=?, positioning=?, core_emotion=?, updated_at=? WHERE id=?`
+    ).run(title, outline, content, orderIdx, countWords(content), status, positioning ?? null, coreEmotion ?? null, now(), id);
     projectRepo.updateWordCount(cur.projectId);
     return this.get(id);
   },
@@ -533,10 +538,16 @@ function rowToProject(r: any): Project {
   };
 }
 function rowToChapter(r: any): Chapter {
+  // M5 修复(第十三轮): 读 positioning/core_emotion,前端可稳定展示 oh-story 章节定位标签
+  const validPositioning: ChapterPositioning[] = ['high-pressure', 'normal-progress', 'trial-error', 'relationship', 'low-pressure', 'info-organize'];
+  const rawPos = typeof r.positioning === 'string' ? r.positioning as ChapterPositioning : undefined;
+  const positioning = rawPos && validPositioning.includes(rawPos) ? rawPos : undefined;
   return {
     id: r.id, projectId: r.project_id, parentId: r.parent_id, title: r.title,
     outline: r.outline, content: r.content, orderIdx: r.order_idx,
     wordCount: r.word_count, status: r.status, createdAt: r.created_at, updatedAt: r.updated_at,
+    ...(positioning ? { positioning } : {}),
+    ...(typeof r.core_emotion === 'string' && r.core_emotion ? { coreEmotion: r.core_emotion } : {}),
   };
 }
 function rowToState(r: any): AgentState {

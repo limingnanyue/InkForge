@@ -15,6 +15,7 @@ import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ChapterNode } from '@shared/types';
 import { cn } from '@/lib/utils';
 import { fmtWords } from '@/components/ui';
+import { POSITIONING_LABEL } from '@/lib/positioning';
 
 const STATUS_DOT: Record<string, string> = { draft: 'bg-ink-400', generating: 'bg-amber', done: 'bg-celadon' };
 
@@ -92,6 +93,12 @@ function Row({ item, collapsed, setCollapsed, selectedId, onSelect }: {
       ) : <span className="w-3.5" />}
       <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', STATUS_DOT[n.status])} />
       <span className="flex-1 truncate">{n.title}</span>
+      {/* M4 修复(第十三轮): 章节树显示 oh-story 章节定位标签,作者可一眼看到节奏分布 */}
+      {n.positioning && (
+        <span className={cn('badge px-1 py-0 text-[9px]', POSITIONING_LABEL[n.positioning][0])}>
+          {POSITIONING_LABEL[n.positioning][1]}
+        </span>
+      )}
       <span className="font-mono text-[10px] text-paper-mute">{fmtWords(n.wordCount)}</span>
     </button>
   );

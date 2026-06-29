@@ -208,8 +208,10 @@ export async function reconcileState(
       backfilled++;
       // 进度回调：让调用方写 task_log，避免长时间无输出被误判卡死
       onProgress?.(backfilled, total);
-    } catch {
-      // 静默，继续下一个
+    } catch (e) {
+      // M6 修复(第十三轮): 不再静默吞错,打 console.warn 让重启回填失败可排查
+      // 原: catch{} 完全无日志 → 80 章回填全失败时 task_log 一片空白,排查者无从下手
+      console.warn(`[reconcileState] 第 ${ch.orderIdx + 1} 章补全失败:`, (e as Error).message);
     }
   }
   return { backfilled };
@@ -938,6 +940,50 @@ function parseOutlineArray(arr: unknown[]): ParsedOutlineItem[] {
       }
       return item;
     });
+}
+
+// ============ oh-story 章节定位六类分布校验 ============
+// H3 修复(第十三轮): 原 computePositioningDistribution 算出目标分布仅注入 prompt 文字约束,
+// LLM 完全可全部输出 normal-progress,引擎不会发现 → oh-story 节奏控制方法论形同虚设
+// 本函数统计实际计数,与目标比例比较,偏差 > 30% 时返回 warn 描述(由调用方打 task_log)
+// 不强制重生成,避免 LLM 卡死循环;仅打日志让用户可见,后续可人工介入调整大纲
+export function checkPositioningDistribution(items: ParsedOutlineItem[]): {
+  ok: boolean;
+  actual: Record<ChapterPositioning, number>;
+  target: Record<ChapterPositioning, number>;
+  warnings: string[];
+} {
+  const total = items.length;
+  const actual: Record<ChapterPositioning, number> = {
+    'high-pressure': 0, 'normal-progress': 0, 'trial-error': 0,
+    'relationship': 0, 'low-pressure': 0, 'info-organize': 0,
+  };
+  for (const it of items) {
+    if (it.positioning && actual[it.positioning] !== undefined) actual[it.positioning]++;
+  }
+  const target = computePositioningDistribution(total);
+  const warnings: string[] = [];
+  const TARGET_RATIOS: Record<ChapterPositioning, number> = {
+    'high-pressure': 0.18, 'normal-progress': 0.45, 'trial-error': 0.08,
+    'relationship': 0.08, 'low-pressure': 0.10, 'info-organize': 0.05,
+  };
+  for (const k of Object.keys(actual) as ChapterPositioning[]) {
+    if (total === 0) continue;
+    const actualRatio = actual[k] / total;
+    const targetRatio = TARGET_RATIOS[k];
+    // 偏差 > 30%(绝对值)视为异常
+    if (Math.abs(actualRatio - targetRatio) > 0.30) {
+      warnings.push(
+        `${POSITIONING_META[k].label}实际 ${actual[k]} 章(${(actualRatio * 100).toFixed(0)}%) vs 目标 ${(targetRatio * 100).toFixed(0)}%,偏离 > 30%`,
+      );
+    }
+  }
+  // 无 positioning 的章节也算异常(若 LLM 全没输出 positioning,actual 全 0)
+  const noPositioningCount = items.filter(it => !it.positioning).length;
+  if (noPositioningCount > total * 0.5) {
+    warnings.push(`${noPositioningCount}/${total} 章未分配 positioning(LLM 未遵守 oh-story 章节定位约束)`);
+  }
+  return { ok: warnings.length === 0, actual, target, warnings };
 }
 
 // ============ 智能体状态自动更新（每章后调用，防跑偏核心）============

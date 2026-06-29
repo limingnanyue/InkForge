@@ -11,6 +11,7 @@ import GenreSelect from '@/components/GenreSelect';
 import type { Project, Chapter, ChapterNode, AgentState, ProjectType, ProviderKind } from '@shared/types';
 import { cn } from '@/lib/utils';
 import ChapterTree, { flatten, countSnapshots, mutateNode } from './ChapterTree';
+import { POSITIONING_LABEL } from '@/lib/positioning';
 
 const STATUS: Record<string, [string, string]> = {
   draft: ['badge-mute', '草稿'], generating: ['badge-amber', '生成中'], done: ['badge-green', '完成'],
@@ -23,16 +24,6 @@ const TYPE_BADGE: Record<ProjectType, string> = { long: 'badge-amber', short: 'b
 const FORESHADOW_STATUS: Record<string, [string, string]> = {
   planted: ['badge-amber', '待回收'], paid: ['badge-green', '已回收'], expired: ['badge-red', '已过期'],
 };
-// 章节定位六类 → badge 颜色 + 中文标签（oh-story 章节定位分布可视化）
-const POSITIONING_LABEL: Record<string, [string, string]> = {
-  'high-pressure':     ['badge-red', '高压章'],
-  'normal-progress':   ['badge-mute', '普通推进'],
-  'trial-error':       ['badge-amber', '试错章'],
-  'relationship':      ['badge-green', '关系回收'],
-  'low-pressure':      ['badge-mute', '低压生活'],
-  'info-organize':      ['badge-mute', '信息整理'],
-};
-
 const fmtDate = (t: number) => new Date(t).toLocaleString('zh-CN', {
   year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
 });
@@ -678,6 +669,15 @@ export default function ProjectDetail() {
                 <input className="min-w-0 flex-1 bg-transparent font-display text-lg text-paper outline-none focus:text-amber"
                   value={selected.title} onChange={e => onEdit({ title: e.target.value })} />
                 <span className={cn('badge', STATUS[selected.status][0])}>{STATUS[selected.status][1]}</span>
+                {/* M3 修复(第十三轮): 编辑器顶栏显示 oh-story 章节定位标签,作者一眼看到本章节奏定位 */}
+                {selected.positioning && (
+                  <span className={cn('badge', POSITIONING_LABEL[selected.positioning][0])} title="章节定位（oh-story）">
+                    {POSITIONING_LABEL[selected.positioning][1]}
+                  </span>
+                )}
+                {selected.coreEmotion && (
+                  <span className="badge badge-mute" title="本章核心情绪">「{selected.coreEmotion}」</span>
+                )}
                 <span className="text-xs text-paper-mute">{fmtWords(selected.wordCount)} 字</span>
                 <button className="btn-ghost py-1.5 text-xs" onClick={() => setPreview(v => !v)}>
                   {preview ? <><Pencil size={13} /> 编辑</> : <><Eye size={13} /> 预览</>}
