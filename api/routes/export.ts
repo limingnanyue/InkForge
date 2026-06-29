@@ -50,6 +50,19 @@ router.get('/', (req: Request, res: Response) => {
   ok(res, exportRepo.list(projectId));
 });
 
+// 第二十一修复: 清空全部导出记录 + 关联文件
+//   原 bug: 前端只有"清空当前项目"按钮,用户切到无导出记录项目时看不到任何清空入口
+//   现: 加全局清空,放在 /:id 之前避免被通配匹配
+router.delete('/', (req: Request, res: Response) => {
+  try {
+    const paths = exportRepo.clearAll();
+    paths.forEach(p => safeDeleteFile(p));
+    ok(res, { deleted: paths.length });
+  } catch (e) {
+    fail(res, 'CLEAR_FAILED', (e as Error).message || '清空失败', 500);
+  }
+});
+
 // H4 修复(第十九轮): 清空指定项目的全部导出记录 + 关联文件
 // 放在 /:id 之前,避免被通配匹配(:projectId 误吞 "project" 字面量虽不会发生,显式靠前更稳)
 router.delete('/project/:projectId', (req: Request, res: Response) => {

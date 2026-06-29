@@ -370,6 +370,16 @@ export const exportRepo = {
     db.prepare('DELETE FROM export_record WHERE project_id=?').run(projectId);
     return paths;
   },
+  // 第二十一修复: 清空全部导出记录 + 关联文件,返回被删文件路径列表
+  //   原 bug: 前端只有"清空当前项目"按钮(projectHistoryCount>0 才显示),
+  //   若用户切到无导出记录的项目就完全看不到清空按钮,误以为功能缺失
+  //   现: 加全局"清空全部"按钮 + 后端 clearAll,无条件清空所有项目的所有导出历史
+  clearAll(): string[] {
+    const rows = db.prepare('SELECT file_path FROM export_record').all() as { file_path: string }[];
+    const paths = rows.map(r => r.file_path);
+    db.prepare('DELETE FROM export_record').run();
+    return paths;
+  },
 };
 
 // ============ Token 用量 ============

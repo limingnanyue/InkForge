@@ -175,6 +175,8 @@ export const api = {
     deleteRecord: (id: string) => req<{ id: string }>(`/exports/${id}`, { method: 'DELETE' }),
     // H4 修复(第十九轮): 清空指定项目的全部导出记录 + 关联文件
     clearByProject: (projectId: string) => req<{ deleted: number }>(`/exports/project/${projectId}`, { method: 'DELETE' }),
+    // 第二十一修复: 清空全部项目的全部导出记录 + 关联文件
+    clearAll: () => req<{ deleted: number }>(`/exports`, { method: 'DELETE' }),
   },
   // 分析工具：市场风向扫榜（风向标）+ 拆书
   analyze: {

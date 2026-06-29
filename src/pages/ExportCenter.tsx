@@ -28,6 +28,8 @@ export default function ExportCenter() {
   // H4 修复(第十九轮): 删除/清空确认弹窗 + 删除中态
   const [deleteTarget, setDeleteTarget] = useState<ExportRecord | null>(null);
   const [clearTarget, setClearTarget] = useState<string | null>(null);
+  // 第二十一修复: 全局清空全部弹窗(避免切到无记录项目时完全看不到清空入口)
+  const [clearAllOpen, setClearAllOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const { toast, node } = useToast();
 
@@ -81,6 +83,18 @@ export default function ExportCenter() {
       const r = await api.exports.clearByProject(clearTarget);
       toast(`已清空 ${r.deleted} 条导出记录`);
       setClearTarget(null);
+      loadHistory();
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setDeleting(false); }
+  };
+
+  // 第二十一修复: 全局清空所有项目的全部导出历史
+  const confirmClearAll = async () => {
+    setDeleting(true);
+    try {
+      const r = await api.exports.clearAll();
+      toast(`已清空全部 ${r.deleted} 条导出记录`);
+      setClearAllOpen(false);
       loadHistory();
     } catch (e) { toast((e as Error).message, 'err'); }
     finally { setDeleting(false); }
@@ -151,16 +165,28 @@ export default function ExportCenter() {
         <section className="panel-elevated animate-fade-up p-6">
           <div className="mb-4 flex items-center justify-between gap-2">
             <h2 className="flex items-center gap-2 font-display text-lg text-paper-dim"><History size={16} /> 导出历史</h2>
-            {/* H4 修复(第十九轮): 清空当前项目全部导出记录按钮,无选中项目或无记录时禁用 */}
-            {projectId && projectHistoryCount > 0 && (
+            <div className="flex items-center gap-2">
+              {/* 第二十一修复: 全局清空按钮 - 永远显示,无记录时禁用
+                  原 bug: 仅有"清空当前项目"按钮,切到无记录项目时完全看不到清空入口 */}
               <button
-                className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-cinnabar hover:text-cinnabar"
-                onClick={() => setClearTarget(projectId)}
-                title={`清空「${projectTitle(projectId)}」的 ${projectHistoryCount} 条导出记录`}
+                className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-cinnabar hover:text-cinnabar disabled:opacity-40 disabled:cursor-not-allowed"
+                onClick={() => setClearAllOpen(true)}
+                disabled={history.length === 0}
+                title={history.length === 0 ? '尚无导出记录可清空' : `清空全部 ${history.length} 条导出记录`}
               >
-                <Trash2 size={12} /> 清空当前项目
+                <Trash2 size={12} /> 清空全部
               </button>
-            )}
+              {/* H4 修复(第十九轮): 清空当前项目全部导出记录按钮,仅当前项目有记录时显示 */}
+              {projectId && projectHistoryCount > 0 && (
+                <button
+                  className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-cinnabar hover:text-cinnabar"
+                  onClick={() => setClearTarget(projectId)}
+                  title={`清空「${projectTitle(projectId)}」的 ${projectHistoryCount} 条导出记录`}
+                >
+                  <Trash2 size={12} /> 清空当前项目
+                </button>
+              )}
+            </div>
           </div>
           {history.length === 0 ? (
             <EmptyState icon={<Download size={32} />} title="尚无导出记录" desc="完成第一次导出后，记录会出现在这里。" />
@@ -227,6 +253,24 @@ export default function ExportCenter() {
         <div className="mt-5 flex justify-end gap-2">
           <button className="btn-ghost" onClick={() => setClearTarget(null)} disabled={deleting}>取消</button>
           <button className="btn-danger" onClick={confirmClear} disabled={deleting}>
+            {deleting ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 清空全部
+          </button>
+        </div>
+      </Modal>
+
+      {/* 第二十一修复: 全局清空全部确认弹窗 */}
+      <Modal
+        open={clearAllOpen}
+        onClose={() => setClearAllOpen(false)}
+        title="清空全部导出历史"
+      >
+        <p className="text-sm text-paper-dim">
+          确定清空 <span className="font-mono text-amber">{history.length}</span> 条导出记录吗？
+        </p>
+        <p className="mt-2 text-xs text-paper-mute">将删除所有项目的全部导出记录及关联文件，此操作不可撤销。</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setClearAllOpen(false)} disabled={deleting}>取消</button>
+          <button className="btn-danger" onClick={confirmClearAll} disabled={deleting}>
             {deleting ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 清空全部
           </button>
         </div>
