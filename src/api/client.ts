@@ -125,8 +125,11 @@ export const api = {
   generate: {
     trigger: (data: GenerateRequest) =>
       req<{ task: Task; project: Project }>('/generate', { method: 'POST', body: JSON.stringify(data) }),
-    continue: (projectId: string, webSearch?: boolean, model?: string, providerId?: string) =>
-      req<{ task: Task; project: Project }>('/generate/continue', { method: 'POST', body: JSON.stringify({ projectId, webSearch, model, providerId }) }),
+    // BUG1 修复:补 chapterWordBudget 参数,继续写作时透传到后端
+    // 原签名漏掉此参数 → ProjectDetail.continueWriting 调用时丢字段 → daemon 回落 infer(取项目历史平均)
+    // → 若用户在 Generate 页选了 2000 字,但项目历史章节是 2500 字,续写会用 2500 字 → 字数不一致
+    continue: (projectId: string, webSearch?: boolean, model?: string, providerId?: string, chapterWordBudget?: number) =>
+      req<{ task: Task; project: Project }>('/generate/continue', { method: 'POST', body: JSON.stringify({ projectId, webSearch, model, providerId, chapterWordBudget }) }),
   },
   tasks: {
     list: (projectId?: string) => req<Task[]>(`/tasks${projectId ? `?projectId=${projectId}` : ''}`),

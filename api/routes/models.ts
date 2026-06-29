@@ -4,6 +4,7 @@
 import { Router, type Request, type Response } from 'express';
 import { providerRepo } from '../repos.js';
 import { testProvider, listModels, getBalance, listAvailableModels } from '../llm.js';
+import { invalidateTokenRatioCache } from '../daemon.js';
 import type { ProviderKind } from '@shared/types';
 
 const router = Router();
@@ -44,14 +45,26 @@ router.patch('/providers/:id', (req: Request, res: Response) => {
     // 过滤掉非字符串元素，防 models 字段被注入非法值
     patch.models = body.models.filter((m: unknown) => typeof m === 'string');
   }
-  if (body.webSearch && typeof body.webSearch === 'object') patch.webSearch = body.webSearch;
+  // B4 修复: webSearch 字段级校验,防数组/null/脏字段值落库
+  if (body.webSearch && typeof body.webSearch === 'object' && !Array.isArray(body.webSearch)) {
+    const ws = body.webSearch as Record<string, unknown>;
+    const validated: Record<string, unknown> = {};
+    if (typeof ws.enabled === 'boolean') validated.enabled = ws.enabled;
+    if (typeof ws.apiKey === 'string') validated.apiKey = ws.apiKey;
+    if (typeof ws.maxResults === 'number' && ws.maxResults > 0 && ws.maxResults <= 20) validated.maxResults = ws.maxResults;
+    if (Object.keys(validated).length > 0) patch.webSearch = validated;
+  }
   const provider = providerRepo.update(req.params.id, patch);
   if (!provider) return fail(res, 'NOT_FOUND', '提供商不存在', 404);
+  // B7 修复: provider kind/name 变化后失效 token ratio 缓存,下次任务用新 ratio
+  invalidateTokenRatioCache(req.params.id);
   ok(res, provider);
 });
 
 router.delete('/providers/:id', (req: Request, res: Response) => {
   providerRepo.delete(req.params.id);
+  // B7 修复: provider 删除后清缓存条目
+  invalidateTokenRatioCache(req.params.id);
   ok(res, { id: req.params.id });
 });
 

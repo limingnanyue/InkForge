@@ -24,8 +24,10 @@ router.post('/', (req: Request, res: Response) => {
   } catch (e) {
     // M8 修复：filterChapters 抛出的"格式错误/超出"类校验异常应返回 400（客户端错误）
     // 而非统一 500（让用户以为是服务端 bug）
+    // B8 修复: "项目不存在"是资源不存在(404),不是参数非法(400),与 projects/generate 路由约定一致
     const msg = (e as Error).message || '';
-    const isValidationError = msg.includes('格式错误') || msg.includes('超出总章数') || msg.includes('项目不存在');
+    if (msg.includes('项目不存在')) return fail(res, 'NOT_FOUND', msg, 404);
+    const isValidationError = msg.includes('格式错误') || msg.includes('超出总章数');
     fail(res, isValidationError ? 'INVALID' : 'EXPORT_FAILED', msg || '导出失败', isValidationError ? 400 : 500);
   }
 });

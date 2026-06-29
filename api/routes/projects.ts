@@ -78,10 +78,27 @@ router.patch('/:id/state', (req: Request, res: Response) => {
     if (typeof body[k] === 'string') patch[k] = body[k];
   }
   // 数组字段（结构化状态机：伏笔/角色实时状态/三层摘要归档/卷纲）
-  if (Array.isArray(body.foreshadowing)) patch.foreshadowing = body.foreshadowing;
-  if (Array.isArray(body.characterState)) patch.characterState = body.characterState;
-  if (Array.isArray(body.chapterSummaries)) patch.chapterSummaries = body.chapterSummaries;
-  if (Array.isArray(body.volumeOutlines)) patch.volumeOutlines = body.volumeOutlines;
+  // B5 修复: 对数组元素做基本结构校验,过滤掉非对象/缺关键字段的脏数据,防前端渲染时崩溃
+  if (Array.isArray(body.foreshadowing)) {
+    patch.foreshadowing = body.foreshadowing.filter(
+      (f: unknown) => f && typeof f === 'object' && typeof (f as any).desc === 'string'
+    );
+  }
+  if (Array.isArray(body.characterState)) {
+    patch.characterState = body.characterState.filter(
+      (c: unknown) => c && typeof c === 'object' && typeof (c as any).name === 'string'
+    );
+  }
+  if (Array.isArray(body.chapterSummaries)) {
+    patch.chapterSummaries = body.chapterSummaries.filter(
+      (s: unknown) => s && typeof s === 'object' && typeof (s as any).idx === 'number'
+    );
+  }
+  if (Array.isArray(body.volumeOutlines)) {
+    patch.volumeOutlines = body.volumeOutlines.filter(
+      (v: unknown) => v && typeof v === 'object' && typeof (v as any).title === 'string'
+    );
+  }
   const state = stateRepo.update(req.params.id, patch);
   ok(res, state);
 });
@@ -196,6 +213,8 @@ router.post('/:id/generate-cover', async (req: Request, res: Response) => {
 要求输出两段：
 1. 【中文描述】封面画面构思，30-80 字，描述主体、场景、氛围、关键视觉元素，需呼应书名与题材
 2. 【英文 Prompt】可直接喂给 SD/MJ 的 prompt，含主体、风格、镜头、光线、画质标签，逗号分隔，50-100 词；务必包含风格关键词：${styleDef.en}
+
+重要：封面是书籍封面，画面构图必须预留顶部或底部的文字排版空间（用于后期叠加书名与作者署名），主体元素不要占据整张画面。Prompt 末尾加上 "negative space for title text, book cover layout, no text" 引导模型留出文字区域。
 
 格式：
 中文：...

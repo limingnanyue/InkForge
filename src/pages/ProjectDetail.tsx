@@ -3,10 +3,10 @@
  */
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play } from 'lucide-react';
+import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play, Sliders, Image as ImageIcon, Download } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
-import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch } from '@/components/ui';
+import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch, Field, SegmentedControl, Slider } from '@/components/ui';
 import GenreSelect from '@/components/GenreSelect';
 import type { Project, Chapter, ChapterNode, AgentState, ProjectType } from '@shared/types';
 import { cn } from '@/lib/utils';
@@ -58,6 +58,28 @@ export default function ProjectDetail() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [continueBusy, setContinueBusy] = useState(false);
   const [refineBookBusy, setRefineBookBusy] = useState(false);
+  // BUG1 修复: 续写时让用户选 chapterWordBudget(默认从项目历史章节平均字数推断)
+  // 原 bug: ProjectDetail.continueWriting 不传 chapterWordBudget → daemon 走 infer(取历史平均)
+  // → 若用户在 Generate 页选了 2000 字但项目历史章节是 2500 字,续写会用 2500 字 → 字数不一致
+  const [continueOpen, setContinueOpen] = useState(false);
+  const [continueBudget, setContinueBudget] = useState<number>(2500);
+  // 切项目时从已完成章节平均字数推断默认 chapterWordBudget
+  useEffect(() => {
+    if (!project) return;
+    const isShort = project.type === 'short';
+    const defaultBudget = isShort ? 5000 : 2500;
+    const allChapters = flatten(tree);
+    const doneChapters = allChapters.filter(c => c.content && c.wordCount > 100);
+    if (doneChapters.length === 0) {
+      setContinueBudget(defaultBudget);
+      return;
+    }
+    const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
+    // clamp 范围与 Generate 页一致: book 1500-8000, short 2000-10000
+    const min = isShort ? 2000 : 1500;
+    const max = isShort ? 10000 : 8000;
+    setContinueBudget(Math.max(min, Math.min(max, Math.round(avg))));
+  }, [project, tree]);
 
   // BUG1 修复：缓存 flatten 结果，避免 countAll(tree) 与移动端下拉在每次 render 多次全树遍历
   const flatTree = useMemo(() => flatten(tree), [tree]);
@@ -76,12 +98,16 @@ export default function ProjectDetail() {
   };
 
   // 继续写作：基于当前项目派发续写任务到守护进程
+  // BUG1 修复: 透传 chapterWordBudget 到后端,避免 daemon 回落 infer 导致字数不一致
+  // 原流程直接派发 → daemon 用 cfg.chapterWordBudget ?? inferChapterWordBudget(projectId) → 续写字数与原项目历史一致但不一定符合用户期望
+  // 现流程: 点"继续写作"先打开 Modal 让用户确认/调整 chapterWordBudget,确认后才派发
   const continueWriting = async () => {
     if (!project) return;
     setContinueBusy(true);
     try {
-      await api.generate.continue(project.id, undefined, currentModel || undefined, currentProviderId || undefined);
-      toast('已派发续写任务到守护进程');
+      await api.generate.continue(project.id, undefined, currentModel || undefined, currentProviderId || undefined, continueBudget);
+      toast(`已派发续写任务到守护进程（每章约 ${continueBudget} 字）`);
+      setContinueOpen(false);
       navigate('/daemon');
     } catch (e) { toast((e as Error).message, 'err'); }
     finally { setContinueBusy(false); }
@@ -322,6 +348,130 @@ export default function ProjectDetail() {
     } catch (e) { toast((e as Error).message, 'err'); }
     finally { setGenCoverBusy(false); }
   };
+  // 封面预览图：调 text_to_image API 生成图片，用 canvas 叠加书名+作者文字
+  // BUG2 修复：原流程只生成 prompt 文本，用户复制到 SD/MJ 生成图片后画面无书名/作者署名
+  // 现流程：应用内直接生成图片 + canvas 叠加文字，提供完整书籍封面
+  const [coverPreviewUrl, setCoverPreviewUrl] = useState<string>('');
+  const [coverPreviewBusy, setCoverPreviewBusy] = useState(false);
+  const coverPreviewAbortRef = useRef<AbortController | null>(null);
+  // 切项目时清空预览图(避免上一项目的图残留)
+  useEffect(() => { setCoverPreviewUrl(''); }, [id]);
+  // B3 修复: 组件卸载时 abort 进行中的预览图请求,防 fetch 在后台继续消耗网络
+  useEffect(() => () => { coverPreviewAbortRef.current?.abort(); }, []);
+
+  // 从 coverDraft 提取英文 Prompt 部分（"Prompt:" 行之后的内容）
+  const extractEnPrompt = (draft: string): string => {
+    if (!draft) return '';
+    // 匹配 "Prompt:" 或 "Prompt：" 后的内容（容错中英文冒号）
+    const m = draft.match(/Prompt[:：]\s*([\s\S]+)/i);
+    if (m && m[1]) return m[1].trim();
+    // 兜底：若没匹配到 Prompt: 标记，取最后一段非中文为主的内容
+    const lines = draft.split('\n').filter(l => l.trim());
+    const enLine = lines.find(l => /^[\x00-\x7f,\. ]+$/.test(l.trim()) && l.trim().length > 30);
+    return enLine || draft.trim();
+  };
+
+  // canvas 在图片上叠加书名 + 作者文字，返回 dataURL
+  const overlayTextOnImage = (imgUrl: string, title: string, author: string): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';  // 允许 canvas 读取像素（否则 toDataURL 报 tainted canvas）
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { reject(new Error('canvas 2d context 不可用')); return; }
+          // 绘制底图
+          ctx.drawImage(img, 0, 0);
+          // 底部渐变蒙版（让文字可读）
+          const h = canvas.height;
+          const gradient = ctx.createLinearGradient(0, h * 0.6, 0, h);
+          gradient.addColorStop(0, 'rgba(8,6,4,0)');
+          gradient.addColorStop(1, 'rgba(8,6,4,0.85)');
+          ctx.fillStyle = gradient;
+          ctx.fillRect(0, h * 0.6, canvas.width, h * 0.4);
+          // 书名（金色，居中，自适应字号）
+          const titleText = title || '';
+          const fontSize = Math.max(28, Math.round(canvas.width / 14));
+          ctx.font = `bold ${fontSize}px "Noto Serif SC", "Songti SC", serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'alphabetic';
+          ctx.fillStyle = '#D4A534';  // 琥珀金
+          ctx.shadowColor = 'rgba(0,0,0,0.8)';
+          ctx.shadowBlur = 8;
+          ctx.shadowOffsetY = 2;
+          const titleY = h - fontSize * 1.5;
+          ctx.fillText(titleText, canvas.width / 2, titleY, canvas.width * 0.9);
+          // 作者署名（米白色，小字号）
+          ctx.shadowBlur = 4;
+          if (author) {
+            const authorSize = Math.max(14, Math.round(fontSize * 0.4));
+            ctx.font = `${authorSize}px "Noto Sans SC", sans-serif`;
+            ctx.fillStyle = '#F5E6C8';
+            ctx.fillText(`—— ${author}`, canvas.width / 2, h - authorSize * 1.2, canvas.width * 0.9);
+          }
+          resolve(canvas.toDataURL('image/png'));
+        } catch (e) { reject(e); }
+      };
+      img.onerror = () => reject(new Error('图片加载失败'));
+      img.src = imgUrl;
+    });
+  };
+
+  const onGenerateCoverPreview = async () => {
+    if (!project) return;
+    if (!coverDraft.trim()) { toast('请先生成封面提示词', 'err'); return; }
+    setCoverPreviewBusy(true);
+    // 中断上一次请求（防快速连点生成多张图）
+    coverPreviewAbortRef.current?.abort();
+    const ac = new AbortController();
+    coverPreviewAbortRef.current = ac;
+    try {
+      const enPrompt = extractEnPrompt(coverDraft);
+      if (!enPrompt) { toast('无法从提示词中提取英文 Prompt', 'err'); return; }
+      // 调 text_to_image API（系统提供）
+      const url = `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=${encodeURIComponent(enPrompt)}&image_size=portrait_4_3`;
+      const resp = await fetch(url, { signal: ac.signal });
+      if (!resp.ok) throw new Error(`图片生成失败（${resp.status}）`);
+      // 响应是图片二进制
+      const blob = await resp.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      // B1 修复: try/finally 确保 objectUrl 在任何路径(包括 overlayTextOnImage 抛错)下都被释放
+      try {
+        // 用 canvas 叠加书名+作者
+        const titledAuthor = coverAuthor.trim() || '';
+        const titledBook = coverBookTitle.trim() || project.title;
+        const dataUrl = await overlayTextOnImage(objectUrl, titledBook, titledAuthor);
+        setCoverPreviewUrl(dataUrl);
+        toast('封面预览图已生成');
+      } finally {
+        URL.revokeObjectURL(objectUrl);
+      }
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return;
+      toast(`生成预览图失败：${(e as Error).message}`, 'err');
+    } finally {
+      // B2 修复: 仅当 ref 仍指向当前请求时才清理,避免快速连点时覆盖后一个请求的控制器
+      if (coverPreviewAbortRef.current === ac) {
+        coverPreviewAbortRef.current = null;
+        setCoverPreviewBusy(false);
+      }
+    }
+  };
+
+  // 下载预览图
+  const onDownloadCover = () => {
+    if (!coverPreviewUrl || !project) return;
+    const a = document.createElement('a');
+    a.href = coverPreviewUrl;
+    a.download = `${project.title.replace(/[\\/:*?"<>|]/g, '_')}_cover.png`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
   // 封面提示词失焦保存（走 PATCH /state）
   const onBlurCover = async () => {
     // BUG4 修复：生成期间跳过，避免覆盖 AI 刚生成的封面提示词
@@ -382,7 +532,7 @@ export default function ProjectDetail() {
             <p className="mt-1 text-[10px] text-paper-mute">{fmtWords(project.currentWords)} / {fmtWords(project.targetWords)}</p>
           </div>
           <button className="btn-ghost py-1.5 text-xs" onClick={() => navigate('/studio')}>工作台</button>
-          <button className="btn-primary py-1.5 text-xs" onClick={continueWriting} disabled={continueBusy || refineBookBusy} title="派发续写任务到守护进程">
+          <button className="btn-primary py-1.5 text-xs" onClick={() => setContinueOpen(true)} disabled={continueBusy || refineBookBusy} title="派发续写任务到守护进程">
             {continueBusy ? <Spinner className="h-3.5 w-3.5" /> : <Play size={13} />} 继续写作
           </button>
           <button className="btn-ghost py-1.5 text-xs text-amber" onClick={refineBook} disabled={refineBookBusy || continueBusy || chapterCount === 0} title={chapterCount === 0 ? '项目无章节，无法精修' : '批量精修所有章节去 AI 味（守护进程任务）'}>
@@ -570,7 +720,7 @@ export default function ProjectDetail() {
                       disabled={genCoverBusy}
                     />
                     {coverDraft && (
-                      <div className="mt-1 flex justify-end">
+                      <div className="mt-1 flex justify-end gap-3">
                         <button
                           className="text-[10px] text-paper-mute hover:text-amber"
                           onClick={() => {
@@ -579,6 +729,33 @@ export default function ProjectDetail() {
                               .catch(() => toast('复制失败，请手动选择文本复制', 'err'));
                           }}
                         >复制全部</button>
+                        {/* BUG2 修复: 新增"生成预览图"按钮,调 text_to_image API 生成图片后用 canvas 叠加书名/作者 */}
+                        <button
+                          className="flex items-center gap-1 text-[10px] text-paper-mute hover:text-amber"
+                          onClick={onGenerateCoverPreview}
+                          disabled={coverPreviewBusy}
+                          title="基于英文 Prompt 生成封面预览图,自动叠加书名与作者署名"
+                        >
+                          {coverPreviewBusy ? <Spinner className="h-3 w-3" /> : <ImageIcon size={11} />}
+                          {coverPreviewBusy ? '生成中…' : '生成预览图'}
+                        </button>
+                      </div>
+                    )}
+                    {/* 封面预览图展示 + 下载 */}
+                    {coverPreviewUrl && (
+                      <div className="mt-3 space-y-2">
+                        <div className="relative overflow-hidden rounded-md border" style={{ borderColor: 'var(--ink-500)' }}>
+                          <img src={coverPreviewUrl} alt="封面预览" className="block w-full" />
+                        </div>
+                        <div className="flex items-center justify-between text-[10px] text-paper-mute">
+                          <span>已叠加书名「{coverBookTitle.trim() || project.title}」{coverAuthor.trim() ? ` · 作者「${coverAuthor.trim()}」` : ''}</span>
+                          <button
+                            className="flex items-center gap-1 text-amber hover:text-amber-bright"
+                            onClick={onDownloadCover}
+                          >
+                            <Download size={11} /> 下载 PNG
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>
@@ -795,6 +972,76 @@ export default function ProjectDetail() {
             {deleteBusy ? <Spinner className="h-4 w-4" /> : <Trash2 size={16} />} 确认删除
           </button>
         </div>
+      </Modal>
+
+      {/* BUG1 修复: 续写前确认 chapterWordBudget,避免后端 infer 导致字数不一致 */}
+      <Modal open={continueOpen} onClose={() => setContinueOpen(false)} title="继续写作 · 字数预算">
+        {project && (() => {
+          const isShort = project.type === 'short';
+          const min = isShort ? 2000 : 1500;
+          const max = isShort ? 10000 : 8000;
+          const step = isShort ? 500 : 100;
+          const presets = isShort
+            ? [{ label: '紧凑', value: 3000 }, { label: '标准', value: 5000 }, { label: '厚实', value: 7000 }]
+            : [{ label: '短章流', value: 1500 }, { label: '标准', value: 2500 }, { label: '厚重', value: 3500 }, { label: '大章', value: 5000 }];
+          const matchedPreset = presets.find(p => p.value === continueBudget);
+          const estChapters = Math.max(1, Math.ceil(project.targetWords / continueBudget));
+          return (
+            <div className="space-y-4">
+              <p className="text-xs leading-relaxed text-paper-mute">
+                设置续写章节的字数预算。默认从项目已完成章节的平均字数推断,可按需调整。
+                <br />注: 调整后续写字数可能与原章节不一致(原章节字数不变)。
+              </p>
+              {/* 预设档位 */}
+              <Field label="每章字数预算" hint={`${min}-${max}`}>
+                <SegmentedControl
+                  options={presets}
+                  value={matchedPreset ? continueBudget : -1}
+                  onChange={v => setContinueBudget(v as number)}
+                />
+              </Field>
+              {/* 滑块 + 数值 */}
+              <div className="flex items-center gap-3">
+                <Slider
+                  value={continueBudget}
+                  min={min}
+                  max={max}
+                  step={step}
+                  onChange={v => setContinueBudget(v)}
+                />
+                <div className="flex w-24 shrink-0 items-center gap-1">
+                  <input
+                    type="number"
+                    min={min}
+                    max={max}
+                    step={step}
+                    className="input px-2 py-1 text-xs"
+                    value={continueBudget}
+                    onChange={e => {
+                      const v = Number(e.target.value);
+                      if (!isNaN(v)) setContinueBudget(Math.min(max, Math.max(min, v)));
+                    }}
+                  />
+                  <span className="shrink-0 text-[10px] text-paper-mute">字</span>
+                </div>
+              </div>
+              {/* 联动预览 */}
+              <div className="flex items-center gap-2 rounded-md border p-2.5 text-xs" style={{ borderColor: 'var(--ink-500)', background: 'var(--ink-900)' }}>
+                <Sliders size={12} className="text-amber" />
+                预估还需约 <span className="font-mono text-amber">{Math.max(0, estChapters - chapterCount)}</span> {isShort ? '段' : '章'}
+                · 总目标 <span className="font-mono text-amber">{(project.targetWords / 10000).toFixed(1)}</span> 万字
+                · 已完成 <span className="font-mono text-paper-dim">{chapterCount}</span> {isShort ? '段' : '章'}
+              </div>
+              {/* 操作按钮 */}
+              <div className="flex justify-end gap-2 border-t pt-4" style={{ borderColor: 'var(--ink-500)' }}>
+                <button className="btn-ghost" onClick={() => setContinueOpen(false)}>取消</button>
+                <button className="btn-primary" onClick={continueWriting} disabled={continueBusy}>
+                  {continueBusy ? <Spinner className="h-4 w-4" /> : <Play size={16} />} 派发续写任务
+                </button>
+              </div>
+            </div>
+          );
+        })()}
       </Modal>
       {node}
     </div>
