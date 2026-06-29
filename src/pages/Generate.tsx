@@ -3,10 +3,10 @@
  */
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { BookOpen, FileText, ArrowLeft, Sparkles, Hash, Cpu } from 'lucide-react';
+import { BookOpen, FileText, ArrowLeft, Sparkles, Hash, Cpu, Type, Sliders } from 'lucide-react';
 import { api } from '@/api/client';
 import BlurText from '@/components/BlurText';
-import { Spinner, useToast } from '@/components/ui';
+import { Spinner, useToast, Field, Switch, SegmentedControl, Slider } from '@/components/ui';
 import GenreSelect from '@/components/GenreSelect';
 import { useApp } from '@/stores/app';
 import { cn } from '@/lib/utils';
@@ -17,11 +17,35 @@ interface Form {
   genre: string; genreId?: string; characters: string;
   hookStyle: string; pace: string; ending: string;
   viewpoint: string; tone: string;
+  chapterWordBudget: number;
 }
 
-const KIND_PRESET: Record<GenerateKind, { label: string; cap: number; default: number; desc: string; icon: typeof BookOpen }> = {
-  book: { label: '成书', cap: 5_000_000, default: 300_000, desc: '长篇连载，多卷结构（最高 500 万字）', icon: BookOpen },
-  short: { label: '成短篇', cap: 200_000, default: 60_000, desc: '短篇速成，单线推进', icon: FileText },
+const KIND_PRESET: Record<GenerateKind, {
+  label: string; cap: number; default: number; desc: string; icon: typeof BookOpen;
+  budgetMin: number; budgetMax: number; budgetDefault: number; budgetStep: number;
+  budgetPresets: { label: string; value: number }[];
+}> = {
+  book: {
+    label: '成书', cap: 5_000_000, default: 300_000,
+    desc: '长篇连载，多卷结构（最高 500 万字）', icon: BookOpen,
+    budgetMin: 1500, budgetMax: 8000, budgetDefault: 2500, budgetStep: 100,
+    budgetPresets: [
+      { label: '短章流', value: 1500 },
+      { label: '标准', value: 2500 },
+      { label: '厚重', value: 3500 },
+      { label: '大章', value: 5000 },
+    ],
+  },
+  short: {
+    label: '成短篇', cap: 200_000, default: 60_000,
+    desc: '短篇速成，单线推进', icon: FileText,
+    budgetMin: 2000, budgetMax: 10000, budgetDefault: 5000, budgetStep: 500,
+    budgetPresets: [
+      { label: '紧凑', value: 3000 },
+      { label: '标准', value: 5000 },
+      { label: '厚实', value: 7000 },
+    ],
+  },
 };
 
 // 题材列表已迁移至后端题材库（GET /api/v1/genres），通过 <GenreSelect> 共享组件渲染
@@ -34,6 +58,7 @@ export default function Generate() {
     title: '', targetWords: 300_000, idea: '', genre: '', characters: '',
     hookStyle: '强冲突', pace: '中等', ending: '圆满',
     viewpoint: '第三人称', tone: '爽文',
+    chapterWordBudget: 2500,
   });
   // BUG3 修复：targetWords 用独立字符串 state 暂存，允许清空重输；onBlur 写入 form.targetWords，submit 校验此原始值
   const [targetWordsInput, setTargetWordsInput] = useState<string>(String(300_000));
@@ -55,24 +80,26 @@ export default function Generate() {
     }
   }, [currentModel, providers, currentProviderId, defaultProviderId, setCurrentModel]);
 
-  const set = (k: keyof Form, v: any) => setForm(f => ({ ...f, [k]: v }));
+  const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm(f => ({ ...f, [k]: v }));
 
   const pickKind = (k: GenerateKind) => {
     setKind(k);
-    setForm(f => ({ ...f, targetWords: KIND_PRESET[k].default }));
-    setTargetWordsInput(String(KIND_PRESET[k].default));
+    const preset = KIND_PRESET[k];
+    setForm(f => ({ ...f, targetWords: preset.default, chapterWordBudget: preset.budgetDefault }));
+    setTargetWordsInput(String(preset.default));
     setStep(2);
   };
 
   const submit = async () => {
     if (!form.idea.trim()) { toast('请填写核心创意', 'err'); return; }
+    // LOW-7 修复：创意过长会撑爆 LLM 上下文，限制 2000 字
+    if (form.idea.length > 2000) { toast(`创意过长（${form.idea.length} 字），请精简到 2000 字内`, 'err'); return; }
     // BUG5 修复：基于未 clamp 的 targetWordsInput 校验，避免 onChange/onBlur 已 clamp 导致校验失效（死代码）
     const n = Number(targetWordsInput);
     if (isNaN(n) || n < 1000) { toast('字数不能少于 1000', 'err'); return; }
     if (n > KIND_PRESET[kind].cap) { toast(`字数不能超过 ${KIND_PRESET[kind].cap}`, 'err'); return; }
     if (!form.genre.trim()) { toast('请选择或输入题材', 'err'); return; }
     if (!currentModel || !currentProviderId) { toast('请先选择模型', 'err'); return; }
-    setForm({ ...form, targetWords: n });
     setBusy(true);
     const config: GenerateConfig = {
       genre: form.genre.trim(),
@@ -86,6 +113,8 @@ export default function Generate() {
         kind, targetWords: n, config,
         idea: form.idea.trim(), title: form.title.trim() || undefined,
         webSearch,
+        // 每章字数预算透传到 daemon（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
+        chapterWordBudget: form.chapterWordBudget,
         // 透传当前所选模型，daemon 会优先用此 model/providerId 而非 default 旗舰
         model: currentModel,
         providerId: currentProviderId || undefined,
@@ -96,7 +125,10 @@ export default function Generate() {
     finally { setBusy(false); }
   };
 
-  const estChapters = Math.max(1, Math.ceil(form.targetWords / 3000));
+  // HIGH-1 修复：estChapters 除数与 daemon 一致，用 form.chapterWordBudget（默认 2500）
+  // 原 bug：UI 显示"预估 N 章 · 每章约 3000 字"，但 daemon 实际每章约 2500 字，预估比实际少 20%
+  // 改后：UI 显示的章数与 daemon 估算完全一致
+  const estChapters = Math.max(1, Math.ceil(form.targetWords / form.chapterWordBudget));
 
   return (
     <div className="h-full overflow-y-auto px-4 py-6 md:px-8">
@@ -163,7 +195,7 @@ function Step1({ onPick }: { onPick: (k: GenerateKind) => void }) {
 }
 
 function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch, setWebSearch, providers, currentModel, currentProviderId, onPickModel, targetWordsInput, setTargetWordsInput }: {
-  kind: GenerateKind; form: Form; set: (k: keyof Form, v: any) => void;
+  kind: GenerateKind; form: Form; set: <K extends keyof Form>(k: K, v: Form[K]) => void;
   estChapters: number; busy: boolean; onBack: () => void; onSubmit: () => void;
   webSearch: boolean; setWebSearch: (v: boolean) => void;
   providers: { id: string; name: string; models: string[] }[];
@@ -173,7 +205,8 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
   targetWordsInput: string;
   setTargetWordsInput: (v: string) => void;
 }) {
-  const cap = KIND_PRESET[kind].cap;
+  const preset = KIND_PRESET[kind];
+  const cap = preset.cap;
   // 编码当前所选：${providerId}::${model}，与 Studio 顶栏下拉一致
   const modelValue = currentProviderId && currentModel ? `${currentProviderId}::${currentModel}` : '';
   // U5 修复：用 indexOf 切第一个 '::' 分隔点，避免 model 名含 '::' 时被 split 全切断裂
@@ -181,24 +214,30 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
     const sep = v.indexOf('::');
     if (sep > 0) onPickModel(v.slice(sep + 2), v.slice(0, sep));
   };
+
+  // 检测当前 chapterWordBudget 是否匹配某个预设档位（用于 SegmentedControl 高亮）
+  const matchedPreset = preset.budgetPresets.find(p => p.value === form.chapterWordBudget);
+
   return (
     <div className="panel-elevated animate-fade-up p-6">
+      {/* ===== 分组 1：基础信息 ===== */}
+      <SectionTitle icon={<Type size={14} />} title="基础信息" />
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <Field label="标题（可选，留空自动命名）">
+        <Field label="标题" hint="可选，留空自动命名">
           <input className="input" placeholder="如：风起观星台" value={form.title} onChange={e => set('title', e.target.value)} />
         </Field>
-        <Field label={`目标字数（上限 ${cap.toLocaleString()}）`}>
+        <Field label={`目标字数`} hint={`上限 ${cap.toLocaleString()}`}>
           <input type="number" min={1000} step={1000} className="input" value={targetWordsInput}
             onChange={e => setTargetWordsInput(e.target.value)}
             onBlur={() => { const v = Number(targetWordsInput); set('targetWords', Math.min(cap, Math.max(1000, v || 0))); }} />
         </Field>
       </div>
-      <Field label="核心创意">
+      <Field label="核心创意" required>
         <textarea className="input min-h-[96px] resize-none" placeholder="一句话点子，越具体越好…"
           value={form.idea} onChange={e => set('idea', e.target.value)} />
       </Field>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <Field label="题材">
+        <Field label="题材" required>
           <GenreSelect
             value={form.genreId}
             label={form.genre}
@@ -212,9 +251,10 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
           <input className="input" placeholder="主角与对手，用逗号分隔" value={form.characters} onChange={e => set('characters', e.target.value)} />
         </Field>
       </div>
-      {/* 任务级模型选择：从全局 store 选当前 provider + model，submit 时透传到 generate 接口 */}
-      {/* daemon 会优先用此 model/providerId，不再固定用 default 旗舰 */}
-      <Field label="使用模型">
+
+      {/* ===== 分组 2：生成参数（含每章字数预算） ===== */}
+      <SectionTitle icon={<Sliders size={14} />} title="生成参数" className="mt-6" />
+      <Field label="使用模型" required>
         <div className="flex items-center gap-2">
           <Cpu size={14} className="shrink-0 text-amber" />
           <select className="input" value={modelValue} onChange={e => handleModelChange(e.target.value)} disabled={providers.length === 0}>
@@ -226,6 +266,52 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
           </select>
         </div>
       </Field>
+
+      {/* 每章字数预算：预设档位 + 滑块 + 精确输入 + 联动预览 */}
+      <Field label="每章字数预算" hint={`影响章数估算与生成字数（${preset.budgetMin}-${preset.budgetMax}）`}>
+        <div className="rounded-md border p-3" style={{ borderColor: 'var(--ink-500)', background: 'var(--ink-900)' }}>
+          {/* 预设档位 */}
+          <SegmentedControl
+            options={preset.budgetPresets}
+            value={matchedPreset ? form.chapterWordBudget : -1}
+            onChange={v => set('chapterWordBudget', v as number)}
+          />
+          {/* 滑块 + 数值 */}
+          <div className="mt-3 flex items-center gap-3">
+            <Slider
+              value={form.chapterWordBudget}
+              min={preset.budgetMin}
+              max={preset.budgetMax}
+              step={preset.budgetStep}
+              onChange={v => set('chapterWordBudget', v)}
+            />
+            <div className="flex w-24 shrink-0 items-center gap-1">
+              <input
+                type="number"
+                min={preset.budgetMin}
+                max={preset.budgetMax}
+                step={preset.budgetStep}
+                className="input px-2 py-1 text-xs"
+                value={form.chapterWordBudget}
+                onChange={e => {
+                  const v = Number(e.target.value);
+                  if (!isNaN(v)) set('chapterWordBudget', Math.min(preset.budgetMax, Math.max(preset.budgetMin, v)));
+                }}
+              />
+              <span className="shrink-0 text-[10px] text-paper-mute">字</span>
+            </div>
+          </div>
+          {/* 联动预览：章数 + 总字数 */}
+          <div className="mt-2.5 flex items-center gap-1.5 text-[11px] text-paper-mute">
+            <Hash size={11} />
+            预估 <span className="font-mono text-amber">{estChapters}</span> {kind === 'book' ? '章' : '段'} ·
+            总计约 <span className="font-mono text-amber">{(form.targetWords / 10000).toFixed(1)}</span> 万字
+          </div>
+        </div>
+      </Field>
+
+      {/* ===== 分组 3：风格设定 ===== */}
+      <SectionTitle icon={<Sparkles size={14} />} title="风格设定" className="mt-6" />
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Field label="钩子风格">
           <select className="input" value={form.hookStyle} onChange={e => set('hookStyle', e.target.value)}>
@@ -256,21 +342,20 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
         </Field>
       </div>
 
-      <div className="mt-5 flex items-start gap-3 rounded-md border p-3" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-900)' }}>
-        <button type="button" role="switch" aria-checked={webSearch}
-          className={cn('relative h-5 w-9 shrink-0 rounded-full transition-colors', webSearch ? 'bg-amber' : 'bg-ink-500')}
-          onClick={() => setWebSearch(!webSearch)}>
-          <span className={cn('absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-paper transition-transform', webSearch && 'translate-x-4')} />
-        </button>
-        <div className="flex-1">
-          <p className="text-xs font-medium text-paper-dim">联网搜索取材</p>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-paper-mute">开启后，扫榜/大纲/正文阶段都会先抓取 5 条网页摘要注入上下文，适合年代文、行业文、历史考据</p>
-        </div>
+      {/* 联网搜索开关 */}
+      <div className="mt-5 rounded-md border p-3" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-900)' }}>
+        <Switch
+          checked={webSearch}
+          onChange={setWebSearch}
+          label="联网搜索取材"
+          desc="开启后，扫榜/大纲/正文阶段都会先抓取 5 条网页摘要注入上下文，适合年代文、行业文、历史考据"
+        />
       </div>
 
+      {/* 操作栏 */}
       <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t pt-4" style={{ borderColor: 'var(--ink-600)' }}>
         <div className="flex items-center gap-2 text-xs text-paper-mute">
-          <Hash size={13} /> 预估 <span className="font-mono text-amber">{estChapters}</span> 章 · 每章约 3000 字
+          <Hash size={13} /> 预估 <span className="font-mono text-amber">{estChapters}</span> {kind === 'book' ? '章' : '段'} · 每章约 <span className="font-mono text-amber">{form.chapterWordBudget}</span> 字
         </div>
         <div className="flex gap-2">
           <button className="btn-ghost" onClick={onBack}><ArrowLeft size={14} /> 上一步</button>
@@ -283,11 +368,13 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+// 分组小标题（视觉分区，提升表单节奏感）
+function SectionTitle({ icon, title, className }: { icon: React.ReactNode; title: string; className?: string }) {
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-medium text-paper-mute">{label}</span>
-      {children}
-    </label>
+    <div className={cn('mb-3 flex items-center gap-2', className)}>
+      <span className="text-amber">{icon}</span>
+      <h3 className="text-xs font-medium uppercase tracking-wider text-paper-mute">{title}</h3>
+      <span className="h-px flex-1" style={{ background: 'var(--ink-500)' }} />
+    </div>
   );
 }

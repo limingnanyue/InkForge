@@ -105,6 +105,15 @@ body {
   }
   .input:focus { outline: none; border-color: var(--amber-deep); box-shadow: 0 0 0 3px rgba(212, 165, 52, 0.12); }
   .input::placeholder { color: var(--paper-mute); }
+  .input-compact {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--paper-dim);
+    border-radius: 4px;
+    transition: all 0.15s;
+  }
+  .input-compact:hover { border-color: var(--ink-400); }
+  .input-compact:focus { outline: none; border-color: var(--amber-deep); background: var(--ink-900); }
 
   /* 标签徽标 */
   .badge {
@@ -122,6 +131,44 @@ body {
   }
   .nav-item:hover { color: var(--paper-dim); background: var(--ink-700); }
   .nav-item.active { color: var(--amber); background: rgba(212, 165, 52, 0.08); box-shadow: inset 2px 0 0 var(--amber); }
+
+  /* 滑块（字数预算选择） */
+  .ink-slider {
+    -webkit-appearance: none;
+    appearance: none;
+    height: 6px;
+    border-radius: 9999px;
+    outline: none;
+    cursor: pointer;
+  }
+  .ink-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 9999px;
+    background: var(--paper);
+    border: 2px solid var(--amber);
+    cursor: pointer;
+    box-shadow: 0 0 0 3px rgba(212, 165, 52, 0.15);
+    transition: transform 0.15s;
+  }
+  .ink-slider::-webkit-slider-thumb:hover { transform: scale(1.15); }
+  .ink-slider::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 9999px;
+    background: var(--paper);
+    border: 2px solid var(--amber);
+    cursor: pointer;
+    box-shadow: 0 0 0 3px rgba(212, 165, 52, 0.15);
+  }
+  .ink-slider:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* number input 去原生 spinner（破坏暗色主题） */
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; }
 }
 
 /* ============================================================

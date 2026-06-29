@@ -6,7 +6,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
-import { Spinner, ProgressBar, fmtWords, Modal, useToast } from '@/components/ui';
+import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch } from '@/components/ui';
 import GenreSelect from '@/components/GenreSelect';
 import type { Project, Chapter, ChapterNode, AgentState, ProjectType } from '@shared/types';
 import { cn } from '@/lib/utils';
@@ -398,15 +398,7 @@ export default function ProjectDetail() {
       {/* 联网搜索配置条 */}
       <div className="flex shrink-0 items-center gap-3 border-b px-4 py-2.5 md:px-8" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
         <Globe size={14} className={cn('shrink-0 transition-colors', webSearch ? 'text-amber' : 'text-paper-mute')} />
-        <button type="button" role="switch" aria-checked={webSearch}
-          className={cn('relative h-5 w-9 shrink-0 rounded-full transition-colors', webSearch ? 'bg-amber' : 'bg-ink-500')}
-          onClick={toggleWebSearch}>
-          <span className={cn('absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-paper transition-transform', webSearch && 'translate-x-4')} />
-        </button>
-        <div className="min-w-0 flex-1">
-          <p className="text-xs font-medium text-paper-dim">联网搜索取材</p>
-          <p className="truncate text-[11px] leading-relaxed text-paper-mute">开启后，本项目对话/生成默认启用联网搜索（可在工作台临时关闭）</p>
-        </div>
+        <Switch checked={webSearch} onChange={toggleWebSearch} label="联网搜索取材" desc="开启后，本项目对话/生成默认启用联网搜索（可在工作台临时关闭）" />
       </div>
 
       {/* Tab 切换条 */}

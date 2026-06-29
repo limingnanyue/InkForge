@@ -193,7 +193,7 @@ export function buildChapterAnchor(
     positioningBlock = `
 【本章定位】
 · 章节类型：普通推进章（默认）
-· 字数预算：${baseWordTarget} 字（约 2000-3000 字）
+· 字数预算：${baseWordTarget} 字（约 ${Math.round(baseWordTarget * 0.8)}-${Math.round(baseWordTarget * 1.2)} 字）
 · 核心情绪：按题材对位（见题材→情绪路由表）`;
   }
 
@@ -610,12 +610,14 @@ async function generateOutlineForVolume(opts: {
   premiseHint: string;        // 本卷核心冲突提示
   prevVolumeTail?: string;     // 上一卷最后一章标题+钩子（用于承接）
   webSearch?: boolean;
+  chapterWordBudget?: number;  // 每章字数预算（默认 2500，影响 prompt 中的"每章约 X 字"提示）
 }): Promise<ParsedOutlineItem[]> {
   const { projectId, model, providerId, config, idea, volIndex, volTotal, volChapterCount, globalStartIdx, emotionArc, premiseHint, prevVolumeTail, webSearch } = opts;
+  const chapterWordBudget = opts.chapterWordBudget ?? 2500;
   const dist = computePositioningDistribution(volChapterCount);
   const distLine = `高压章 ${dist['high-pressure']} 章 / 普通推进章 ${dist['normal-progress']} 章 / 修炼试错章 ${dist['trial-error']} 章 / 关系回收章 ${dist['relationship']} 章 / 低压生活章 ${dist['low-pressure']} 章 / 信息整理章 ${dist['info-organize']} 章`;
 
-  const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 2000-3000 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
+  const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
 
 【核心创意】${idea}
 【题材风格】${config.genre}
@@ -690,9 +692,13 @@ export async function generateOutline(opts: {
    * 接收当前已完成卷的累积 chapters 与已完成卷数。
    */
   onVolumeCheckpoint?: (accumulated: ParsedOutlineItem[], doneVolumes: number, totalVolumes: number) => void;
+  /** 每章字数预算：影响章数估算与 prompt 中的"每章约 X 字"提示，默认 2500 */
+  chapterWordBudget?: number;
 }): Promise<string> {
   const { projectId, model, providerId, targetWords, config, idea, webSearch, onVolumeProgress, prevVolumes, onVolumeCheckpoint } = opts;
-  const chapterCount = Math.max(1, Math.ceil(targetWords / 2500));
+  // 每章字数预算：用户可配置，默认 2500（影响章数估算与 prompt 中的字数提示）
+  const chapterWordBudget = opts.chapterWordBudget ?? 2500;
+  const chapterCount = Math.max(1, Math.ceil(targetWords / chapterWordBudget));
 
   // —— 单次调用足够时走原逻辑（小卷，<= 200 章）——
   if (chapterCount <= OUTLINE_SINGLE_CALL_MAX_CHAPTERS) {
@@ -706,7 +712,7 @@ export async function generateOutline(opts: {
     const volLine = volumes.length > 0
       ? `\n【卷纲】共 ${volumes.length} 卷，每卷 ~20 章，卷情绪弧线依次：${volumes.map((v, i) => `第${i + 1}卷(${v.range[0] + 1}-${v.range[1] + 1}章,${v.emotionArc})`).join('；')}`
       : '';
-    const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 2000-3000 字）。
+    const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字）。
 
 【核心创意】${idea}
 【题材风格】${config.genre}
@@ -779,6 +785,7 @@ ${distLine}
       volChapterCount, globalStartIdx: vol.range[0],
       emotionArc: vol.emotionArc, premiseHint: volPremiseHints(vi),
       prevVolumeTail: prevTail, webSearch,
+      chapterWordBudget,
     });
 
     if (volChapters.length === 0) {

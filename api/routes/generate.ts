@@ -21,7 +21,7 @@ const MAX_SHORT = 200_000;
  * 可被 generate 路由与 chat 路由（守护进程意图）共同调用
  * model/providerId：可选，前端从全局 store currentModel/currentProviderId 透传
  */
-export function createContinueTask(projectId: string, webSearch?: boolean, model?: string, providerId?: string): { task: Task; project: Project } | null {
+export function createContinueTask(projectId: string, webSearch?: boolean, model?: string, providerId?: string, chapterWordBudget?: number): { task: Task; project: Project } | null {
   const project = projectRepo.get(projectId);
   if (!project) return null;
 
@@ -60,6 +60,8 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
       // 任务级模型选择（不传则回落到 default provider 旗舰模型）
       ...(model ? { model } : {}),
       ...(providerId ? { providerId } : {}),
+      // 每章字数预算透传到 task.config，daemon 从 cfg 读
+      ...(chapterWordBudget ? { chapterWordBudget } : {}),
     },
   });
 
@@ -73,12 +75,18 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
 }
 
 router.post('/', (req: Request, res: Response) => {
-  const { projectId, title, kind, targetWords, config, idea, webSearch, model, providerId } = req.body || {};
+  const { projectId, title, kind, targetWords, config, idea, webSearch, model, providerId, chapterWordBudget } = req.body || {};
   if (!kind || !['book', 'short'].includes(kind)) return fail(res, 'INVALID', 'kind 必须为 book 或 short');
 
   const limit = kind === 'book' ? MAX_BOOK : MAX_SHORT;
   if (!targetWords || targetWords <= 0) return fail(res, 'INVALID', '目标字数必填');
   if (targetWords > limit) return fail(res, 'INVALID', `${kind === 'book' ? '成书' : '成短篇'}上限为 ${limit.toLocaleString()} 字`);
+  // 每章字数预算范围校验（book 1500-8000，short 2000-10000）
+  const budgetMin = kind === 'book' ? 1500 : 2000;
+  const budgetMax = kind === 'book' ? 8000 : 10000;
+  if (chapterWordBudget != null && (typeof chapterWordBudget !== 'number' || chapterWordBudget < budgetMin || chapterWordBudget > budgetMax)) {
+    return fail(res, 'INVALID', `每章字数预算须在 ${budgetMin}-${budgetMax} 之间`);
+  }
 
   // 获取或创建项目
   let project = projectId ? projectRepo.get(projectId) : null;
@@ -109,6 +117,8 @@ router.post('/', (req: Request, res: Response) => {
       // 任务级模型选择（不传则回落到 default provider 旗舰模型）
       ...(model ? { model } : {}),
       ...(providerId ? { providerId } : {}),
+      // 每章字数预算透传到 task.config，daemon 从 cfg 读
+      ...(chapterWordBudget ? { chapterWordBudget } : {}),
     },
   });
 
@@ -117,9 +127,9 @@ router.post('/', (req: Request, res: Response) => {
 
 // 继续写作：基于已有项目派发续写任务到守护进程
 router.post('/continue', (req: Request, res: Response) => {
-  const { projectId, webSearch, model, providerId } = req.body || {};
+  const { projectId, webSearch, model, providerId, chapterWordBudget } = req.body || {};
   if (!projectId) return fail(res, 'INVALID', '项目 ID 必填');
-  const result = createContinueTask(projectId, webSearch, model, providerId);
+  const result = createContinueTask(projectId, webSearch, model, providerId, chapterWordBudget);
   if (!result) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   ok(res, result);
 });

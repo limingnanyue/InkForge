@@ -7,7 +7,6 @@ import { useNavigate } from 'react-router-dom';
 import { Send, Sparkles, Plus, ChevronRight, Brain, Activity, MessageSquare, Cpu, Globe, Server, Tag, TrendingUp } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
-import { api as apiClient } from '@/api/client';
 import BlurText from '@/components/BlurText';
 import { Spinner, EmptyState, ProgressRing, fmtWords, useToast, Tabs } from '@/components/ui';
 import type { ChatMessage, AgentState, Task } from '@shared/types';
@@ -65,10 +64,10 @@ export default function Studio() {
   useEffect(() => {
     if (!currentProject) { setMessages([]); setState(null); return; }
     const reqSeq = ++loadSeqRef.current;
-    apiClient.projects.messages(currentProject.id)
+    api.projects.messages(currentProject.id)
       .then(list => { if (reqSeq === loadSeqRef.current) setMessages(list); })
       .catch(e => { if (reqSeq === loadSeqRef.current) toast(`加载消息失败：${(e as Error).message}`, 'err'); });
-    apiClient.projects.state(currentProject.id)
+    api.projects.state(currentProject.id)
       .then(s => { if (reqSeq === loadSeqRef.current) setState(s); })
       .catch(e => { if (reqSeq === loadSeqRef.current) toast(`加载状态失败：${(e as Error).message}`, 'err'); });
     loadTasks(currentProject.id);
@@ -81,7 +80,7 @@ export default function Studio() {
 
   // SSE 订阅任务进度
   useEffect(() => {
-    const off = apiClient.streamEvents((e) => {
+    const off = api.streamEvents((e) => {
       if (e.type === 'task:progress' || e.type === 'task:done' || e.type === 'task:failed') {
         // 刷新任务列表
         if (currentProject) loadTasks(currentProject.id);
@@ -128,9 +127,9 @@ export default function Studio() {
     try {
       await handle.done;
       // 刷新消息（BUG-1：校验项目未切换才 set，避免串号覆盖）
-      const msgs = await apiClient.projects.messages(currentProject.id);
+      const msgs = await api.projects.messages(currentProject.id);
       if (mountedRef.current && reqSeq === loadSeqRef.current) setMessages(msgs);
-      const s = await apiClient.projects.state(currentProject.id);
+      const s = await api.projects.state(currentProject.id);
       if (mountedRef.current && reqSeq === loadSeqRef.current) setState(s);
     } catch (e) {
       if (mountedRef.current) toast((e as Error).message, 'err');
@@ -208,7 +207,7 @@ export default function Studio() {
           </div>
           <div className="flex items-center gap-1.5 text-xs text-paper-mute">
             <Cpu size={14} />
-            <select className="bg-transparent py-1 text-xs outline-none" value={currentProviderId ? `${currentProviderId}::${currentModel}` : ''} onChange={e => {
+            <select className="input-compact px-2 py-1 text-xs" value={currentProviderId ? `${currentProviderId}::${currentModel}` : ''} onChange={e => {
               const sep = e.target.value.indexOf('::');
               if (sep > 0) {
                 const pid = e.target.value.slice(0, sep);

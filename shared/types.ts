@@ -240,6 +240,9 @@ export interface GenerateRequest {
   config: GenerateConfig;
   idea?: string;
   webSearch?: boolean; // 生成时是否启用联网搜索取材
+  // 每章字数预算（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
+  // 不传则按 kind 回落：book=2500，short=5000
+  chapterWordBudget?: number;
   // 任务级模型选择（不传则回落到 default provider 旗舰模型）
   // 用法：前端从全局 store currentModel/currentProviderId 透传到 generate 接口
   model?: string;

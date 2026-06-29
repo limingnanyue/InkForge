@@ -258,8 +258,11 @@ async function runTask(task: Task): Promise<void> {
 async function runBookPipeline(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
   const cfg = task.config as {
     projectId: string; targetWords: number; config: any; idea: string; title: string;
+    chapterWordBudget?: number;
   };
   const { projectId, targetWords } = cfg;
+  // 每章字数预算：用户可配置，默认 2500（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
+  const chapterWordBudget = cfg.chapterWordBudget ?? 2500;
 
   // 断点续传：从 checkpoint 读取进度
   const checkpoint = task.checkpoint as { phase?: string; chapterIdx?: number; outlineJson?: string; scanInsight?: string };
@@ -307,7 +310,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   // 大纲阶段
   let outline = checkpoint.outlineJson;
   if (!outline) {
-    const totalChapters = Math.max(1, Math.ceil(targetWords / 2500));
+    const totalChapters = Math.max(1, Math.ceil(targetWords / chapterWordBudget));
     // 超长篇（>200 章）会触发分卷生成，每卷一条日志避免长时间无输出被误判卡死
     if (totalChapters > 200) {
       logTask(task.id, 'info', `超长篇（${totalChapters} 章）启用分卷大纲生成，预计 ${Math.ceil(totalChapters / 20)} 卷`);
@@ -324,6 +327,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     }
     outline = await generateOutline({
       projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch,
+      chapterWordBudget,
       prevVolumes,
       onVolumeProgress: (done, total) => {
         logTask(task.id, 'info', `大纲分卷生成 ${done}/${total} 卷完成`);
@@ -408,7 +412,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // oh-story：按章节定位类型调整 maxTokens（高压章给更多空间，低压/信息章压缩防注水）
     chapterRepo.update(chapter.id, { status: 'generating' });
     let content = '';
-    const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, 2500, ch.coreEmotion);
+    const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion);
     // 章末钩子提示 + 定位对位的字数提示
     const positioningHint = ch.positioning
       ? `（本章为${ch.positioning}，按【本章定位】的字数预算与情绪强度写作）`
@@ -426,7 +430,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       : [];
     // maxTokens 按定位系数微调：高压章 1.1×，信息/低压章 0.8-0.85×（贴合字数预算Σ契约）
     const TOKEN_MULT: Record<string, number> = { 'high-pressure': 1.1, 'normal-progress': 1.0, 'trial-error': 0.9, 'relationship': 1.0, 'low-pressure': 0.85, 'info-organize': 0.8 };
-    const chapterMaxTokens = Math.round(2500 * (ch.positioning ? (TOKEN_MULT[ch.positioning] ?? 1.0) : 1.0));
+    const chapterMaxTokens = Math.round(chapterWordBudget * (ch.positioning ? (TOKEN_MULT[ch.positioning] ?? 1.0) : 1.0));
     // 章节字数预算（用于质量门判定）
     const wordBudget = chapterMaxTokens;  // token 与字数近似 1:1（中文）
 
@@ -502,7 +506,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     let refined = '';
     // 精修 maxTokens 按原文字数动态调整：精修"只改表达不增删情节"，token 空间贴近原文字数 + 10% 余量
     // 原 maxTokens 4096 ≈ 5500 汉字，给 2000-3000 字原文 5500 字空间 → LLM 注水扩写
-    const refineMaxTokens = Math.max(2000, Math.round((ch.wordCount || 2500) * 1.1));
+    const refineMaxTokens = Math.max(2000, Math.round((ch.wordCount || chapterWordBudget) * 1.1));
     // D3 修复：包 withHeartbeat 防 claimNext 误回收；webSearch:false 显式关闭联网
     for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
       refined += chunk;
@@ -517,9 +521,12 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 async function runShortPipeline(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
   const cfg = task.config as {
     projectId: string; targetWords: number; config: any; idea: string;
+    chapterWordBudget?: number;
   };
   const { projectId, targetWords } = cfg;
-  const segmentCount = Math.max(1, Math.ceil(targetWords / 5000));
+  // 每章字数预算：短篇默认 5000
+  const chapterWordBudget = cfg.chapterWordBudget ?? 5000;
+  const segmentCount = Math.max(1, Math.ceil(targetWords / chapterWordBudget));
   const checkpoint = task.checkpoint as { segmentIdx?: number; outlineJson?: string; setupDone?: boolean };
 
   // setup 阶段：生成世界观 + 角色档案（短篇同样需要，让正文人设有据可循）
@@ -540,7 +547,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   let outlineJson = checkpoint.outlineJson;
   if (!outlineJson) {
     progress(task.id, 0.1, webSearch ? '短篇结构 + 联网取材中…' : '生成短篇结构…');
-    const prompt = `为短篇生成 ${segmentCount} 段结构。每段约 5000 字。
+    const prompt = `为短篇生成 ${segmentCount} 段结构。每段约 ${chapterWordBudget} 字。
 题材：${cfg.config.genre} | 创意：${cfg.idea} | 钩子风格：${cfg.config.hookStyle} | 结局：${cfg.config.ending}
 输出 JSON 数组：[{"title":"段落标题","outline":"段落大纲"}]，只输出 JSON。`;
 
@@ -605,7 +612,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 5000 字（4500-5500 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: 5000, webSearch }))) {
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${Math.round(chapterWordBudget * 0.9)}-${Math.round(chapterWordBudget * 1.1)} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: chapterWordBudget, webSearch }))) {
           content += chunk;
         }
         // 质量门检测（字数门 + 跑题门）
@@ -614,7 +621,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
             projectId, model, providerId,
             chapterIdx: i, chapterTitle: seg.title, outline: seg.outline,
             positioning: seg.positioning, coreEmotion: seg.coreEmotion,
-            content, wordBudget: 5000,
+            content, wordBudget: chapterWordBudget,
           });
           if (quality.ok) {
             if (quality.issues.length > 0) {
@@ -662,8 +669,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   for (const ch of toRefineShort) {
     if (!ch.content) continue;
     let refined = '';
-    // 短篇段约 5000 字，精修 maxTokens 按原文字数 + 10% 余量（防注水扩写）
-    const refineMaxTokens = Math.max(3000, Math.round((ch.wordCount || 5000) * 1.1));
+    // 短篇段约 chapterWordBudget 字，精修 maxTokens 按原文字数 + 10% 余量（防注水扩写）
+    const refineMaxTokens = Math.max(3000, Math.round((ch.wordCount || chapterWordBudget) * 1.1));
     // D3 修复：包 withHeartbeat 防 claimNext 误回收；webSearch:false 显式关闭联网
     for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
       refined += chunk;
@@ -675,7 +682,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
 
 // ============ 单章生成 ============
 async function runChapterGeneration(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
-  const cfg = task.config as { projectId: string; chapterId: string; prompt: string };
+  const cfg = task.config as { projectId: string; chapterId: string; prompt: string; chapterWordBudget?: number };
+  // 单章字数预算：默认 2500（用户可在派发单章生成时指定）
+  const chapterWordBudget = cfg.chapterWordBudget ?? 2500;
   const chapter = chapterRepo.get(cfg.chapterId);
   if (!chapter) throw new Error('章节不存在');
   chapterRepo.update(chapter.id, { status: 'generating' });
@@ -683,18 +692,18 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   let content = '';
   // D1 修复：流失败时回滚 status='failed'，避免 chapter 永远卡 'generating' 显示「生成中」
   // 与 runBookPipeline / runShortPipeline 行为一致
-  // 单章质量门：与流水线一致，不达标重写一次（wordBudget=2500）
+  // 单章质量门：与流水线一致，不达标重写一次（wordBudget=chapterWordBudget）
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       content = '';
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 2000-3000 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: 2500, webSearch }))) {
+      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: chapterWordBudget, webSearch }))) {
         content += chunk;
       }
       try {
         const quality = await checkChapterQuality({
           projectId: chapter.projectId, model, providerId,
           chapterIdx: chapter.orderIdx, chapterTitle: chapter.title, outline: chapter.outline,
-          content, wordBudget: 2500,
+          content, wordBudget: chapterWordBudget,
         });
         if (quality.ok) {
           if (quality.issues.length > 0) {
