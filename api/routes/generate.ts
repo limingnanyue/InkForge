@@ -129,6 +129,18 @@ router.post('/', (req: Request, res: Response) => {
 router.post('/continue', (req: Request, res: Response) => {
   const { projectId, webSearch, model, providerId, chapterWordBudget } = req.body || {};
   if (!projectId) return fail(res, 'INVALID', '项目 ID 必填');
+  // M4 修复：/continue 路由也校验 chapterWordBudget 范围（与 POST / 一致）
+  // 项目 type=short → 范围 2000-10000；其余（long/script）→ 1500-8000（book）
+  if (chapterWordBudget != null) {
+    const project = projectRepo.get(projectId);
+    if (!project) return fail(res, 'NOT_FOUND', '项目不存在', 404);
+    const isShort = project.type === 'short';
+    const budgetMin = isShort ? 2000 : 1500;
+    const budgetMax = isShort ? 10000 : 8000;
+    if (typeof chapterWordBudget !== 'number' || chapterWordBudget < budgetMin || chapterWordBudget > budgetMax) {
+      return fail(res, 'INVALID', `每章字数预算须在 ${budgetMin}-${budgetMax} 之间`);
+    }
+  }
   const result = createContinueTask(projectId, webSearch, model, providerId, chapterWordBudget);
   if (!result) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   ok(res, result);

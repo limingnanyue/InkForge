@@ -69,7 +69,20 @@ router.get('/:id/state', (req: Request, res: Response) => {
 });
 
 router.patch('/:id/state', (req: Request, res: Response) => {
-  const state = stateRepo.update(req.params.id, req.body || {});
+  // R2 修复：白名单 + 类型校验，防篡改 projectId/updatedAt 等字段
+  // projectId 由 path 参数决定，updatedAt 由 repo 自动管理
+  const body = req.body || {};
+  const patch: Record<string, unknown> = {};
+  // 字符串字段（智能体状态七件套：创意/设定/角色/记忆/审稿/修订/封面）
+  for (const k of ['idea', 'setting', 'characters', 'memory', 'review', 'revision', 'cover'] as const) {
+    if (typeof body[k] === 'string') patch[k] = body[k];
+  }
+  // 数组字段（结构化状态机：伏笔/角色实时状态/三层摘要归档/卷纲）
+  if (Array.isArray(body.foreshadowing)) patch.foreshadowing = body.foreshadowing;
+  if (Array.isArray(body.characterState)) patch.characterState = body.characterState;
+  if (Array.isArray(body.chapterSummaries)) patch.chapterSummaries = body.chapterSummaries;
+  if (Array.isArray(body.volumeOutlines)) patch.volumeOutlines = body.volumeOutlines;
+  const state = stateRepo.update(req.params.id, patch);
   ok(res, state);
 });
 

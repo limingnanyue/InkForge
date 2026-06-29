@@ -69,18 +69,20 @@ export default function Market() {
     }
   };
 
-  // 点击历史记录 → 加载该条扫榜结果
+  // 点击历史记录 → 调详情接口拿完整 content（H2 修复：列表 SQL 不含 content，直接用 scan.content 是空串）
   const viewScan = async (scan: MarketScan) => {
     setBusy(true);
     try {
-      // 已在列表里有 content，直接用
-      setResult(scan.content);
-      setGenre(scan.genre);
-      setGenreId(scan.genreId || '');
-      setPeriod(scan.period);
-      setWebSearch(scan.webSearch);
-      setActiveScanId(scan.id);
-      toast(`已加载 ${scan.genre} 的历史扫榜`);
+      const full = await api.analyze.marketScanGet(scan.id);
+      setResult(full.content);
+      setGenre(full.genre);
+      setGenreId(full.genreId || '');
+      setPeriod(full.period);
+      setWebSearch(full.webSearch);
+      setActiveScanId(full.id);
+      toast(`已加载 ${full.genre} 的历史扫榜`);
+    } catch (e) {
+      toast((e as Error).message, 'err');
     } finally { setBusy(false); }
   };
 

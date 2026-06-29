@@ -29,7 +29,23 @@ router.post('/providers', (req: Request, res: Response) => {
 });
 
 router.patch('/providers/:id', (req: Request, res: Response) => {
-  const provider = providerRepo.update(req.params.id, req.body || {});
+  // R2 修复：白名单 + 类型校验，防篡改 id/createdAt/isDefault 等字段
+  // isDefault 应通过 POST /providers/:id/default 显式切换，不接受 PATCH 覆盖
+  const body = req.body || {};
+  const patch: Record<string, unknown> = {};
+  if (typeof body.name === 'string') patch.name = body.name;
+  if (typeof body.kind === 'string') {
+    if (!VALID_KINDS.includes(body.kind as ProviderKind)) return fail(res, 'INVALID', '类型不合法');
+    patch.kind = body.kind as ProviderKind;
+  }
+  if (typeof body.baseUrl === 'string') patch.baseUrl = body.baseUrl;
+  if (typeof body.apiKey === 'string') patch.apiKey = body.apiKey;
+  if (Array.isArray(body.models)) {
+    // 过滤掉非字符串元素，防 models 字段被注入非法值
+    patch.models = body.models.filter((m: unknown) => typeof m === 'string');
+  }
+  if (body.webSearch && typeof body.webSearch === 'object') patch.webSearch = body.webSearch;
+  const provider = providerRepo.update(req.params.id, patch);
   if (!provider) return fail(res, 'NOT_FOUND', '提供商不存在', 404);
   ok(res, provider);
 });

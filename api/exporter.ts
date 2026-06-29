@@ -37,16 +37,34 @@ export function exportProject(req: { projectId: string; format: ExportFormat; ch
 }
 
 function filterChapters(chapters: any[], range: string): any[] {
+  const total = chapters.length;
+  // M8 修复：严格校验 range 格式，防 NaN/负数/反转导致 slice 越界返回空数组或越界文件
+  // 支持三种格式（1-based）："1-5"（区间）、"1,3,5"（枚举）、"3"（单值）
   if (range.includes('-')) {
-    const [s, e] = range.split('-').map(n => parseInt(n.trim(), 10));
-    return chapters.slice(Math.max(0, s - 1), e);
+    const parts = range.split('-');
+    if (parts.length !== 2) throw new Error(`章节范围格式错误：${range}（应为 起-终，如 1-5）`);
+    const s = parseInt(parts[0].trim(), 10);
+    const e = parseInt(parts[1].trim(), 10);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || s < 1 || e < 1) {
+      throw new Error(`章节范围格式错误：${range}（起/终须为正整数）`);
+    }
+    if (s > e) throw new Error(`章节范围格式错误：${range}（起始章 ${s} 大于终止章 ${e}）`);
+    if (s > total) throw new Error(`起始章 ${s} 超出总章数 ${total}`);
+    return chapters.slice(s - 1, Math.min(e, total));
   }
   if (range.includes(',')) {
-    const idx = range.split(',').map(n => parseInt(n.trim(), 10) - 1);
-    return chapters.filter((_, i) => idx.includes(i));
+    const idx = range.split(',').map(n => parseInt(n.trim(), 10));
+    if (idx.some(n => !Number.isFinite(n) || n < 1)) {
+      throw new Error(`章节范围格式错误：${range}（每项须为正整数）`);
+    }
+    const maxIdx = Math.max(...idx);
+    if (maxIdx > total) throw new Error(`章节 ${maxIdx} 超出总章数 ${total}`);
+    return chapters.filter((_, i) => idx.includes(i + 1));
   }
-  const i = parseInt(range, 10) - 1;
-  return chapters.slice(i, i + 1);
+  const i = parseInt(range, 10);
+  if (!Number.isFinite(i) || i < 1) throw new Error(`章节范围格式错误：${range}（须为正整数）`);
+  if (i > total) throw new Error(`章节 ${i} 超出总章数 ${total}`);
+  return chapters.slice(i - 1, i);
 }
 
 function toTxt(project: any, chapters: any[]): string {

@@ -8,7 +8,7 @@ import { EventEmitter } from 'events';
 import { taskRepo, taskLogRepo, chapterRepo, projectRepo, stateRepo, providerRepo } from './repos.js';
 import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality } from './engine.js';
 import { complete } from './llm.js';
-import type { Task, StreamEvent } from '@shared/types';
+import type { Task, StreamEvent, ProviderKind } from '@shared/types';
 
 // ============ Cancel Token（worker 主动停止信号）============
 // 任务开始时 registerToken，cancel/pause 端点调 cancelToken 把 cancelled=true
@@ -254,6 +254,36 @@ async function runTask(task: Task): Promise<void> {
   }
 }
 
+// H1 修复：从项目已完成章节平均字数推断每章字数预算
+// 用途：续写任务、单章生成任务未显式传 chapterWordBudget 时，从历史章节推断
+//      避免新生成章节字数与原章节不一致（原项目用 3500 生成，续写回落 2500 导致割裂）
+function inferChapterWordBudget(projectId: string): number {
+  const chapters = chapterRepo.listByProject(projectId);
+  const doneChapters = chapters.filter(c => c.content && c.wordCount > 100);
+  if (doneChapters.length === 0) return 2500;
+  const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
+  // 去极端值（删除/重写异常章）：clamp 到 1500-8000
+  return Math.max(1500, Math.min(8000, Math.round(avg)));
+}
+
+// H4 修复：maxTokens 按 provider kind 放大 token/字 系数
+// 国产模型 1 字 ≈ 1.5-2 token，若 maxTokens 直接等于 chapterWordBudget（字数），
+// 实际可输出字数 ≈ maxTokens / 1.5，章节会被截断（典型表现：结尾不完整/突兀截断）
+// wordBudget（质量门用）保持字数语义不变，只放大 maxTokens 给模型留 token 空间
+// 国产（deepseek/qwen/glm/doubao/kimi/hunyuan/ernie）：1.5×
+// OpenAI 系（openai/anthropic/gemini/kilo）：1.2×
+// ollama/custom/未知：1.5×（保守放大，宁多勿少）
+function tokenCharRatio(providerId?: string): number {
+  if (!providerId) return 1.5;
+  const provider = providerRepo.get(providerId);
+  if (!provider) return 1.5;
+  const CN_KINDS: ProviderKind[] = ['deepseek', 'qwen', 'glm', 'doubao', 'kimi', 'hunyuan', 'ernie'];
+  const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo'];
+  if (CN_KINDS.includes(provider.kind)) return 1.5;
+  if (LIGHT_KINDS.includes(provider.kind)) return 1.2;
+  return 1.5;  // ollama/custom
+}
+
 // ============ 一键成书流水线（最高 500 万字）============
 async function runBookPipeline(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
   const cfg = task.config as {
@@ -262,7 +292,8 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   };
   const { projectId, targetWords } = cfg;
   // 每章字数预算：用户可配置，默认 2500（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
-  const chapterWordBudget = cfg.chapterWordBudget ?? 2500;
+  // H1 修复：续写任务未显式传时，从历史章节平均字数推断（防字数不一致）
+  const chapterWordBudget = cfg.chapterWordBudget ?? inferChapterWordBudget(projectId);
 
   // 断点续传：从 checkpoint 读取进度
   const checkpoint = task.checkpoint as { phase?: string; chapterIdx?: number; outlineJson?: string; scanInsight?: string };
@@ -325,21 +356,31 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     if (prevVolumes && prevVolumes.length > 0) {
       logTask(task.id, 'info', `大纲断点续传：已生成 ${prevVolumes.length} 章（约 ${Math.floor(prevVolumes.length / 20)} 卷），从下一卷继续`);
     }
-    outline = await generateOutline({
-      projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch,
-      chapterWordBudget,
-      prevVolumes,
-      onVolumeProgress: (done, total) => {
-        logTask(task.id, 'info', `大纲分卷生成 ${done}/${total} 卷完成`);
-        progress(task.id, 0.1 + 0.05 * (done / total), `大纲分卷 ${done}/${total}…`);
-      },
-      onVolumeCheckpoint: (accumulated, doneVolumes, totalVolumes) => {
-        // 每完成一卷立即回写 checkpoint：失败/重试时从该卷后继续
-        // 注意：checkpoint 用浅合并，phase 保持 outline 不变（直到全部完成才转 chapter）
-        taskRepo.update(task.id, { checkpoint: { phase: 'outline', prevVolumesJson: JSON.stringify(accumulated) } });
-        logTask(task.id, 'info', `大纲 checkpoint 已保存：${doneVolumes}/${totalVolumes} 卷（${accumulated.length} 章）`);
-      },
-    });
+    // H3 修复：generateOutline 是单次 await，200 章大纲 ~30000 tokens，国产慢模型 8-10min
+    // 期间 task.updated_at 停滞 → claimNext 5min STALE_MS 阈值误回收 → 多 worker 部署重复生成
+    // 用 setInterval 周期发心跳，generateOutline 返回后 clearInterval
+    const outlineBeat = setInterval(() => {
+      try { taskRepo.heartbeat(task.id); } catch (e) { console.warn('[outline-heartbeat] 失败', (e as Error).message); }
+    }, 30_000);
+    try {
+      outline = await generateOutline({
+        projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch,
+        chapterWordBudget,
+        prevVolumes,
+        onVolumeProgress: (done, total) => {
+          logTask(task.id, 'info', `大纲分卷生成 ${done}/${total} 卷完成`);
+          progress(task.id, 0.1 + 0.05 * (done / total), `大纲分卷 ${done}/${total}…`);
+        },
+        onVolumeCheckpoint: (accumulated, doneVolumes, totalVolumes) => {
+          // 每完成一卷立即回写 checkpoint：失败/重试时从该卷后继续
+          // 注意：checkpoint 用浅合并，phase 保持 outline 不变（直到全部完成才转 chapter）
+          taskRepo.update(task.id, { checkpoint: { phase: 'outline', prevVolumesJson: JSON.stringify(accumulated) } });
+          logTask(task.id, 'info', `大纲 checkpoint 已保存：${doneVolumes}/${totalVolumes} 卷（${accumulated.length} 章）`);
+        },
+      });
+    } finally {
+      clearInterval(outlineBeat);
+    }
     taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline } });
     logTask(task.id, 'info', '大纲生成完成');
   }
@@ -430,9 +471,12 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       : [];
     // maxTokens 按定位系数微调：高压章 1.1×，信息/低压章 0.8-0.85×（贴合字数预算Σ契约）
     const TOKEN_MULT: Record<string, number> = { 'high-pressure': 1.1, 'normal-progress': 1.0, 'trial-error': 0.9, 'relationship': 1.0, 'low-pressure': 0.85, 'info-organize': 0.8 };
-    const chapterMaxTokens = Math.round(chapterWordBudget * (ch.positioning ? (TOKEN_MULT[ch.positioning] ?? 1.0) : 1.0));
-    // 章节字数预算（用于质量门判定）
-    const wordBudget = chapterMaxTokens;  // token 与字数近似 1:1（中文）
+    const positioningMult = ch.positioning ? (TOKEN_MULT[ch.positioning] ?? 1.0) : 1.0;
+    // wordBudget 保持字数语义（质量门按字数判定，不放大）
+    const wordBudget = Math.round(chapterWordBudget * positioningMult);
+    // H4 修复：maxTokens 按国产模型 token/字 系数放大（1 字 ≈ 1.5-2 token），
+    // 否则国产模型实际可输出字数 ≈ maxTokens / 1.5，章节被截断
+    const chapterMaxTokens = Math.round(wordBudget * tokenCharRatio(providerId));
 
     // 章节质量门：生成 → 质检 → 不达标重写一次（避免死循环 + 浪费 token，最多 1 次重写）
     try {
@@ -506,7 +550,8 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     let refined = '';
     // 精修 maxTokens 按原文字数动态调整：精修"只改表达不增删情节"，token 空间贴近原文字数 + 10% 余量
     // 原 maxTokens 4096 ≈ 5500 汉字，给 2000-3000 字原文 5500 字空间 → LLM 注水扩写
-    const refineMaxTokens = Math.max(2000, Math.round((ch.wordCount || chapterWordBudget) * 1.1));
+    // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断（国产 1 字≈1.5-2 token）
+    const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
     // D3 修复：包 withHeartbeat 防 claimNext 误回收；webSearch:false 显式关闭联网
     for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
       refined += chunk;
@@ -524,8 +569,14 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     chapterWordBudget?: number;
   };
   const { projectId, targetWords } = cfg;
-  // 每章字数预算：短篇默认 5000
-  const chapterWordBudget = cfg.chapterWordBudget ?? 5000;
+  // 短篇默认 5000 字/段；若项目已有段落则从平均字数推断（H1：防字数不一致）
+  // inferChapterWordBudget 无历史时回落 2500，对短篇偏小，所以显式给 5000 兜底
+  const chapters = chapterRepo.listByProject(projectId);
+  const doneSegs = chapters.filter(c => c.content && c.wordCount > 100);
+  const inferred = doneSegs.length > 0
+    ? Math.max(2000, Math.min(10000, Math.round(doneSegs.reduce((s, c) => s + (c.wordCount || 0), 0) / doneSegs.length)))
+    : 5000;
+  const chapterWordBudget = cfg.chapterWordBudget ?? inferred;
   const segmentCount = Math.max(1, Math.ceil(targetWords / chapterWordBudget));
   const checkpoint = task.checkpoint as { segmentIdx?: number; outlineJson?: string; setupDone?: boolean };
 
@@ -612,7 +663,10 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${Math.round(chapterWordBudget * 0.9)}-${Math.round(chapterWordBudget * 1.1)} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: chapterWordBudget, webSearch }))) {
+        // 短篇段约 chapterWordBudget 字，maxTokens 按国产模型 token/字 系数放大（H4 防截断）
+        // wordBudget 保持字数语义不变，用于质量门判定
+        const segMaxTokens = Math.round(chapterWordBudget * tokenCharRatio(providerId));
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${Math.round(chapterWordBudget * 0.9)}-${Math.round(chapterWordBudget * 1.1)} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
           content += chunk;
         }
         // 质量门检测（字数门 + 跑题门）
@@ -670,7 +724,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     if (!ch.content) continue;
     let refined = '';
     // 短篇段约 chapterWordBudget 字，精修 maxTokens 按原文字数 + 10% 余量（防注水扩写）
-    const refineMaxTokens = Math.max(3000, Math.round((ch.wordCount || chapterWordBudget) * 1.1));
+    // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断
+    const refineMaxTokens = Math.round(Math.max(3000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
     // D3 修复：包 withHeartbeat 防 claimNext 误回收；webSearch:false 显式关闭联网
     for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
       refined += chunk;
@@ -683,8 +738,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
 // ============ 单章生成 ============
 async function runChapterGeneration(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
   const cfg = task.config as { projectId: string; chapterId: string; prompt: string; chapterWordBudget?: number };
-  // 单章字数预算：默认 2500（用户可在派发单章生成时指定）
-  const chapterWordBudget = cfg.chapterWordBudget ?? 2500;
+  // 单章字数预算：用户可指定，否则从项目历史章节平均字数推断（H1：防字数不一致）
+  const chapterWordBudget = cfg.chapterWordBudget ?? inferChapterWordBudget(cfg.projectId);
   const chapter = chapterRepo.get(cfg.chapterId);
   if (!chapter) throw new Error('章节不存在');
   chapterRepo.update(chapter.id, { status: 'generating' });
@@ -696,7 +751,10 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       content = '';
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: chapterWordBudget, webSearch }))) {
+      // H4 修复：maxTokens 按国产模型 token/字 系数放大，否则章节被截断
+      // wordBudget 保持字数语义不变，用于质量门判定
+      const chMaxTokens = Math.round(chapterWordBudget * tokenCharRatio(providerId));
+      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch }))) {
         content += chunk;
       }
       try {
@@ -747,7 +805,8 @@ async function runRefine(task: Task, model: string, providerId?: string): Promis
   // D3 修复：(1) 包 withHeartbeat 防 claimNext 5min 超时误回收
   // (2) webSearch:false 显式关闭联网（精修不应触发抓取）
   // (3) maxTokens 按原文字数动态计算（与 runBookPipeline/runShortPipeline 一致，防 4096 注水扩写）
-  const refineMaxTokens = Math.max(2000, Math.round((chapter.wordCount || 2500) * 1.1));
+  // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断
+  const refineMaxTokens = Math.round(Math.max(2000, (chapter.wordCount || 2500) * 1.1) * tokenCharRatio(providerId));
   for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${chapter.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
     refined += chunk;
   }
@@ -808,7 +867,8 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
 
     let refined = '';
     // 精修 maxTokens 按原文字数 × 1.1（与 runRefine 一致，防注水扩写）
-    const refineMaxTokens = Math.max(2000, Math.round((ch.wordCount || ch.content.length) * 1.1));
+    // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断
+    const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || ch.content.length) * 1.1) * tokenCharRatio(providerId));
     try {
       for await (const chunk of withHeartbeat(task.id, runSkill({
         projectId, skill: 'refine', model, providerId,

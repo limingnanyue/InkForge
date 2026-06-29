@@ -22,7 +22,11 @@ router.post('/', (req: Request, res: Response) => {
     const result = exportProject({ projectId, format: format as ExportFormat, chapterRange });
     ok(res, result);
   } catch (e) {
-    fail(res, 'EXPORT_FAILED', (e as Error).message, 500);
+    // M8 修复：filterChapters 抛出的"格式错误/超出"类校验异常应返回 400（客户端错误）
+    // 而非统一 500（让用户以为是服务端 bug）
+    const msg = (e as Error).message || '';
+    const isValidationError = msg.includes('格式错误') || msg.includes('超出总章数') || msg.includes('项目不存在');
+    fail(res, isValidationError ? 'INVALID' : 'EXPORT_FAILED', msg || '导出失败', isValidationError ? 400 : 500);
   }
 });
 
