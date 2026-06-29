@@ -238,6 +238,77 @@ Prompt: ...
   }
 });
 
+// POST /:id/cover-preview
+// H2+H3 修复(第十一轮): 封面预览图后端代理
+// 原方案前端直连第三方 provider 的 /images/generations 有两个问题:
+//   1) CORS 阻断: OpenAI/KKAPI 等不返回 Access-Control-Allow-Origin, 浏览器预检直接拒绝
+//   2) apiKey 暴露: Authorization Bearer 从浏览器明文发往第三方域名, DevTools/扩展/MITM 可抓
+// 现方案: 前端只调自己的 /api/v1/projects/:id/cover-preview, 后端拿 apiKey 调第三方,
+//        返回 base64 图片数据, apiKey 永不离开服务端
+// 入参: { prompt: string, providerId: string, model: string }
+//   - providerId/model 必填(指定用哪个 provider 的哪个图像模型)
+//   - prompt 是英文 Prompt(从 coverDraft 提取)
+// 出参: { image: string }  // data URL 形式: "data:image/png;base64,xxxx"
+router.post('/:id/cover-preview', async (req: Request, res: Response) => {
+  try {
+    const project = projectRepo.get(req.params.id);
+    if (!project) return fail(res, 'NOT_FOUND', '项目不存在', 404);
+    const { prompt, providerId, model } = req.body || {};
+    if (typeof prompt !== 'string' || !prompt.trim()) return fail(res, 'INVALID', 'prompt 必填');
+    if (typeof providerId !== 'string' || !providerId) return fail(res, 'INVALID', 'providerId 必填');
+    if (typeof model !== 'string' || !model) return fail(res, 'INVALID', 'model 必填');
+    const provider = providerRepo.get(providerId);
+    if (!provider) return fail(res, 'NOT_FOUND', 'provider 不存在', 404);
+    if (!provider.models.includes(model)) return fail(res, 'INVALID', `模型 ${model} 不在该 provider 列表中`);
+    if (!provider.apiKey && provider.kind !== 'ollama' && provider.kind !== 'kilo') {
+      return fail(res, 'INVALID', `provider ${provider.name} 未配置 API Key`);
+    }
+
+    // 调 OpenAI 兼容 /images/generations
+    const ep = provider.baseUrl.replace(/\/+$/, '') + '/images/generations';
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (provider.kind !== 'ollama' && provider.kind !== 'kilo') {
+      headers['Authorization'] = `Bearer ${provider.apiKey}`;
+    }
+    const upstream = await fetch(ep, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model,
+        prompt: prompt.trim(),
+        n: 1,
+        size: '1024x1024',
+        response_format: 'b64_json',
+      }),
+    });
+    if (!upstream.ok) {
+      const errText = await upstream.text().catch(() => '');
+      return fail(res, 'UPSTREAM_ERROR',
+        `${provider.name} · ${model} 图片生成失败（${upstream.status}）${errText ? ': ' + errText.slice(0, 300) : ''}`,
+        502);
+    }
+    const json = await upstream.json() as { data?: Array<{ b64_json?: string; url?: string }> };
+    const item = json.data?.[0];
+    if (!item) return fail(res, 'UPSTREAM_ERROR', '图像供应商未返回 data 字段', 502);
+
+    let dataUrl: string;
+    if (item.b64_json) {
+      dataUrl = `data:image/png;base64,${item.b64_json}`;
+    } else if (item.url) {
+      // 部分 provider 返回 url, 后端再下载转 base64
+      const imgResp = await fetch(item.url);
+      if (!imgResp.ok) return fail(res, 'UPSTREAM_ERROR', `下载图像失败（${imgResp.status}）`, 502);
+      const buf = Buffer.from(await imgResp.arrayBuffer());
+      dataUrl = `data:image/png;base64,${buf.toString('base64')}`;
+    } else {
+      return fail(res, 'UPSTREAM_ERROR', '图像供应商返回 data 字段不含 b64_json 或 url', 502);
+    }
+    ok(res, { image: dataUrl });
+  } catch (e) {
+    fail(res, 'COVER_PREVIEW_FAILED', (e as Error).message || '封面预览生成失败', 500);
+  }
+});
+
 // POST /:id/refine-book
 // 整书精修：批量精修项目所有已生成章节，入队守护进程任务
 // 透传 model/providerId（不传则后端回落到 default 旗舰），断点续传由 daemon 处理

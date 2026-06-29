@@ -262,8 +262,8 @@ function inferChapterWordBudget(projectId: string): number {
   const doneChapters = chapters.filter(c => c.content && c.wordCount > 100);
   if (doneChapters.length === 0) return 2500;
   const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
-  // 去极端值（删除/重写异常章）：clamp 到 1500-8000
-  return Math.max(1500, Math.min(8000, Math.round(avg)));
+  // M3 修复(第十一轮): clamp 边界同步扩展, book 1500-10000(原 8000), short 由调用方处理
+  return Math.max(1500, Math.min(10000, Math.round(avg)));
 }
 
 // H4 修复：maxTokens 按 provider kind 放大 token/字 系数
@@ -284,11 +284,10 @@ function tokenCharRatio(providerId?: string): number {
   let ratio = 1.5;
   if (provider) {
     const CN_KINDS: ProviderKind[] = ['deepseek', 'qwen', 'glm', 'doubao', 'kimi', 'hunyuan', 'ernie'];
-    // KKAPI 走 OpenAI 兼容网关，按 OpenAI 标准计费 → 1.2×（与 kilo 一致）
-    const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo', 'kkai'];
+    const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo'];
     if (CN_KINDS.includes(provider.kind)) ratio = 1.5;
     else if (LIGHT_KINDS.includes(provider.kind)) ratio = 1.2;
-    else ratio = 1.5;  // ollama/custom
+    else ratio = 1.5;  // ollama/custom/kkai: 网关聚合按保守 1.5×(可能中转国产模型,宁多勿少)
   }
   _tokenRatioCache.set(providerId, ratio);
   return ratio;
@@ -590,8 +589,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   // inferChapterWordBudget 无历史时回落 2500，对短篇偏小，所以显式给 5000 兜底
   const chapters = chapterRepo.listByProject(projectId);
   const doneSegs = chapters.filter(c => c.content && c.wordCount > 100);
+  // M4 修复(第十一轮): short clamp 边界 10000→12000,与 Generate 页 + POST /generate 同步
   const inferred = doneSegs.length > 0
-    ? Math.max(2000, Math.min(10000, Math.round(doneSegs.reduce((s, c) => s + (c.wordCount || 0), 0) / doneSegs.length)))
+    ? Math.max(2000, Math.min(12000, Math.round(doneSegs.reduce((s, c) => s + (c.wordCount || 0), 0) / doneSegs.length)))
     : 5000;
   const chapterWordBudget = cfg.chapterWordBudget ?? inferred;
   // BUG1 辅助：把实际生效的 chapterWordBudget 打到 task log

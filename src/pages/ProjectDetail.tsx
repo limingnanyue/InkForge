@@ -75,9 +75,9 @@ export default function ProjectDetail() {
       return;
     }
     const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
-    // clamp 范围与 Generate 页一致: book 1500-8000, short 2000-10000
+    // M5 修复(第十一轮): clamp 范围与 Generate 页 + 续写 Modal slider 一致: book 1500-10000, short 2000-12000
     const min = isShort ? 2000 : 1500;
-    const max = isShort ? 10000 : 8000;
+    const max = isShort ? 12000 : 10000;
     setContinueBudget(Math.max(min, Math.min(max, Math.round(avg))));
   }, [project, tree]);
 
@@ -441,9 +441,9 @@ export default function ProjectDetail() {
       if (!enPrompt) { toast('无法从提示词中提取英文 Prompt', 'err'); return; }
 
       // BUG3 修复: 支持选择图像供应商。两条路径:
-      //   A. coverImageProvider 选了 provider::model → 直连该 provider 的 /images/generations(OpenAI 兼容)
-      //   B. coverImageProvider 空 → 兜底走 TRAE 系统 text_to_image 端点
-      // 选 provider 路径: 前端直连(baseUrl + apiKey 在 store 已暴露),响应取 data[0].b64_json 转 dataURL
+      //   A. coverImageProvider 选了 provider::model → 走后端代理 /api/v1/projects/:id/cover-preview
+      //      (H2+H3 修复: 不再前端直连,避免 CORS 阻断 + apiKey 暴露)
+      //   B. coverImageProvider 空 → 兜底走 TRAE 系统 text_to_image 端点(浏览器内置,无 apiKey)
       let objectUrl: string | null = null;
       let imageDataUrl: string | null = null;
       const sel = coverImageProvider;
@@ -451,44 +451,16 @@ export default function ProjectDetail() {
       const selProvider = sepIdx > 0 ? providers.find(p => p.id === sel.slice(0, sepIdx)) : undefined;
       const selModel = sepIdx > 0 ? sel.slice(sepIdx + 2) : '';
       if (selProvider && selModel) {
-        // 路径 A: OpenAI 兼容 images/generations
-        const ep = selProvider.baseUrl.replace(/\/+$/, '') + '/images/generations';
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (selProvider.kind !== 'ollama' && selProvider.kind !== 'kilo') {
-          headers['Authorization'] = `Bearer ${selProvider.apiKey}`;
-        }
-        // OpenAI 标准请求体: model / prompt / n / size / response_format
-        // dall-e-3 强制要求 size∈{1024x1024,1792x1024,1024x1792}; gpt-image-2 / SD / FLUX 走 1024x1024
-        const resp = await fetch(ep, {
-          method: 'POST',
-          headers,
-          signal: ac.signal,
-          body: JSON.stringify({
-            model: selModel,
-            prompt: enPrompt,
-            n: 1,
-            size: '1024x1024',
-            response_format: 'b64_json',
-          }),
+        // 路径 A: 后端代理调 OpenAI 兼容 /images/generations
+        // H2+H3 修复: 前端只调自己的 /api/v1/projects/:id/cover-preview,
+        //           后端拿 apiKey 调第三方, apiKey 永不离开服务端, 也不受 CORS 约束
+        const data = await api.projects.coverPreview(project.id, {
+          prompt: enPrompt,
+          providerId: selProvider.id,
+          model: selModel,
         });
-        if (!resp.ok) {
-          const errText = await resp.text().catch(() => '');
-          throw new Error(`${selProvider.name} · ${selModel} 图片生成失败（${resp.status}）${errText ? '：' + errText.slice(0, 200) : ''}`);
-        }
-        const json = await resp.json() as { data?: Array<{ b64_json?: string; url?: string }> };
-        const item = json.data?.[0];
-        if (!item) throw new Error('图像供应商未返回 data 字段');
-        if (item.b64_json) {
-          imageDataUrl = `data:image/png;base64,${item.b64_json}`;
-        } else if (item.url) {
-          // 部分 provider 返回 url,前端再下载
-          const imgResp = await fetch(item.url, { signal: ac.signal });
-          if (!imgResp.ok) throw new Error(`下载图像失败（${imgResp.status}）`);
-          const blob = await imgResp.blob();
-          objectUrl = URL.createObjectURL(blob);
-        } else {
-          throw new Error('图像供应商返回 data 字段不含 b64_json 或 url');
-        }
+        // data.image 已是 data URL 形式
+        imageDataUrl = data.image;
       } else {
         // 路径 B: TRAE 系统默认端点（兜底）
         const url = `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=${encodeURIComponent(enPrompt)}&image_size=portrait_4_3`;
@@ -506,6 +478,10 @@ export default function ProjectDetail() {
         const src = imageDataUrl || objectUrl;
         if (!src) throw new Error('未拿到图片数据');
         const dataUrl = await overlayTextOnImage(src, titledBook, titledAuthor);
+        // M1 修复(第十一轮): overlayTextOnImage 内的 Image() 不受 ac.signal 控制,
+        // 快速连点时旧请求的 Image 可能晚于新请求完成并覆盖 setCoverPreviewUrl
+        // 守卫: 仅当 ref 仍指向当前请求时才 setCoverPreviewUrl,否则丢弃(已被新请求取代)
+        if (coverPreviewAbortRef.current !== ac) return;
         setCoverPreviewUrl(dataUrl);
         toast(selProvider ? `已通过 ${selProvider.name} · ${selModel} 生成预览图` : '封面预览图已生成');
       } finally {
