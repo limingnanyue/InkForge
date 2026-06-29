@@ -3,7 +3,7 @@
  */
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play, Sliders, Image as ImageIcon, Download } from 'lucide-react';
+import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play, Sliders, Image as ImageIcon, Download, RotateCw } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
 import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch, Field, SegmentedControl, Slider } from '@/components/ui';
@@ -684,9 +684,16 @@ export default function ProjectDetail() {
                 </button>
                 <button className="btn-ghost py-1.5 text-xs" onClick={() => gen('refine')} disabled={busy}><Wand2 size={13} /> 精修</button>
                 <button className="btn-ghost py-1.5 text-xs" onClick={snapshot}><Camera size={13} /> 快照</button>
-                <button className="btn-primary py-1.5 text-xs" onClick={() => gen('generate')} disabled={busy}>
-                  {busy ? <Spinner className="h-3.5 w-3.5" /> : <Sparkles size={13} />} AI 生成
-                </button>
+                {/* H3 修复(第十六轮): failed 状态显式「重试生成」按钮,UX 比复用「AI 生成」更清晰 */}
+                {selected.status === 'failed' ? (
+                  <button className="btn-primary py-1.5 text-xs" onClick={() => gen('generate')} disabled={busy}>
+                    {busy ? <Spinner className="h-3.5 w-3.5" /> : <RotateCw size={13} />} 重试生成
+                  </button>
+                ) : (
+                  <button className="btn-primary py-1.5 text-xs" onClick={() => gen('generate')} disabled={busy}>
+                    {busy ? <Spinner className="h-3.5 w-3.5" /> : <Sparkles size={13} />} AI 生成
+                  </button>
+                )}
               </div>
               <div className="grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-2">
                 <div className="flex flex-col overflow-hidden border-b lg:border-b-0 lg:border-r" style={{ borderColor: 'var(--ink-600)' }}>
@@ -947,6 +954,49 @@ export default function ProjectDetail() {
           {/* 状态 Tab */}
           {tab === 'state' && (
             <div className="mx-auto max-w-4xl space-y-4 p-4 md:p-8">
+              {/* M1 修复(第十六轮): 项目健康度仪表盘 - 章节状态分布 StatCard */}
+              {/* 让作者一眼看到 done/draft/failed/generating 计数,快速判断哪些章节要重做 */}
+              {(() => {
+                const flat = flatten(tree);
+                const total = flat.length;
+                if (total === 0) return null;
+                const stats: Record<string, number> = { done: 0, draft: 0, failed: 0, generating: 0 };
+                flat.forEach(c => { if (stats[c.status] !== undefined) stats[c.status]++; });
+                const cards: Array<[keyof typeof stats, string, string]> = [
+                  ['done', 'badge-green', '完成'],
+                  ['draft', 'badge-mute', '草稿'],
+                  ['generating', 'badge-amber', '生成中'],
+                  ['failed', 'badge-red', '失败'],
+                ];
+                return (
+                  <div className="panel-elevated p-5">
+                    <div className="mb-3 flex items-center justify-between">
+                      <h3 className="font-display text-base text-paper">项目健康度</h3>
+                      <span className="text-[11px] text-paper-mute">共 {total} 章</span>
+                    </div>
+                    <div className="grid grid-cols-4 gap-2">
+                      {cards.map(([k, badge, label]) => {
+                        const count = stats[k];
+                        const pct = total > 0 ? (count / total) * 100 : 0;
+                        return (
+                          <div key={k} className="rounded border p-3 text-center" style={{ borderColor: 'var(--ink-600)' }}>
+                            <div className="mb-1 flex items-center justify-center gap-1">
+                              <span className={cn('badge', badge)}>{label}</span>
+                            </div>
+                            <div className="font-mono text-2xl text-paper">{count}</div>
+                            <div className="mt-1 text-[10px] text-paper-mute">{pct.toFixed(0)}%</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {stats.failed > 0 && (
+                      <p className="mt-3 text-[11px] text-cinnabar">
+                        ⚠ 有 {stats.failed} 章失败,在编辑器选中失败章节点「重试生成」
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
               <div className="panel-elevated p-5">
                 <h3 className="mb-3 font-display text-base text-paper">创意</h3>
                 {agentState?.idea ? (

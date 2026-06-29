@@ -269,7 +269,7 @@ export async function reconcileState(
   for (const ch of missing) {
     try {
       const oc = outlineChapters?.[ch.orderIdx];
-      await updateStateFromGeneration(projectId, model, providerId, ch.orderIdx, oc?.positioning, oc?.coreEmotion);
+      await updateStateFromGeneration(projectId, model, providerId, ch.orderIdx, oc?.positioning, oc?.coreEmotion);  // H1 修复(第十六轮): 返回 issues 由调用方 daemon 接管打日志
       backfilled++;
       // 进度回调：让调用方写 task_log，避免长时间无输出被误判卡死
       onProgress?.(backfilled, total);
@@ -1199,9 +1199,13 @@ export async function updateStateFromGeneration(
   justFinishedChapterIdx?: number,
   positioning?: ChapterPositioning,
   coreEmotion?: string,
-): Promise<void> {
+): Promise<{ issues: string[] }> {
   const chapters = chapterRepo.listByProject(projectId).filter(c => c.content);
-  if (chapters.length === 0) return;
+  if (chapters.length === 0) return { issues: [] };
+  // H1 修复(第十六轮): 收集 issues 让 daemon 层 warn 可见
+  // 原: catch{} 静默吞错,LLM 返回非法 JSON 时 daemon 不触发 try/catch → 用户无感知状态更新失败
+  // 现: 函数返回 issues 数组,catch 改 throw 让 daemon 接管 warn 日志
+  const issues: string[] = [];
 
   const state = stateRepo.get(projectId);
   const curForeshadowing = state?.foreshadowing || [];
@@ -1212,10 +1216,10 @@ export async function updateStateFromGeneration(
   const target = typeof justFinishedChapterIdx === 'number'
     ? chapters.find(c => c.orderIdx === justFinishedChapterIdx)
     : chapters[chapters.length - 1];
-  if (!target) return;
+  if (!target) return { issues };
 
   // 已有摘要就跳过（避免重复提炼覆盖已记录的定位/字数）
-  if (curSummaries.some(s => s.idx === target.orderIdx)) return;
+  if (curSummaries.some(s => s.idx === target.orderIdx)) return { issues };
 
   const wordBudget = target.wordCount;
 
@@ -1288,7 +1292,7 @@ ${pendingList || '（无）'}
         }
       }
     }
-    if (!jsonStr) return;
+    if (!jsonStr) return { issues };
     const parsed = JSON.parse(jsonStr);
 
     // 1. 追加章节摘要（含定位/字数/核心情绪，oh-story 三层归档所需）
@@ -1319,7 +1323,22 @@ ${pendingList || '（无）'}
     }
     if (Array.isArray(parsed.newForeshadows)) {
       for (const nf of parsed.newForeshadows) {
-        if (nf?.desc && !foreshadowing.some(f => f.desc === nf.desc)) {
+        if (!nf?.desc) continue;
+        // H2 修复(第十六轮): 过期伏笔被误埋检测
+        // oh-story: expired 伏笔「不可再埋」,但 LLM 后期可能"忘记"已过期伏笔而重新埋设相同 desc
+        // 原: newForeshadows 仅用全等去重(f.desc === nf.desc),不查 expired 列表 → 重复条目
+        // 现: 用 fuzzyMatch(双向 includes) 对比 expired 伏笔 desc,命中则跳过 push + 记 warn
+        const expiredList = foreshadowing.filter(f => f.status === 'expired');
+        const isExpiredDuplicate = expiredList.some(f => {
+          if (!nf.desc || nf.desc.length < 4) return false;
+          return f.desc.includes(nf.desc) || nf.desc.includes(f.desc);
+        });
+        if (isExpiredDuplicate) {
+          // 跳过 push,记到 issues 让 daemon 层 warn
+          issues.push(`LLM 试图重新埋设已过期伏笔（已跳过）:${String(nf.desc).slice(0, 40)}`);
+          continue;
+        }
+        if (!foreshadowing.some(f => f.desc === nf.desc)) {
           const importance = nf.importance === 'high' || nf.importance === 'mid' || nf.importance === 'low' ? nf.importance : 'mid';
           const expectedRecycleAt = typeof nf.expectedRecycleAt === 'number' ? nf.expectedRecycleAt : undefined;
           foreshadowing.push({
@@ -1385,7 +1404,11 @@ ${pendingList || '（无）'}
       volumeOutlines,
       memory: parsed.memory ? String(parsed.memory).slice(0, 600) : (state?.memory || ''),
     });
-  } catch {
-    // 静默失败，不影响主流程
+    return { issues };
+  } catch (e) {
+    // H1 修复(第十六轮): 不再静默吞错,改 throw 让 daemon 层 try/catch 接管打 warn
+    // 原: catch{} 完全无日志 → daemon 不知状态更新失败,用户无感知 → 长篇后期状态陈旧
+    // 现: throw 上抛,daemon 已有 try/catch 打 warn 日志(不阻断正文生成)
+    throw new Error(`状态更新失败(第${target.orderIdx + 1}章): ${(e as Error).message}`);
   }
 }

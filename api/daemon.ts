@@ -581,7 +581,13 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     //   权衡:保持当前行为(失败也推进),修正注释避免误导
     try {
       logTask(task.id, 'info', `更新剧情记忆 · 防跑偏（第 ${i + 1} 章）`);
-      await updateStateFromGeneration(projectId, model, providerId, i, ch.positioning, ch.coreEmotion);
+      // H1 修复(第十六轮): 接住 issues 数组,逐条打 info/warn 日志
+      const result = await updateStateFromGeneration(projectId, model, providerId, i, ch.positioning, ch.coreEmotion);
+      if (result.issues.length > 0) {
+        for (const issue of result.issues) {
+          logTask(task.id, 'warn', `第 ${i + 1} 章: ${issue}`);
+        }
+      }
     } catch (e) {
       logTask(task.id, 'warn', `第 ${i + 1} 章状态更新失败（不影响正文,reconcileState 重启会补做）：${(e as Error).message.slice(0, 100)}`);
     }
@@ -606,6 +612,35 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
         } catch (e) {
           logTask(task.id, 'warn', `第 ${curVol.idx + 1} 卷摘要压缩失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
         }
+      }
+    }
+
+    // M2 修复(第十六轮): 每 10 章调一次 LLM 卷级审稿,写入 state.review
+    // oh-story: 审稿要点应定期更新,而非永远为空让 LLM 无审稿引导
+    // 原: state.review 只有用户手动写才更新,长篇全程为空 → 缺审稿引导
+    // 现: 每 10 章(i+1 是 10 的倍数)调 LLM 综合最近 5 章做卷级审稿,写入 state.review
+    //     失败仅 warn 不阻断,不重试(下次 10 章再触发)
+    if ((i + 1) % 10 === 0 && i + 1 < chapters.length) {
+      try {
+        const recentChapters = chapterRepo.listByProject(projectId)
+          .filter(c => c.content && c.status === 'done')
+          .slice(-5);
+        if (recentChapters.length >= 3) {
+          const reviewContent = recentChapters.map(c => `第${c.orderIdx + 1}章《${c.title}》:\n${c.content.slice(0, 800)}`).join('\n\n');
+          const { text: reviewText } = await complete({
+            providerId, model, projectId,
+            messages: [{ role: 'user', content: `请对以下最近 ${recentChapters.length} 章做卷级审稿,输出 100-200 字的审稿要点（含:① 节奏是否拖沓 ② 人设是否漂移 ③ 伏笔回收是否到位 ④ 下一步建议）:\n\n${reviewContent}` }],
+            systemStable: '你是资深网文审稿编辑,擅长发现节奏/人设/伏笔问题。',
+            temperature: 0.4, maxTokens: 400,
+          });
+          if (reviewText && reviewText.length > 20) {
+            const curState = stateRepo.get(projectId);
+            stateRepo.update(projectId, { ...(curState || {}), review: reviewText.slice(0, 800) });
+            logTask(task.id, 'info', `第 ${i + 1} 章后卷级审稿完成,已更新 state.review`);
+          }
+        }
+      } catch (e) {
+        logTask(task.id, 'warn', `第 ${i + 1} 章后卷级审稿失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
       }
     }
   }
@@ -802,7 +837,12 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     // 每段后更新防跑偏记忆（传 positioning/coreEmotion 与 book 流水线一致）
     // 失败不阻断正文落库：状态更新失败只 warn，不让单段状态失败导致整任务重试
     try {
-      await updateStateFromGeneration(projectId, model, providerId, i, seg.positioning, seg.coreEmotion);
+      const result = await updateStateFromGeneration(projectId, model, providerId, i, seg.positioning, seg.coreEmotion);
+      if (result.issues.length > 0) {
+        for (const issue of result.issues) {
+          logTask(task.id, 'warn', `第 ${i + 1} 段: ${issue}`);
+        }
+      }
     } catch (e) {
       logTask(task.id, 'warn', `第 ${i + 1} 段状态更新失败（不影响正文）：${(e as Error).message.slice(0, 100)}`);
     }
