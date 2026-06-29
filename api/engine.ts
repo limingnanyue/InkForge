@@ -595,6 +595,7 @@ export function buildVolumeOutlines(chapterCount: number): VolumeOutline[] {
 const OUTLINE_SINGLE_CALL_MAX_CHAPTERS = 200;
 
 // 单卷大纲生成（被 generateOutline 编排，也可独立用于小卷）
+// 单卷失败时本地重试 1 次：避免单卷瞬时抖动导致整个 book 任务重试（重试会从 checkpoint 续传，但浪费已成功卷的 LLM 调用）
 async function generateOutlineForVolume(opts: {
   projectId: string;
   model: string;
@@ -645,12 +646,28 @@ ${distLine}
   const { complete } = await import('./llm.js');
   // 单卷最多 20 章，maxTokens 给 8192 足够（20 章 × 150 tokens = 3000，留余量）
   const volMaxTokens = Math.min(16384, Math.max(4096, volChapterCount * 200));
-  const { text } = await complete({
-    providerId, model, messages, systemStable, projectId, temperature: 0.8, maxTokens: volMaxTokens,
-    webSearch,
-    searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路 第${volIndex + 1}卷` : undefined,
-  });
-  return parseOutline(text);
+  // 单卷输出 ~3000 tokens，正常 30-90s，给 8 分钟 wall timeout 容忍长上下文处理
+  const volWallTimeout = 8 * 60 * 1000;
+
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { text } = await complete({
+        providerId, model, messages, systemStable, projectId, temperature: 0.8, maxTokens: volMaxTokens,
+        webSearch,
+        searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路 第${volIndex + 1}卷` : undefined,
+        wallTimeoutMs: volWallTimeout,
+      });
+      const parsed = parseOutline(text);
+      if (parsed.length > 0) return parsed;
+      lastErr = new Error(`第 ${volIndex + 1} 卷大纲解析为空（LLM 未输出合法 JSON 数组）`);
+    } catch (e) {
+      lastErr = e as Error;
+    }
+    // 第 1 次失败时记录但不抛错，继续第 2 次尝试
+  }
+  // 本地重试 2 次都失败 → 抛错让上层（daemon）走断点续传重试
+  throw lastErr ?? new Error(`第 ${volIndex + 1} 卷大纲生成失败`);
 }
 
 export async function generateOutline(opts: {
@@ -662,12 +679,27 @@ export async function generateOutline(opts: {
   idea: string;
   webSearch?: boolean;
   onVolumeProgress?: (done: number, total: number) => void;
+  /**
+   * 断点续传：已生成卷的累积 chapters（JSON 字符串解析后的数组）。
+   * daemon 在重试时把已完成的卷数据传入，本函数从对应卷继续生成。
+   * 缺省（首次生成）传 undefined。
+   */
+  prevVolumes?: ParsedOutlineItem[];
+  /**
+   * checkpoint 回写钩子：每完成一卷后调用，让 daemon 持久化进度。
+   * 接收当前已完成卷的累积 chapters 与已完成卷数。
+   */
+  onVolumeCheckpoint?: (accumulated: ParsedOutlineItem[], doneVolumes: number, totalVolumes: number) => void;
 }): Promise<string> {
-  const { projectId, model, providerId, targetWords, config, idea, webSearch, onVolumeProgress } = opts;
+  const { projectId, model, providerId, targetWords, config, idea, webSearch, onVolumeProgress, prevVolumes, onVolumeCheckpoint } = opts;
   const chapterCount = Math.max(1, Math.ceil(targetWords / 2500));
 
   // —— 单次调用足够时走原逻辑（小卷，<= 200 章）——
   if (chapterCount <= OUTLINE_SINGLE_CALL_MAX_CHAPTERS) {
+    // 单次大纲生成无法中途断点（一次 LLM 调用），但重试时如果 prevVolumes 已有数据则直接返回
+    if (prevVolumes && prevVolumes.length >= chapterCount) {
+      return JSON.stringify(prevVolumes);
+    }
     const dist = computePositioningDistribution(chapterCount);
     const volumes = computeVolumeRanges(chapterCount);
     const distLine = `高压章 ${dist['high-pressure']} 章 / 普通推进章 ${dist['normal-progress']} 章 / 修炼试错章 ${dist['trial-error']} 章 / 关系回收章 ${dist['relationship']} 章 / 低压生活章 ${dist['low-pressure']} 章 / 信息整理章 ${dist['info-organize']} 章`;
@@ -701,10 +733,13 @@ ${distLine}
     const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
     const { complete } = await import('./llm.js');
     const outlineMaxTokens = Math.min(32000, Math.max(8192, chapterCount * 150));
+    // 200 章输出 ~30000 tokens，正常 2-5 分钟，给 12 分钟 wall timeout 避免误杀（远超 5 分钟默认）
+    const outlineWallTimeout = chapterCount > 100 ? 12 * 60 * 1000 : 8 * 60 * 1000;
     const { text: acc } = await complete({
       providerId, model, messages, systemStable, projectId, temperature: 0.8, maxTokens: outlineMaxTokens,
       webSearch,
       searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路` : undefined,
+      wallTimeoutMs: outlineWallTimeout,
     });
     const match = acc.match(/\[[\s\S]*\]/);
     return match ? match[0] : acc;
@@ -713,17 +748,28 @@ ${distLine}
   // —— 分卷生成（超长篇，> 200 章）——
   // 500 万字 = 2000 章 = 100 卷，单卷 20 章逐次调 LLM 后合并
   // 解决：原单次调用 maxTokens cap 32000 只能产 ~213 章 JSON，超长篇必然截断
+  // 断点续传：prevVolumes 已有 N 卷数据时，从第 N+1 卷继续生成（避免重试从头开始永远卡在同一卷）
   const volumes = computeVolumeRanges(chapterCount);
-  const allChapters: ParsedOutlineItem[] = [];
+  const allChapters: ParsedOutlineItem[] = prevVolumes ? [...prevVolumes] : [];
+  // 跳过已完成的卷（基于已累积的章节数推算）
+  let startVolIdx = 0;
+  if (allChapters.length > 0) {
+    const doneChapters = allChapters.length;
+    startVolIdx = Math.floor(doneChapters / 20);  // 每 20 章一卷
+    // 已完成的卷数也回写日志
+    if (startVolIdx > 0 && onVolumeProgress) {
+      for (let i = 0; i < startVolIdx; i++) onVolumeProgress(i + 1, volumes.length);
+    }
+  }
   const volPremiseHints = (i: number) =>
     i === 0 ? '开篇立人设、抛核心冲突与主线伏笔' :
     (i === volumes.length - 1 ? '终局决战、回收所有主线伏笔、收束情绪弧线' :
     '中段推进、新伏笔集群、关系深化');
 
-  for (let vi = 0; vi < volumes.length; vi++) {
+  for (let vi = startVolIdx; vi < volumes.length; vi++) {
     const vol = volumes[vi];
     const volChapterCount = vol.range[1] - vol.range[0] + 1;
-    const prevTail = vi > 0 && allChapters.length > 0
+    const prevTail = allChapters.length > 0
       ? `第 ${allChapters.length} 章《${allChapters[allChapters.length - 1].title}》：${allChapters[allChapters.length - 1].outline}\n章末钩子：${allChapters[allChapters.length - 1].hook}`
       : undefined;
 
@@ -741,6 +787,8 @@ ${distLine}
     }
     allChapters.push(...volChapters);
     onVolumeProgress?.(vi + 1, volumes.length);
+    // 每完成一卷回写 checkpoint：daemon 重试时从该卷后继续，避免从头开始
+    onVolumeCheckpoint?.(allChapters, vi + 1, volumes.length);
   }
 
   return JSON.stringify(allChapters);

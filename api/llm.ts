@@ -44,6 +44,12 @@ export interface LLMOptions {
   projectId?: string;
   /** usage 回调：流式结束时报送本次调用的 token 用量 */
   onUsage?: (usage: Usage) => void;
+  /**
+   * 单次调用总耗时上限（毫秒），缺省取 WALL_TIMEOUT_MS（5 分钟）。
+   * 长输出场景（如 200 章大纲生成 ~30000 tokens）可放宽到 10-15 分钟避免误杀。
+   * 注意：仅在确实长输出的合法场景放宽，不要为短输出场景放宽（会掩盖真实卡死）。
+   */
+  wallTimeoutMs?: number;
 }
 
 // LLM 流式调用防卡死超时（守护进程长篇生成核心保护）
@@ -300,13 +306,15 @@ async function* streamOpenAICompatible(provider: Provider, opts: LLMOptions): As
   let buffer = '';
   let reportedUsage: Usage | null = null;
   // wall-clock 截止时刻：超过则中止（防空心跳 keep-alive 卡死）
-  const wallDeadline = Date.now() + WALL_TIMEOUT_MS;
+  // 大纲生成等长输出场景可通过 opts.wallTimeoutMs 放宽（缺省 5 分钟）
+  const wallTimeoutMs = opts.wallTimeoutMs && opts.wallTimeoutMs > 0 ? opts.wallTimeoutMs : WALL_TIMEOUT_MS;
+  const wallDeadline = Date.now() + wallTimeoutMs;
 
   try {
     while (true) {
       // 总耗时超时：服务端持续发空心跳但无实质内容，直接中止
       if (Date.now() > wallDeadline) {
-        throw new DOMException(`LLM 调用总耗时超时（${WALL_TIMEOUT_MS / 1000}s，疑似空心跳卡死）`, 'TimeoutError');
+        throw new DOMException(`LLM 调用总耗时超时（${wallTimeoutMs / 1000}s，疑似空心跳卡死或输出过长；如反复触发请降低字数/分卷或切换更快的模型）`, 'TimeoutError');
       }
       const { done, value } = await readWithTimeout(reader, READ_TIMEOUT_MS, wallDeadline);
       if (done) break;
@@ -379,12 +387,13 @@ async function* streamGemini(provider: Provider, opts: LLMOptions): AsyncGenerat
   const decoder = new TextDecoder();
   let buffer = '';
   let reportedUsage: Usage | null = null;
-  const wallDeadline = Date.now() + WALL_TIMEOUT_MS;
+  const wallTimeoutMs = opts.wallTimeoutMs && opts.wallTimeoutMs > 0 ? opts.wallTimeoutMs : WALL_TIMEOUT_MS;
+  const wallDeadline = Date.now() + wallTimeoutMs;
 
   try {
     while (true) {
       if (Date.now() > wallDeadline) {
-        throw new DOMException(`Gemini 调用总耗时超时（${WALL_TIMEOUT_MS / 1000}s）`, 'TimeoutError');
+        throw new DOMException(`Gemini 调用总耗时超时（${wallTimeoutMs / 1000}s）`, 'TimeoutError');
       }
       const { done, value } = await readWithTimeout(reader, READ_TIMEOUT_MS, wallDeadline);
       if (done) break;
@@ -505,12 +514,13 @@ async function* streamAnthropic(provider: Provider, opts: LLMOptions): AsyncGene
   let cacheReadTokens = 0;
   let cacheCreationTokens = 0;
   let outputTokens = 0;
-  const wallDeadline = Date.now() + WALL_TIMEOUT_MS;
+  const wallTimeoutMs = opts.wallTimeoutMs && opts.wallTimeoutMs > 0 ? opts.wallTimeoutMs : WALL_TIMEOUT_MS;
+  const wallDeadline = Date.now() + wallTimeoutMs;
 
   try {
     while (true) {
       if (Date.now() > wallDeadline) {
-        throw new DOMException(`Anthropic 调用总耗时超时（${WALL_TIMEOUT_MS / 1000}s）`, 'TimeoutError');
+        throw new DOMException(`Anthropic 调用总耗时超时（${wallTimeoutMs / 1000}s）`, 'TimeoutError');
       }
       const { done, value } = await readWithTimeout(reader, READ_TIMEOUT_MS, wallDeadline);
       if (done) break;

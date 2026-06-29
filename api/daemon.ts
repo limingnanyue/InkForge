@@ -309,11 +309,27 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       logTask(task.id, 'info', `超长篇（${totalChapters} 章）启用分卷大纲生成，预计 ${Math.ceil(totalChapters / 20)} 卷`);
     }
     progress(task.id, 0.1, totalChapters > 200 ? `分卷大纲生成中（共 ${Math.ceil(totalChapters / 20)} 卷）…` : '生成分章大纲…');
+    // 断点续传：从 checkpoint 读取已生成卷的累积 chapters（分卷大纲场景）
+    // 重试时 prevVolumes 已有 N 卷数据 → generateOutline 从第 N+1 卷继续，避免从头开始永远卡同一卷
+    const cpOutline = checkpoint as { prevVolumesJson?: string };
+    const prevVolumes = cpOutline.prevVolumesJson
+      ? (() => { try { return parseOutline(cpOutline.prevVolumesJson); } catch { return undefined; } })()
+      : undefined;
+    if (prevVolumes && prevVolumes.length > 0) {
+      logTask(task.id, 'info', `大纲断点续传：已生成 ${prevVolumes.length} 章（约 ${Math.floor(prevVolumes.length / 20)} 卷），从下一卷继续`);
+    }
     outline = await generateOutline({
       projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch,
+      prevVolumes,
       onVolumeProgress: (done, total) => {
         logTask(task.id, 'info', `大纲分卷生成 ${done}/${total} 卷完成`);
         progress(task.id, 0.1 + 0.05 * (done / total), `大纲分卷 ${done}/${total}…`);
+      },
+      onVolumeCheckpoint: (accumulated, doneVolumes, totalVolumes) => {
+        // 每完成一卷立即回写 checkpoint：失败/重试时从该卷后继续
+        // 注意：checkpoint 用浅合并，phase 保持 outline 不变（直到全部完成才转 chapter）
+        taskRepo.update(task.id, { checkpoint: { phase: 'outline', prevVolumesJson: JSON.stringify(accumulated) } });
+        logTask(task.id, 'info', `大纲 checkpoint 已保存：${doneVolumes}/${totalVolumes} 卷（${accumulated.length} 章）`);
       },
     });
     taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline } });
