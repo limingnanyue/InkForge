@@ -64,6 +64,16 @@ export function buildContextPrompt(projectId: string): string {
   if (state.idea) sections.push(`【创意】\n${state.idea}`);
   if (state.setting) sections.push(`【世界观设定】\n${state.setting}`);
   if (state.characters) sections.push(`【角色档案】\n${state.characters}`);
+  // H1 修复(第十二轮): 注入全书大纲到稳定段,防长篇中段主线遗忘
+  // 原: generateOutline 产物只落 task.checkpoint.outlineJson,正文生成 prompt 完全看不到全书故事线
+  // 现: 大纲落 state.outline,每章正文生成都能看到全书主线,防止跑题
+  if (state.outline) {
+    // 大纲可能很长(200章 ~ 30000 字),截断到前 4000 字保稳定段不超长
+    const outlineSnippet = state.outline.length > 4000
+      ? state.outline.slice(0, 4000) + '\n...(全书大纲节选,完整大纲见 task.checkpoint)'
+      : state.outline;
+    sections.push(`【全书大纲主线】\n${outlineSnippet}`);
+  }
   return sections.length ? `【当前项目智能体状态】\n${sections.join('\n\n')}` : '';
 }
 
@@ -114,13 +124,42 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
   // —— 三层摘要归档（oh-story）：防上下文爆炸 ——
   // 第 1 层（近 5 章）：完整摘要详记
   // 第 2 层（6-15 章，即过去 10 章）：单行概要（标题 + 一句话）
-  // 第 3 层（>15 章前）：仅卷级总览（若有 volumeOutlines）+ memory 总览
-  // 第 50 章后：>15 章前的章节摘要不再注入，仅靠卷总览 + memory
+  // 第 3 层（>15 章前）：H6 修复(第十二轮) 加远期卷摘要压缩层
+  //   原: 16 章前摘要完全不注入 → 100+ 章长篇中段"失忆"
+  //   现: 16 章前已完成的摘要按卷压缩,每卷取前 3 条摘要拼成"卷级已发生事件"注入
+  //       既保留历史主线信息又控制 token,避免长篇失忆
   const summaries = (state.chapterSummaries || []).slice().sort((a, b) => a.idx - b.idx);
   if (summaries.length > 0) {
     const recentDetailed = summaries.slice(-5);            // 近 5 章：完整摘要
     const midOutline = summaries.slice(-15, -5);            // 6-15 章：单行概要
+    const faraway = summaries.slice(0, -15);                // 16 章前：远期
     const parts: string[] = [];
+    // H6 修复: 远期摘要按卷压缩注入(若有 volumeOutlines),无卷大纲则按每 10 章压缩
+    if (faraway.length > 0) {
+      const vols = state.volumeOutlines || [];
+      if (vols.length > 0) {
+        // 按卷分组,每卷取前 3 条摘要拼成一句话
+        const volSummaries = vols.map(v => {
+          const inVol = faraway.filter(s => s.idx >= v.chapterRange[0] && s.idx <= v.chapterRange[1]);
+          if (inVol.length === 0) return null;
+          // 每卷取首章 + 末章 + 中间章,拼成"卷内关键事件"
+          const picks = inVol.length <= 3 ? inVol : [inVol[0], inVol[Math.floor(inVol.length / 2)], inVol[inVol.length - 1]];
+          return `· 第${v.idx + 1}卷《${v.title}》(第${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章,共${inVol.length}章已完成):${picks.map(s => `第${s.idx + 1}章${s.summary.slice(0, 30)}`).join(' / ')}`;
+        }).filter(Boolean);
+        if (volSummaries.length > 0) {
+          parts.push(`【远期卷摘要（第1-${faraway[faraway.length - 1].idx + 1}章,按卷压缩)】\n${volSummaries.join('\n')}`);
+        }
+      } else if (faraway.length > 0) {
+        // 无卷大纲时,按每 10 章压缩
+        const groups: ChapterSummary[][] = [];
+        for (let i = 0; i < faraway.length; i += 10) groups.push(faraway.slice(i, i + 10));
+        const groupLines = groups.map((g, gi) => {
+          const picks = g.length <= 3 ? g : [g[0], g[Math.floor(g.length / 2)], g[g.length - 1]];
+          return `· 第${gi * 10 + 1}-${gi * 10 + g.length}章:${picks.map(s => `第${s.idx + 1}章${s.summary.slice(0, 30)}`).join(' / ')}`;
+        });
+        parts.push(`【远期摘要(按10章压缩)】\n${groupLines.join('\n')}`);
+      }
+    }
     if (midOutline.length > 0) {
       parts.push(`【十章概要（第${midOutline[0].idx + 1}-${midOutline[midOutline.length - 1].idx + 1}章）】\n${midOutline.map(s => `· 第${s.idx + 1}章《${s.title}》：${s.summary.slice(0, 40)}`).join('\n')}`);
     }
@@ -187,6 +226,7 @@ export function buildChapterAnchor(
   positioning?: ChapterPositioning,
   baseWordTarget = 2500,
   coreEmotion?: string,
+  volumeCtx?: { idx: number; title: string; premise: string; emotionArc: string } | null,
 ): string {
   // BUG-1 修复：原 listByProject 全量加载只为取 prevChapters[currentIdx-1].content.slice(-300)，
   // 2000 章循环 = O(N²) 全表扫描。改用 getTail 仅查单行 content
@@ -210,15 +250,26 @@ export function buildChapterAnchor(
 · 核心情绪：按题材对位（见题材→情绪路由表）`;
   }
 
+  // H2 修复(第十二轮): 注入本卷核心冲突 + 情绪弧线,防每章不知卷主线而跑题
+  // 原: buildChapterAnchor 只注入本章定位 + 上一章结尾,LLM 看不到当前卷要解决什么主线冲突
+  // 现: 通过 volumeOutlines 反查当前章所属卷,注入【本卷主线】段
+  const volumeBlock = volumeCtx
+    ? `
+【本卷主线 · 第${volumeCtx.idx + 1}卷《${volumeCtx.title}》】
+· 核心冲突：${volumeCtx.premise}
+· 情绪弧线：${volumeCtx.emotionArc}
+· 本章须推进本卷核心冲突,不得脱离卷主线写独立单元`
+    : '';
+
   return `【当前位置锚点】
 正在创作：第 ${currentIdx + 1} / ${totalChapters} 章《${chapterTitle}》
 本章大纲：${chapterOutline}
-${positioningBlock}
+${positioningBlock}${volumeBlock}
 
 【上一章结尾 300 字】（必须自然承接此情境，不得重复）
 ${prevTail}
 
-约束：严格承接上一章结尾的情境/对话/动作，不得让角色做出与人设矛盾的行为；按【本章定位】的情绪强度与字数预算写作；伏笔已在上方列出，本章可考虑回收其中之一（过期伏笔不可再埋）。`;
+约束：严格承接上一章结尾的情境/对话/动作，不得让角色做出与人设矛盾的行为；按【本章定位】的情绪强度与字数预算写作；${volumeCtx ? '推进【本卷主线】的核心冲突,不得跑题；' : ''}伏笔已在上方列出，本章可考虑回收其中之一（过期伏笔不可再埋）。`;
 }
 
 // 构建最近章节记忆（防止上下文过长，仅取最近 N 章摘要）

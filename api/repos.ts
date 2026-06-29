@@ -151,12 +151,12 @@ export const stateRepo = {
     const merged = { ...(cur || { projectId: projectId, idea: '', setting: '', characters: '', memory: '', review: '', revision: '', cover: '', foreshadowing: [], characterState: [], chapterSummaries: [], volumeOutlines: [] }), ...data };
     db.prepare(
       `UPDATE agent_state SET idea=?, setting=?, characters=?, memory=?, review=?, revision=?, cover=?,
-       foreshadowing_json=?, character_state_json=?, chapter_summaries_json=?, volume_outlines_json=?, updated_at=? WHERE project_id=?`
+       foreshadowing_json=?, character_state_json=?, chapter_summaries_json=?, volume_outlines_json=?, outline=?, updated_at=? WHERE project_id=?`
     ).run(
       merged.idea || '', merged.setting || '', merged.characters || '', merged.memory || '',
       merged.review || '', merged.revision || '', merged.cover || '',
       JSON.stringify(merged.foreshadowing || []), JSON.stringify(merged.characterState || []), JSON.stringify(merged.chapterSummaries || []),
-      JSON.stringify(merged.volumeOutlines || []),
+      JSON.stringify(merged.volumeOutlines || []), merged.outline || '',
       now(), projectId
     );
     return this.get(projectId);
@@ -547,6 +547,7 @@ function rowToState(r: any): AgentState {
     characterState: parseJSONArr(r.character_state_json),
     chapterSummaries: parseJSONArr(r.chapter_summaries_json),
     volumeOutlines: parseJSONArr(r.volume_outlines_json),
+    outline: r.outline || '',  // H1 修复(第十二轮): 全书大纲
     updatedAt: r.updated_at,
   };
 }

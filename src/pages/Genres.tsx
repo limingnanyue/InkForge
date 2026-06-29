@@ -86,13 +86,14 @@ export default function Genres() {
     toast(`正在为「${g.label}」联网搜索并生成详细说明...`);
     try {
       const { currentModel, currentProviderId } = useApp.getState();
-      await api.genres.enrich(g.id, {
+      const { description, emotionMap } = await api.genres.enrich(g.id, {
         model: currentModel || undefined,
         providerId: currentProviderId || undefined,
         webSearch: true,
       });
-      toast(`已补全「${g.label}」的题材说明`);
-      load();  // 刷新列表展示新说明
+      // M2 修复(第十二轮): 用返回值就地更新单条,避免 load() 全量重拉导致列表闪 Spinner
+      setGenres(list => list.map(x => x.id === g.id ? { ...x, description, emotionMap } : x));
+      toast(`已补全「${g.label}」的题材说明与情绪映射`);
     } catch (e) {
       toast(`补全失败：${(e as Error).message}`, 'err');
     } finally {
@@ -186,8 +187,8 @@ export default function Genres() {
                 <button
                   className="btn-ghost py-1 text-xs text-amber hover:text-amber-bright"
                   onClick={() => handleEnrich(g)}
-                  disabled={enrichingId === g.id}
-                  title="联网搜索 + AI 生成详细题材说明"
+                  disabled={!!enrichingId}
+                  title={enrichingId && enrichingId !== g.id ? '请等待当前补全完成' : '联网搜索 + AI 生成详细题材说明'}
                 >
                   {enrichingId === g.id ? <Spinner className="h-3 w-3" /> : <Sparkles size={12} />} AI 补全
                 </button>

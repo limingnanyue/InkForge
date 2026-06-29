@@ -323,6 +323,17 @@ export default function ProjectDetail() {
     // BUG3: 切项目重置图像供应商选择,避免上一项目选定的 provider::model 串到新项目
     setCoverImageProvider('');
   }, [id]);
+  // M3 修复(第十二轮): 所选图像供应商被删除时自动清空 coverImageProvider,避免静默回落 TRAE
+  // 原: provider 删除后 coverImageProvider 仍是旧 providerId,下拉 value 不匹配任何 option,
+  //     onGenerateCoverPreview 走 TRAE 兜底但 toast 不明示,用户以为用的是自配供应商
+  useEffect(() => {
+    if (!coverImageProvider) return;
+    const pid = coverImageProvider.split('::')[0];
+    if (!providers.find(p => p.id === pid)) {
+      setCoverImageProvider('');
+      toast('所选图像供应商已被删除,已切回系统默认', 'err');
+    }
+  }, [providers, coverImageProvider, toast]);
   useEffect(() => {
     if (!coverTitleTouchedRef.current && project) {
       setCoverBookTitle(project.title);
@@ -483,7 +494,10 @@ export default function ProjectDetail() {
         // 守卫: 仅当 ref 仍指向当前请求时才 setCoverPreviewUrl,否则丢弃(已被新请求取代)
         if (coverPreviewAbortRef.current !== ac) return;
         setCoverPreviewUrl(dataUrl);
-        toast(selProvider ? `已通过 ${selProvider.name} · ${selModel} 生成预览图` : '封面预览图已生成');
+        // M3 修复(第十二轮): TRAE 兜底路径明示,避免用户误以为用的是自配供应商
+        toast(selProvider
+          ? `已通过 ${selProvider.name} · ${selModel} 生成预览图`
+          : '封面预览图已生成（系统默认文生图）');
       } finally {
         if (objectUrl) URL.revokeObjectURL(objectUrl);
       }

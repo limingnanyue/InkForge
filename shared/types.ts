@@ -111,6 +111,7 @@ export interface AgentState {
   characterState: CharacterState[];   // 角色实时状态表（防人设漂移）
   chapterSummaries: ChapterSummary[]; // 三层摘要归档（近5章详记 / 十章概要 / 卷总览）
   volumeOutlines?: VolumeOutline[];   // 卷级大纲（长篇专用）
+  outline?: string;  // 全书大纲（H1 修复第十二轮：原仅落 task.checkpoint，正文生成 prompt 看不到全书主线 → 长篇中段跑题/遗忘主线）
   updatedAt: number;
 }
 

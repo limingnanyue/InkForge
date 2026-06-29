@@ -83,6 +83,9 @@ body {
     border: 1px solid var(--ink-400);
   }
   .btn-ghost:hover { color: var(--amber); border-color: var(--amber-deep); background: rgba(212, 165, 52, 0.05); }
+  /* M6 修复(第十二轮): 补 .btn-ghost:disabled 视觉反馈,原仅 .btn-primary:disabled 有样式 */
+  .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  .btn-ghost:disabled:hover { color: var(--paper-dim); border-color: var(--ink-400); background: transparent; }
 
   /* 面板 */
   .panel {
@@ -105,6 +108,8 @@ body {
   }
   .input:focus { outline: none; border-color: var(--amber-deep); box-shadow: 0 0 0 3px rgba(212, 165, 52, 0.12); }
   .input::placeholder { color: var(--paper-mute); }
+  /* M6 修复(第十二轮): 补 input/select/textarea disabled 全局样式,影响 8+ 处控件 */
+  .input:disabled, select.input:disabled, textarea.input:disabled { opacity: 0.5; cursor: not-allowed; background: var(--paper-dim); }
   .input-compact {
     background: transparent;
     border: 1px solid transparent;

@@ -398,7 +398,9 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       clearInterval(outlineBeat);
     }
     taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline } });
-    logTask(task.id, 'info', '大纲生成完成');
+    // H1 修复(第十二轮): 全书大纲落 state.outline,正文生成 prompt 可见,防长篇主线遗忘
+    stateRepo.update(projectId, { outline });
+    logTask(task.id, 'info', '大纲生成完成,已注入智能体状态(防长篇跑题)');
   }
 
   const chapters = parseOutline(outline);
@@ -469,7 +471,15 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // oh-story：按章节定位类型调整 maxTokens（高压章给更多空间，低压/信息章压缩防注水）
     chapterRepo.update(chapter.id, { status: 'generating' });
     let content = '';
-    const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion);
+    // H2 修复(第十二轮): 查当前章所属卷,把卷 premise/emotionArc 传给 buildChapterAnchor
+    // 原: buildChapterAnchor 不知本卷主线,LLM 每章只看本章大纲,容易跑题写独立单元
+    const curState = stateRepo.get(projectId);
+    const curVolumes = curState?.volumeOutlines || [];
+    const curVol = curVolumes.find(v => i >= v.chapterRange[0] && i <= v.chapterRange[1]);
+    const volumeCtx = curVol
+      ? { idx: curVol.idx, title: curVol.title, premise: curVol.premise, emotionArc: curVol.emotionArc }
+      : null;
+    const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion, volumeCtx);
     // 章末钩子提示 + 定位对位的字数提示
     const positioningHint = ch.positioning
       ? `（本章为${ch.positioning}，按【本章定位】的字数预算与情绪强度写作）`

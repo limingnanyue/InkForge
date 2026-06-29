@@ -210,6 +210,8 @@ function migrateLegacySchema(): void {
   if (!stateCols.includes('character_state_json')) db.exec("ALTER TABLE agent_state ADD COLUMN character_state_json TEXT DEFAULT '[]'");
   if (!stateCols.includes('chapter_summaries_json')) db.exec("ALTER TABLE agent_state ADD COLUMN chapter_summaries_json TEXT DEFAULT '[]'");
   if (!stateCols.includes('volume_outlines_json')) db.exec("ALTER TABLE agent_state ADD COLUMN volume_outlines_json TEXT DEFAULT '[]'");
+  // H1 修复(第十二轮): agent_state 加 outline 列存全书大纲,防长篇主线遗忘
+  if (!stateCols.includes('outline')) db.exec("ALTER TABLE agent_state ADD COLUMN outline TEXT DEFAULT ''");
 
   // C1 修复：旧库 chapter 表的 CHECK 不含 'failed' 时重建表（SQLite 不支持 ALTER CHECK）
   // 副作用：旧 status='generating' 的卡死章节会被强制回滚为 'draft'，避免再次启动后被 CHECK 拒绝写入 'failed'
