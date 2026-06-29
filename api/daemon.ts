@@ -528,7 +528,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch }))) {
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch, currentChapterIdx: i }))) {
           content += chunk;
         }
         // 质量门检测（字数门 + 跑题门）
@@ -611,21 +611,41 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   }
 
   // 精修阶段（抽样精修最近几章）
+  // H1 修复(第十五轮): 精修范围从最后 3 章扩到 5 章 + 加 snapshot + try/catch
+  // 原 bug1: 范围仅 slice(-3),200 章长篇 197 章未精修
+  // 原 bug2: 不调 snapshot → 精修后原文永久丢失,无法回滚
+  // 原 bug3: 无 try/catch → LLM 抛错让整个 200 章任务标记 failed 重做,巨大 token 浪费
+  // 现: 范围 min(N, max(5, N*0.1)); 每章先 snapshot; 整段 try/catch 失败仅 warn 不阻断
   progress(task.id, 0.95, '精修去 AI 味…');
   const allChapters = chapterRepo.listByProject(projectId);
-  const toRefine = allChapters.slice(-3);
-  for (const ch of toRefine) {
-    if (!ch.content) continue;
-    let refined = '';
-    // 精修 maxTokens 按原文字数动态调整：精修"只改表达不增删情节"，token 空间贴近原文字数 + 10% 余量
-    // 原 maxTokens 4096 ≈ 5500 汉字，给 2000-3000 字原文 5500 字空间 → LLM 注水扩写
-    // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断（国产 1 字≈1.5-2 token）
-    const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
-    // D3 修复：包 withHeartbeat 防 claimNext 误回收；webSearch:false 显式关闭联网
-    for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
-      refined += chunk;
+  const refineCount = Math.min(allChapters.length, Math.max(5, Math.floor(allChapters.length * 0.1)));
+  const toRefine = allChapters.slice(-refineCount);
+  try {
+    for (const ch of toRefine) {
+      if (!ch.content) continue;
+      let refined = '';
+      const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
+      try {
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
+          refined += chunk;
+        }
+      } catch (e) {
+        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 章精修失败（不阻断,保留原文）：${(e as Error).message.slice(0, 80)}`);
+        continue;
+      }
+      // 质量门:精修后字数不应 < 原文 70%(防 LLM 截断/缩写);否则保留原文
+      const originalLen = ch.content.length;
+      if (refined.length < originalLen * 0.7) {
+        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 章精修后字数 ${refined.length} < 原文 ${originalLen} 的 70%,疑似截断/缩写,保留原文`);
+        continue;
+      }
+      if (refined.length > 100) {
+        chapterRepo.snapshot(ch.id);  // 精修前存快照,允许用户回滚
+        chapterRepo.update(ch.id, { content: refined });
+      }
     }
-    if (refined.length > 100) chapterRepo.update(ch.id, { content: refined });
+  } catch (e) {
+    logTask(task.id, 'warn', `末尾精修阶段异常（不阻断任务完成）：${(e as Error).message.slice(0, 100)}`);
   }
 
   projectRepo.updateWordCount(projectId);
@@ -791,20 +811,38 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     taskRepo.update(task.id, { checkpoint: { segmentIdx: i + 1, segmentTotal: segments.length, outlineJson } });
   }
 
-  // 精修：精修最近 2 段（短篇段较长，精修多段保证质量）
+  // 精修：精修最近 N 段（N = min(总段数, max(3, 段数*0.2))）
+  // H1 修复(第十五轮): 短篇段较长,精修范围扩到 max(3, 段数*0.2);加 snapshot + try/catch
+  // 原 bug: 仅 slice(-2) + 无 snapshot + 无 try/catch → 短篇任务因末尾精修失败被标记 failed 重做
   progress(task.id, 0.95, '精修中…');
-  const toRefineShort = chapterRepo.listByProject(projectId).slice(-2);
-  for (const ch of toRefineShort) {
-    if (!ch.content) continue;
-    let refined = '';
-    // 短篇段约 chapterWordBudget 字，精修 maxTokens 按原文字数 + 10% 余量（防注水扩写）
-    // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断
-    const refineMaxTokens = Math.round(Math.max(3000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
-    // D3 修复：包 withHeartbeat 防 claimNext 误回收；webSearch:false 显式关闭联网
-    for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
-      refined += chunk;
+  const shortChapters = chapterRepo.listByProject(projectId);
+  const shortRefineCount = Math.min(shortChapters.length, Math.max(3, Math.floor(shortChapters.length * 0.2)));
+  const toRefineShort = shortChapters.slice(-shortRefineCount);
+  try {
+    for (const ch of toRefineShort) {
+      if (!ch.content) continue;
+      let refined = '';
+      const refineMaxTokens = Math.round(Math.max(3000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
+      try {
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
+          refined += chunk;
+        }
+      } catch (e) {
+        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 段精修失败（不阻断,保留原文）：${(e as Error).message.slice(0, 80)}`);
+        continue;
+      }
+      const originalLen = ch.content.length;
+      if (refined.length < originalLen * 0.7) {
+        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 段精修后字数 ${refined.length} < 原文 ${originalLen} 的 70%,保留原文`);
+        continue;
+      }
+      if (refined.length > 100) {
+        chapterRepo.snapshot(ch.id);
+        chapterRepo.update(ch.id, { content: refined });
+      }
     }
-    if (refined.length > 100) chapterRepo.update(ch.id, { content: refined });
+  } catch (e) {
+    logTask(task.id, 'warn', `短篇末尾精修异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
   }
   projectRepo.updateWordCount(projectId);
 }

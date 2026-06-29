@@ -161,6 +161,12 @@ function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
 }) {
   const [logs, setLogs] = useState<TaskLog[] | null>(null);
   const [logLoading, setLogLoading] = useState(false);
+  // M3 修复(第十五轮): 任务日志实时滚动 - 监听 task:log SSE + 自动滚到底部
+  // 原: 仅 onExpand 时拉一次 logs,展开态新日志不自动追加,需手动折叠+展开
+  //   后端 logTask 已通过 SSE 推 task:log(daemon.ts:48-49),但前端 streamEvents 没监听
+  // 现: 监听 task:log,匹配当前 task.id 时把日志追加到 logs;用户在底部时自动滚到底
+  const logEndRef = useRef<HTMLDivElement | null>(null);
+  const userScrolledUpRef = useRef(false);
 
   const loadLogs = async () => {
     // BUG-8 修复：去掉「if (logs) return」永久缓存，每次展开都重新拉取，
@@ -171,8 +177,43 @@ function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
     finally { setLogLoading(false); }
   };
 
+  // M3: 监听 task:log SSE 事件,展开态实时追加日志
+  useEffect(() => {
+    if (!expanded) return;
+    const off = api.streamEvents((e: any) => {
+      if (e.type === 'task:log' && e.taskId === task.id) {
+        const newLog: TaskLog = {
+          id: `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          taskId: task.id,
+          level: e.level || 'info',
+          message: e.message || '',
+          createdAt: Date.now(),
+        };
+        setLogs(prev => prev ? [...prev, newLog] : [newLog]);
+      }
+    });
+    return off;
+  }, [expanded, task.id]);
+
+  // M3: 新日志时,若用户在底部则自动滚到底
+  useEffect(() => {
+    if (!expanded || !logs) return;
+    if (!userScrolledUpRef.current) {
+      logEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [logs, expanded]);
+
+  const onLogScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    // 距底部 < 30px 视为在底部
+    userScrolledUpRef.current = el.scrollHeight - el.scrollTop - el.clientHeight > 30;
+  };
+
   const onExpand = () => {
-    if (!expanded) loadLogs();
+    if (!expanded) {
+      userScrolledUpRef.current = false;
+      loadLogs();
+    }
     onToggle();
   };
 
@@ -240,7 +281,7 @@ function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
           )}
           {logLoading ? <Spinner className="h-4 w-4 text-paper-mute" /> :
             logs && logs.length === 0 ? <p className="text-xs text-paper-mute">暂无日志</p> :
-            <div className="max-h-64 space-y-0.5 overflow-y-auto font-mono text-[11px] leading-relaxed">
+            <div className="max-h-64 space-y-0.5 overflow-y-auto font-mono text-[11px] leading-relaxed" onScroll={onLogScroll}>
               {logs?.map(l => (
                 <div key={l.id} className="flex gap-2">
                   <span className="shrink-0 text-paper-mute">{new Date(l.createdAt).toLocaleTimeString()}</span>
@@ -248,6 +289,8 @@ function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
                   <span className="text-paper-dim">{l.message}</span>
                 </div>
               ))}
+              {/* M3: 锚点 div 用于 scrollIntoView 自动滚到底 */}
+              <div ref={logEndRef} />
             </div>}
         </div>
       )}

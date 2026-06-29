@@ -57,7 +57,7 @@ function detectExpiredForeshadows(foreshadowing: Foreshadow[], currentChapterIdx
 // 拆分为「稳定段」与「动态段」以最大化缓存命中：
 // - 稳定段（buildContextPrompt）：idea/setting/characters —— 跨章不变，进 systemStable
 // - 动态段（buildDynamicContext）：foreshadowing/characterState/chapterSummaries/memory/review —— 每章后更新，进 user 消息
-export function buildContextPrompt(projectId: string): string {
+export function buildContextPrompt(projectId: string, currentChapterIdx?: number): string {
   const state = stateRepo.get(projectId);
   if (!state) return '';
   const sections: string[] = [];
@@ -65,20 +65,44 @@ export function buildContextPrompt(projectId: string): string {
   if (state.setting) sections.push(`【世界观设定】\n${state.setting}`);
   if (state.characters) sections.push(`【角色档案】\n${state.characters}`);
   // H1 修复(第十二轮): 注入全书大纲到稳定段,防长篇中段主线遗忘
-  // 原: generateOutline 产物只落 task.checkpoint.outlineJson,正文生成 prompt 完全看不到全书故事线
-  // 现: 大纲落 state.outline,每章正文生成都能看到全书主线,防止跑题
+  // H4 修复(第十五轮): 大纲改滑动窗口注入(当前章 ± 5 章 + 当前卷全章 + 其他卷 premise)
+  //   原: 截断前 4000 字,200 章长篇丢 87% 大纲,后期章节看不到第 27 章后剧情规划
+  //   现: 按当前章 idx 滑动窗口,稳定段只含与当前章相关的大纲片段,跨章稳定 + 后期不跑题
+  //   无 currentChapterIdx 时降级到原截断策略(setup/scan 阶段调用)
   if (state.outline) {
-    // 大纲可能很长(200章 ~ 30000 字),截断到前 4000 字保稳定段不超长
-    const outlineSnippet = state.outline.length > 4000
-      ? state.outline.slice(0, 4000) + '\n...(全书大纲节选,完整大纲见 task.checkpoint)'
-      : state.outline;
-    sections.push(`【全书大纲主线】\n${outlineSnippet}`);
+    if (typeof currentChapterIdx === 'number' && state.volumeOutlines?.length) {
+      // 滑动窗口: 当前卷全章 + 邻近 ± 5 章 + 其他卷 premise
+      const curVol = state.volumeOutlines.find(v => currentChapterIdx >= v.chapterRange[0] && currentChapterIdx <= v.chapterRange[1]);
+      if (curVol) {
+        // 解析大纲 JSON 拿每章片段
+        try {
+          const items = JSON.parse(state.outline) as Array<{ title?: string; outline?: string; positioning?: string; coreEmotion?: string; hook?: string }>;
+          const windowStart = Math.max(0, currentChapterIdx - 5);
+          const windowEnd = Math.min(items.length, currentChapterIdx + 6);
+          const nearby = items.slice(windowStart, windowEnd)
+            .map((it, i) => `${windowStart + i + 1}. 《${it.title || ''}》${it.positioning ? `[${it.positioning}]` : ''}${it.coreEmotion ? `「${it.coreEmotion}」` : ''}: ${it.outline || ''}${it.hook ? `（钩子:${it.hook}）` : ''}`)
+            .join('\n');
+          const otherVols = state.volumeOutlines
+            .filter(v => v.idx !== curVol.idx)
+            .map(v => `· 第${v.idx + 1}卷《${v.title}》(${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章): ${v.premise}（${v.emotionArc}）`)
+            .join('\n');
+          sections.push(`【全书大纲 · 滑动窗口(第${windowStart + 1}-${windowEnd}章详记 + 其他卷 premise)】\n当前卷(第${curVol.idx + 1}卷)详记:\n${nearby}\n\n其他卷概览:\n${otherVols}`);
+        } catch {
+          // JSON 解析失败,降级到截断
+          const outlineSnippet = state.outline.length > 4000 ? state.outline.slice(0, 4000) + '\n...(全书大纲节选)' : state.outline;
+          sections.push(`【全书大纲主线】\n${outlineSnippet}`);
+        }
+      } else {
+        const outlineSnippet = state.outline.length > 4000 ? state.outline.slice(0, 4000) + '\n...(全书大纲节选)' : state.outline;
+        sections.push(`【全书大纲主线】\n${outlineSnippet}`);
+      }
+    } else {
+      // 无 currentChapterIdx 或无 volumeOutlines: 降级到截断(setup/scan 阶段)
+      const outlineSnippet = state.outline.length > 4000 ? state.outline.slice(0, 4000) + '\n...(全书大纲节选,完整大纲见 task.checkpoint)' : state.outline;
+      sections.push(`【全书大纲主线】\n${outlineSnippet}`);
+    }
   }
   // M2 修复(第十四轮): 注入题材元信息到稳定段,正文生成也能看到题材说明+情绪映射
-  // 原: buildGenreHint 仅在 generateSetup/generateOutline 注入,runSkill(write) 走 buildContextPrompt
-  //   → 正文阶段题材说明/情绪映射缺失,LLM 仅靠 SKILL_PROMPTS.write 通用路由表,题材特征引导不足
-  // 现: buildContextPrompt 反查 project.genreId → genreRepo 拿 description + emotionMap,注入稳定段
-  //   跨章不变 → 命中前缀缓存,不增额外 token 成本
   const project = projectRepo.get(projectId);
   if (project?.genreId) {
     const g = genreRepo.get(project.genreId);
@@ -118,8 +142,14 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
       return `${i + 1}. 第${f.plantedAt + 1}章埋设 ${imp}${overdue}：${f.desc}${expect}`;
     }).join('\n')}`);
   }
+  // M2 修复(第十五轮): expired 伏笔限最近 10 条,防长篇后期 prompt 被撑爆
+  // 原: expired 全量注入,400 章累积 50+ expired × 30 字 = 1500 字/章,且对当前章无指导意义
+  //   expired「不可再埋,可作废案处理」,LLM 不需看到全部历史废案,只需最近的作参考
+  // 现: 按 plantedAt 降序取最近 10 条,更早的归档到 memory
   if (expired.length > 0) {
-    sections.push(`【已过期伏笔 · 不可再埋，可作废案处理】\n${expired.map(f => `· 第${f.plantedAt + 1}章埋设：${f.desc}`).join('\n')}`);
+    const recentExpired = expired.slice().sort((a, b) => b.plantedAt - a.plantedAt).slice(0, 10);
+    const omittedExp = expired.length - recentExpired.length;
+    sections.push(`【已过期伏笔 · 不可再埋${omittedExp > 0 ? `（最近 ${recentExpired.length} 条,省略 ${omittedExp} 条更早）` : ''}】\n${recentExpired.map(f => `· 第${f.plantedAt + 1}章埋设：${f.desc}`).join('\n')}`);
   }
   if (paid.length > 0) {
     // D7 修复：paid 伏笔限制注入最近 20 条（按 paidAt 降序）
@@ -132,8 +162,14 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
   }
 
   // —— 角色实时状态（防人设漂移 / 位置穿帮）——
+  // M1 修复(第十五轮): characterState 限最近活跃 15 角色,防长篇后期 prompt 被撑爆
+  // 原: 全量注入,200 章长篇累积 50+ 角色 × 250 字 = 12500 字/章 → 200 章 250 万字浪费
+  // 现: 按 characterState 数组顺序(最近更新的在后)取末尾 15 个;实际最近活跃角色多在末尾
+  //   注:characterState 是 LLM 每章后 merge 的,末尾的是最近出场角色
   if (state.characterState && state.characterState.length > 0) {
-    sections.push(`【角色当前状态】\n${state.characterState.map(c => `· ${c.name}：位置「${c.location}」/ 状态「${c.mood}」/ 关系「${c.relationships}」`).join('\n')}`);
+    const recentChars = state.characterState.slice(-15);
+    const omitted = state.characterState.length - recentChars.length;
+    sections.push(`【角色当前状态${omitted > 0 ? `（最近 ${recentChars.length} 个,省略 ${omitted} 个更早角色）` : ''}】\n${recentChars.map(c => `· ${c.name}：位置「${c.location}」/ 状态「${c.mood}」/ 关系「${c.relationships}」`).join('\n')}`);
   }
 
   // —— 三层摘要归档（oh-story）：防上下文爆炸 ——
@@ -414,10 +450,12 @@ export interface GenerateParams {
   searchQuery?: string;     // 联网搜索查询词
   /** 多轮对话历史（不含当前 userPrompt）：按时间顺序的 user/assistant 消息，置于稳定段之后、当前 user 之前 */
   history?: ChatCompletionMessage[];
+  // H4 修复(第十五轮): 透传当前章 idx 给 buildContextPrompt 做大纲滑动窗口注入
+  currentChapterIdx?: number;
 }
 
 export async function* runSkill(params: GenerateParams): AsyncGenerator<string> {
-  const contextPrompt = buildContextPrompt(params.projectId);
+  const contextPrompt = buildContextPrompt(params.projectId, params.currentChapterIdx);
   const dynamicContext = buildDynamicContext(params.projectId);
   const recentMemory = buildRecentMemory(params.projectId);
 
@@ -582,11 +620,9 @@ export async function checkChapterQuality(opts: {
   let topicScore = 1.0;  // 默认通过（LLM 调用失败时不阻断生成）
   if (actualLen >= minHard) {
     // H1 修复(第十四轮): 跑题门增第 5 维「伏笔回收度」,relationship 章未回收扣分
-    // oh-story: 标 positioning=relationship 的章必须回收至少 1 个前文伏笔
-    // 原: 跑题门只查大纲符合度/定位符合度/剧情推进/人设一致 4 维,伏笔回收完全无校验
-    //   → LLM 写 relationship 章但忘了回收伏笔,引擎不发现 → 长篇伏笔堆积
-    // 现: 增第 5 维,relationship 章未回收扣分;综合分按 5 维平均
-    // 注入待回收伏笔列表让 LLM 可判断"是否回收了其中之一"
+    // H2 修复(第十五轮): 增第 6 维「AI 味检测」,正则预筛禁用词/翻转句/总结升华
+    // H3 修复(第十五轮): 增第 7 维「卷主线推进度」,注入 volumeCtx 校验是否推进卷核心冲突
+    // 待回收伏笔列表(供 LLM 判断本章是否回收)
     const pendingFs = (stateRepo.get(projectId)?.foreshadowing || [])
       .filter(f => f.status === 'planted')
       .slice(0, 15)
@@ -598,13 +634,51 @@ export async function checkChapterQuality(opts: {
     const recycleHint = positioning === 'relationship'
       ? `\n5. 伏笔回收度：本章为关系回收章,是否回收了至少 1 个上方【待回收伏笔】中的项（0-1,未回收给 ≤0.4,回收 1 个给 0.7+,回收多个给 1.0）`
       : `\n5. 伏笔回收度：本章非关系回收章,默认给 0.7（0-1）`;
+
+    // H2 修复(第十五轮): AI 味正则预筛(7 Gate 禁用模式),命中数过多 → 直接判 0.4 + 加 issue
+    // oh-story 7 Gate: A 禁用副词(仿佛/宛如/犹如/似乎/不禁/不由得/淡淡的/缓缓的)
+    //   B 翻转句式(不是 A 而是 B / 并非 A,而是 B / 这便是 X)
+    //   C 总结升华(本章.../至此.../就这样.../从此.../就这样,故事.../这便是...的全部)
+    //   D 排比三连(三句相同句式排比)
+    // 注入到 prompt 让 LLM 二次确认,综合分按 7 维平均
+    const AI_TASTE_PATTERNS = [
+      /仿佛/g, /宛如/g, /犹如/g, /似乎/g, /不禁/g, /不由得/g, /淡淡的/g, /缓缓的/g,
+      /不是.{0,30}而是/g, /并非.{0,30}而是/g, /这便是.{0,10}/g,
+      /本章[^。]*。/g, /至此[^。]*。/g, /就这样[^。]*。/g, /从此[^。]*。/g,
+    ];
+    let aiTasteHits = 0;
+    const hitPatterns: string[] = [];
+    for (const p of AI_TASTE_PATTERNS) {
+      const m = content.match(p);
+      if (m) { aiTasteHits += m.length; if (m.length > 0) hitPatterns.push(`${p.source}×${m.length}`); }
+    }
+    // 命中数 > 8 视为 AI 味重,直接判 0.4 + 加 issue 触发重写
+    const aiTasteScore = aiTasteHits > 12 ? 0.3 : (aiTasteHits > 8 ? 0.5 : (aiTasteHits > 4 ? 0.7 : 0.9));
+    if (aiTasteHits > 8) {
+      issues.push(`AI 味重：命中 ${aiTasteHits} 个禁用模式（${hitPatterns.slice(0, 3).join(' / ')}${hitPatterns.length > 3 ? '...' : ''}）`);
+    }
+    const aiTasteBlock = aiTasteHits > 4
+      ? `\n【已检测到 AI 味命中 ${aiTasteHits} 处】命中模式: ${hitPatterns.slice(0, 5).join(' / ') || '无'}\n请重点检查是否仍有上述禁用模式未修改。`
+      : '';
+
+    // H3 修复(第十五轮): 卷主线推进度(第 7 维),注入 volumeCtx.premise
+    // 原: prompt 写"本章须推进本卷核心冲突",但质量门不校验 → LLM 可写高分章节但完全脱离卷主线
+    // 现: 反查当前章所属卷,注入 premise + emotionArc,LLM 判断本章是否推进卷核心冲突
+    const curVol = stateRepo.get(projectId)?.volumeOutlines?.find(v => chapterIdx >= v.chapterRange[0] && chapterIdx <= v.chapterRange[1]);
+    const volMainLineBlock = curVol
+      ? `\n【本卷核心冲突】第${curVol.idx + 1}卷《${curVol.title}》: ${curVol.premise}（情绪弧线: ${curVol.emotionArc}）`
+      : '';
+    const volMainLineHint = curVol
+      ? `\n7. 卷主线推进度：本章是否推进了上方【本卷核心冲突】（0-1,完全脱离给 ≤0.3,部分推进给 0.5-0.7,核心推进给 0.9-1.0）`
+      : `\n7. 卷主线推进度：无卷大纲,默认给 0.7（0-1）`;
+
     const prompt = `请判断以下章节正文是否符合大纲要求。
 
 【章节信息】第 ${chapterIdx + 1} 章《${chapterTitle}》
 【章节定位】${positioning || '未指定'}
 【核心情绪】${coreEmotion || '未指定'}
 【本章大纲】
-${outline}${recycleBlock}
+${outline}${recycleBlock}${volMainLineBlock}${aiTasteBlock}
 
 【正文片段】（前 1500 字）
 ${content.slice(0, 1500)}
@@ -614,14 +688,15 @@ ${content.slice(0, 1500)}
 2. 章节定位符合度：是否体现 ${positioning || '通用'} 的特征（0-1）
 3. 剧情推进度：是否有实质推进，非重复/非注水（0-1）
 4. 人设一致性：角色行为是否符合前文人设（0-1，无法判断时给 0.7）${recycleHint}
+6. AI 味度：本章是否仍含禁用副词/翻转句式/总结升华/排比三连等 AI 套路（0-1,0=全是 AI 味,1=完全原创）${volMainLineHint}
 
-输出 JSON：{"score": <0-1 综合分,5 维平均>, "reason": "<一句话说明不符合之处>"}
+输出 JSON：{"score": <0-1 综合分,6 维平均(大纲+定位+推进+人设+伏笔+AI味+卷主线)>, "reason": "<一句话说明不符合之处>"}
 只输出 JSON，不要其他文字。`;
 
     const ctxPrompt = buildContextPrompt(projectId);
     const systemStable = ctxPrompt
-      ? `${ctxPrompt}\n\n你是严苛的网文质检编辑，擅长判断章节是否跑题。输出必须是合法 JSON。`
-      : '你是严苛的网文质检编辑，擅长判断章节是否跑题。输出必须是合法 JSON。';
+      ? `${ctxPrompt}\n\n你是严苛的网文质检编辑，擅长判断章节是否跑题与 AI 味。输出必须是合法 JSON。`
+      : '你是严苛的网文质检编辑，擅长判断章节是否跑题与 AI 味。输出必须是合法 JSON。';
     const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
 
     try {
@@ -634,11 +709,13 @@ ${content.slice(0, 1500)}
       if (match) {
         const parsed = JSON.parse(match[0]);
         if (typeof parsed.score === 'number') {
-          topicScore = parsed.score;
-          if (parsed.score < 0.6) {
-            issues.push(`跑题风险：综合分 ${parsed.score.toFixed(2)} < 0.6${parsed.reason ? `（${parsed.reason}）` : ''}`);
-          } else if (parsed.score < 0.8 && parsed.reason) {
-            issues.push(`质量轻微不达标：${parsed.score.toFixed(2)}（${parsed.reason}，不重写）`);
+          // H2: AI 味命中过多时,把综合分压低(避免 LLM 给高分但实际 AI 味重)
+          const finalScore = aiTasteHits > 8 ? Math.min(parsed.score, aiTasteScore) : parsed.score;
+          topicScore = finalScore;
+          if (finalScore < 0.6) {
+            issues.push(`跑题/AI 味风险：综合分 ${finalScore.toFixed(2)} < 0.6${parsed.reason ? `（${parsed.reason}）` : ''}`);
+          } else if (finalScore < 0.8 && parsed.reason) {
+            issues.push(`质量轻微不达标：${finalScore.toFixed(2)}（${parsed.reason}，不重写）`);
           }
         }
       }

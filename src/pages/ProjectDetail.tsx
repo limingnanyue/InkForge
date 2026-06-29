@@ -11,7 +11,7 @@ import GenreSelect from '@/components/GenreSelect';
 import type { Project, Chapter, ChapterNode, AgentState, ProjectType, ProviderKind } from '@shared/types';
 import { cn } from '@/lib/utils';
 import ChapterTree, { flatten, countSnapshots, mutateNode } from './ChapterTree';
-import { POSITIONING_LABEL } from '@/lib/positioning';
+import { POSITIONING_LABEL, POSITIONING_TARGET_RATIO, POSITIONING_BAR_COLOR, POSITIONING_ORDER } from '@/lib/positioning';
 
 const STATUS: Record<string, [string, string]> = {
   draft: ['badge-mute', '草稿'], generating: ['badge-amber', '生成中'], done: ['badge-green', '完成'],
@@ -1065,6 +1065,8 @@ export default function ProjectDetail() {
               </div>
 
               {/* 卷级大纲（oh-story 长篇分卷结构） */}
+              {/* H5 修复(第十五轮): 每卷加 compactedSummary 折叠区,让用户可见远期压缩结果 */}
+              {/* M3 修复(第十四轮): keyForeshadows 已注入 prompt,此处也展示 */}
               {agentState?.volumeOutlines && agentState.volumeOutlines.length > 0 && (
                 <div className="panel-elevated p-5">
                   <h3 className="mb-3 font-display text-base text-paper">卷级大纲</h3>
@@ -1075,16 +1077,90 @@ export default function ProjectDetail() {
                           <span className="text-sm font-medium text-paper">第 {v.idx + 1} 卷 《{v.title}》</span>
                           <span className="badge badge-mute">{v.emotionArc}</span>
                           <span className="text-[11px] text-paper-mute">第 {v.chapterRange[0] + 1}-{v.chapterRange[1] + 1} 章</span>
+                          {/* H5: compactedSummary 状态 badge */}
+                          {v.compactedSummary
+                            ? <span className="badge badge-green" title="远期摘要已 LLM 压缩">已压缩</span>
+                            : <span className="badge badge-mute" title="远期摘要走采样策略">未压缩</span>}
                         </div>
                         <p className="text-xs leading-relaxed text-paper-dim">{v.premise}</p>
                         {v.keyForeshadows.length > 0 && (
                           <p className="mt-1 text-[11px] text-paper-mute">伏笔集群：{v.keyForeshadows.join(' / ')}</p>
+                        )}
+                        {/* H5: 远期压缩摘要折叠展示 */}
+                        {v.compactedSummary && (
+                          <details className="mt-2">
+                            <summary className="cursor-pointer text-[11px] text-celadon hover:text-celadon-400">
+                              远期压缩摘要（{v.compactedSummary.length} 字）▶
+                            </summary>
+                            <p className="mt-1 rounded bg-ink-900/50 p-2 text-[11px] leading-relaxed text-paper-dim">
+                              {v.compactedSummary}
+                            </p>
+                          </details>
                         )}
                       </li>
                     ))}
                   </ul>
                 </div>
               )}
+
+              {/* M4 修复(第十五轮): 章节定位分布柱状图(实际 vs oh-story 目标) */}
+              {/* 让用户一眼看到 LLM 实际生成的定位分布是否符合 oh-story 18%/45%/8%/8%/10%/5% 目标 */}
+              {(() => {
+                const flat = flatten(tree);
+                const withPos = flat.filter(c => c.positioning);
+                if (withPos.length === 0) return null;
+                const total = withPos.length;
+                const counts: Record<string, number> = {};
+                POSITIONING_ORDER.forEach(k => { counts[k] = 0; });
+                withPos.forEach(c => { if (c.positioning) counts[c.positioning]++; });
+                return (
+                  <div className="panel-elevated p-5">
+                    <h3 className="mb-1 font-display text-base text-paper">章节定位分布</h3>
+                    <p className="mb-4 text-[11px] text-paper-mute">
+                      实际分布 vs oh-story 目标比例（共 {total} 章已分配定位）· 偏离 &gt;30% 标红
+                    </p>
+                    <div className="grid grid-cols-6 gap-2">
+                      {POSITIONING_ORDER.map(k => {
+                        const actual = counts[k];
+                        const actualRatio = actual / total;
+                        const targetRatio = POSITIONING_TARGET_RATIO[k];
+                        const deviate = Math.abs(actualRatio - targetRatio) > 0.30;
+                        const actualH = `${Math.min(100, actualRatio * 100 * 2)}px`;  // ×2 放大柱高可视
+                        const targetH = `${Math.min(100, targetRatio * 100 * 2)}px`;
+                        return (
+                          <div key={k} className="flex flex-col items-center gap-1">
+                            <div className="flex h-[100px] w-full items-end justify-center gap-1">
+                              {/* 实际柱 */}
+                              <div
+                                className="w-3 rounded-t"
+                                style={{ height: actualH, backgroundColor: deviate ? 'var(--cinnabar)' : POSITIONING_BAR_COLOR[k] }}
+                                title={`实际 ${actual} 章（${(actualRatio * 100).toFixed(0)}%）`}
+                              />
+                              {/* 目标柱(虚线对照) */}
+                              <div
+                                className="w-3 rounded-t border border-dashed border-paper-mute/50 bg-paper-mute/10"
+                                style={{ height: targetH }}
+                                title={`目标 ${(targetRatio * 100).toFixed(0)}%`}
+                              />
+                            </div>
+                            <span className={cn('text-[9px] leading-tight text-center', deviate ? 'text-cinnabar font-medium' : 'text-paper-mute')}>
+                              {POSITIONING_LABEL[k][1]}
+                            </span>
+                            <span className={cn('text-[9px] font-mono', deviate ? 'text-cinnabar' : 'text-paper-dim')}>
+                              {actual}/{total}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-3 flex items-center gap-4 text-[10px] text-paper-mute">
+                      <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm bg-celadon" />实际</span>
+                      <span className="flex items-center gap-1"><span className="inline-block h-2 w-3 rounded-sm border border-dashed border-paper-mute/50 bg-paper-mute/10" />oh-story 目标</span>
+                      <span className="text-cinnabar">偏离 &gt;30% 标红</span>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>
