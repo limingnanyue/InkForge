@@ -14,7 +14,7 @@ const KIND_LABEL: Record<ProviderKind, string> = {
   openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini',
   glm: '智谱 GLM', deepseek: 'DeepSeek', doubao: '豆包',
   qwen: '通义', kimi: 'Kimi', hunyuan: '混元', ernie: '文心',
-  ollama: 'Ollama', kilo: 'Kilo 公益', custom: '自定义',
+  ollama: 'Ollama', kilo: 'Kilo 公益', kkai: 'KKAPI 网关', custom: '自定义',
 };
 
 // 厂商分组：海外 / 国内 / 本地 / 公益
@@ -22,7 +22,7 @@ const KIND_CATEGORY: Record<ProviderKind, 'overseas' | 'domestic' | 'local' | 'p
   openai: 'overseas', anthropic: 'overseas', gemini: 'overseas',
   deepseek: 'domestic', qwen: 'domestic', glm: 'domestic',
   doubao: 'domestic', kimi: 'domestic', hunyuan: 'domestic', ernie: 'domestic',
-  ollama: 'local', kilo: 'public', custom: 'local',
+  ollama: 'local', kilo: 'public', kkai: 'overseas', custom: 'local',
 };
 const CATEGORY_PRIORITY: Record<string, number> = { overseas: 0, domestic: 1, public: 2, local: 3 };
 
@@ -394,6 +394,7 @@ const KIND_DEFAULTS: Record<ProviderKind, { name: string; baseUrl: string; model
   ernie:     { name: '百度文心 ERNIE',    baseUrl: 'https://qianfan.baidubce.com/v2',                       models: ['ernie-bot-5.1', 'ernie-speed-5.1'] },
   ollama:    { name: '本地 Ollama',      baseUrl: 'http://localhost:11434/v1',                              models: ['llama-4-scout-17b', 'qwen2.5-32b-instruct', 'deepseek-v4'] },
   kilo:      { name: 'Kilo 公益聚合',     baseUrl: 'https://api.kilo.ai/api/openrouter',                     models: ['kilo-auto/free', 'qwen/qwen3.6-plus:free', 'minimax/minimax-m2.5:free', 'nvidia/nemotron-3-super-120b-a12b:free', 'arcee-ai/trinity-large-preview:free', 'stepfun/step-3.5-flash:free'] },
+  kkai:      { name: 'KKAPI 网关聚合',    baseUrl: 'https://api.kkaiapi.com/v1',                              models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'claude-4.6-sonnet-20260217', 'gemini-2.5-pro', 'deepseek-v4-pro', 'qwen3.7-turbo', 'gpt-image-2', 'dall-e-3', 'sd3-large', 'flux-pro-1.1'] },
   custom:    { name: '自定义',           baseUrl: '',                                                       models: [] },
 };
 
@@ -464,6 +465,9 @@ function AddProviderModal({ open, onClose, onAdded }: { open: boolean; onClose: 
               </optgroup>
               <optgroup label="公益免费">
                 <option value="kilo">Kilo 公益聚合（OpenAI 兼容，免费配额）</option>
+              </optgroup>
+              <optgroup label="网关聚合">
+                <option value="kkai">KKAPI 网关（OpenAI 兼容，文本+图像多模型中转）</option>
               </optgroup>
             </select>
           </Field>

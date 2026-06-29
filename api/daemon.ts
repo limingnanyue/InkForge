@@ -284,7 +284,8 @@ function tokenCharRatio(providerId?: string): number {
   let ratio = 1.5;
   if (provider) {
     const CN_KINDS: ProviderKind[] = ['deepseek', 'qwen', 'glm', 'doubao', 'kimi', 'hunyuan', 'ernie'];
-    const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo'];
+    // KKAPI 走 OpenAI 兼容网关，按 OpenAI 标准计费 → 1.2×（与 kilo 一致）
+    const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo', 'kkai'];
     if (CN_KINDS.includes(provider.kind)) ratio = 1.5;
     else if (LIGHT_KINDS.includes(provider.kind)) ratio = 1.2;
     else ratio = 1.5;  // ollama/custom

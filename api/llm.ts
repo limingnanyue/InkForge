@@ -279,7 +279,7 @@ async function* streamOpenAICompatible(provider: Provider, opts: LLMOptions): As
   //   智谱 GLM / 豆包 Doubao / 混元 Hunyuan / 文心 ERNIE 兼容层 2026 年起均支持 OpenAI 标准 stream_options
   //   R3 修复：原跳过这 4 家导致 usage 永久不入库（token 统计失真）
   //   stream_options 是 OpenAI 标准字段，不支持的厂商通常会忽略而非 400
-  const USAGE_OK = new Set(['openai', 'deepseek', 'qwen', 'kimi', 'kilo', 'ollama', 'custom', 'glm', 'doubao', 'hunyuan', 'ernie']);
+  const USAGE_OK = new Set(['openai', 'deepseek', 'qwen', 'kimi', 'kilo', 'kkai', 'ollama', 'custom', 'glm', 'doubao', 'hunyuan', 'ernie']);
   if (USAGE_OK.has(provider.kind)) {
     body.stream_options = { include_usage: true };
   }

@@ -13,11 +13,11 @@ const ok = (res: Response, data?: unknown) => res.json({ ok: true, data });
 const fail = (res: Response, code: string, message: string, status = 400) =>
   res.status(status).json({ ok: false, error: { code, message } });
 
-// 全部 13 种 kind（2026 年 6 月）
+// 全部 14 种 kind（2026 年 6 月）
 const VALID_KINDS: ProviderKind[] = [
   'openai', 'anthropic', 'gemini',
   'deepseek', 'qwen', 'glm', 'doubao', 'kimi', 'hunyuan', 'ernie',
-  'kilo', 'ollama', 'custom',
+  'kilo', 'kkai', 'ollama', 'custom',
 ];
 
 router.get('/providers', (_req: Request, res: Response) => ok(res, providerRepo.list()));

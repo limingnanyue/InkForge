@@ -157,6 +157,7 @@ export type ProviderKind =
   | 'openai' | 'anthropic' | 'gemini'
   | 'deepseek' | 'qwen' | 'glm' | 'doubao' | 'kimi' | 'hunyuan' | 'ernie'
   | 'kilo'  // Kilo AI 公益聚合（OpenAI 兼容，转 OpenRouter，每日免费配额）
+  | 'kkai'  // KKAPI 网关聚合（OpenAI 兼容，https://kkaiapi.com/，文本+图像多模型中转）
   | 'ollama' | 'custom';
 
 // 联网搜索配置（接 anysearch MCP）

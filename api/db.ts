@@ -188,6 +188,7 @@ export function initDb(): void {
   migrateLegacySchema();
   seedDefaultProviders();
   ensureKiloProvider();
+  ensureKkaiProvider();
   seedBuiltinGenres();
 }
 
@@ -307,6 +308,34 @@ function ensureKiloProvider(): void {
     JSON.stringify(['kilo-auto/free', 'qwen/qwen3.6-plus:free', 'minimax/minimax-m2.5:free',
                     'nvidia/nemotron-3-super-120b-a12b:free', 'arcee-ai/trinity-large-preview:free',
                     'stepfun/step-3.5-flash:free']),
+    '{}',
+    0,
+    now
+  );
+}
+
+// 增量补丁：旧 DB 已 seed 过 provider 但缺少 KKAPI 网关聚合（2026-06 新增 kind）
+// 幂等：若已有 kind='kkai' 的 provider 则跳过
+// KKAPI（https://kkaiapi.com/）是 OpenAI 兼容的网关聚合，中转 OpenAI/Claude/Gemini/DALL·E/SDXL 等，
+// 文本与图像模型走统一 /v1/chat/completions 与 /v1/images/generations 端点
+function ensureKkaiProvider(): void {
+  const row = db.prepare("SELECT id FROM provider WHERE kind='kkai' LIMIT 1").get() as { id: string } | undefined;
+  if (row) return;
+  const now = Date.now();
+  db.prepare(
+    'INSERT INTO provider (id, name, kind, base_url, api_key, models, web_search_json, is_default, created_at) VALUES (?,?,?,?,?,?,?,?,?)'
+  ).run(
+    cryptoRandomId(),
+    'KKAPI 网关聚合',
+    'kkai',
+    'https://api.kkaiapi.com/v1',
+    '',
+    // 文本模型 + 图像模型（gpt-image-2 / dall-e-3 / sd3-large / flux-pro）
+    JSON.stringify([
+      'gpt-5.6-sol', 'gpt-5.6-terra', 'claude-4.6-sonnet-20260217',
+      'gemini-2.5-pro', 'deepseek-v4-pro', 'qwen3.7-turbo',
+      'gpt-image-2', 'dall-e-3', 'sd3-large', 'flux-pro-1.1',
+    ]),
     '{}',
     0,
     now

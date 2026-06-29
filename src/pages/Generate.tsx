@@ -28,22 +28,24 @@ const KIND_PRESET: Record<GenerateKind, {
   book: {
     label: '成书', cap: 5_000_000, default: 300_000,
     desc: '长篇连载，多卷结构（最高 500 万字）', icon: BookOpen,
-    budgetMin: 1500, budgetMax: 8000, budgetDefault: 2500, budgetStep: 100,
+    budgetMin: 1500, budgetMax: 10000, budgetDefault: 2500, budgetStep: 100,
     budgetPresets: [
       { label: '短章流', value: 1500 },
       { label: '标准', value: 2500 },
       { label: '厚重', value: 3500 },
       { label: '大章', value: 5000 },
+      { label: '超大章', value: 8000 },
     ],
   },
   short: {
     label: '成短篇', cap: 200_000, default: 60_000,
     desc: '短篇速成，单线推进', icon: FileText,
-    budgetMin: 2000, budgetMax: 10000, budgetDefault: 5000, budgetStep: 500,
+    budgetMin: 2000, budgetMax: 12000, budgetDefault: 5000, budgetStep: 500,
     budgetPresets: [
       { label: '紧凑', value: 3000 },
       { label: '标准', value: 5000 },
       { label: '厚实', value: 7000 },
+      { label: '大段', value: 10000 },
     ],
   },
 };
@@ -276,6 +278,12 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
             value={matchedPreset ? form.chapterWordBudget : -1}
             onChange={v => set('chapterWordBudget', v as number)}
           />
+          {/* 自定义提示：当前值不在预设档时显式标识 */}
+          {!matchedPreset && (
+            <p className="mt-1.5 text-[10px] text-amber-deep">
+              · 自定义值 {form.chapterWordBudget} 字（不在预设档，将在 {preset.budgetMin}-{preset.budgetMax} 范围内生效）
+            </p>
+          )}
           {/* 滑块 + 数值 */}
           <div className="mt-3 flex items-center gap-3">
             <Slider

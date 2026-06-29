@@ -81,9 +81,9 @@ router.post('/', (req: Request, res: Response) => {
   const limit = kind === 'book' ? MAX_BOOK : MAX_SHORT;
   if (!targetWords || targetWords <= 0) return fail(res, 'INVALID', '目标字数必填');
   if (targetWords > limit) return fail(res, 'INVALID', `${kind === 'book' ? '成书' : '成短篇'}上限为 ${limit.toLocaleString()} 字`);
-  // 每章字数预算范围校验（book 1500-8000，short 2000-10000）
+  // 每章字数预算范围校验（book 1500-10000，short 2000-12000）
   const budgetMin = kind === 'book' ? 1500 : 2000;
-  const budgetMax = kind === 'book' ? 8000 : 10000;
+  const budgetMax = kind === 'book' ? 10000 : 12000;
   if (chapterWordBudget != null && (typeof chapterWordBudget !== 'number' || chapterWordBudget < budgetMin || chapterWordBudget > budgetMax)) {
     return fail(res, 'INVALID', `每章字数预算须在 ${budgetMin}-${budgetMax} 之间`);
   }

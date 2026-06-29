@@ -8,7 +8,7 @@ import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
 import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch, Field, SegmentedControl, Slider } from '@/components/ui';
 import GenreSelect from '@/components/GenreSelect';
-import type { Project, Chapter, ChapterNode, AgentState, ProjectType } from '@shared/types';
+import type { Project, Chapter, ChapterNode, AgentState, ProjectType, ProviderKind } from '@shared/types';
 import { cn } from '@/lib/utils';
 import ChapterTree, { flatten, countSnapshots, mutateNode } from './ChapterTree';
 
@@ -40,7 +40,7 @@ const fmtDate = (t: number) => new Date(t).toLocaleString('zh-CN', {
 export default function ProjectDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const { setCurrentProject, loadTasks, currentModel, currentProviderId } = useApp();
+  const { setCurrentProject, loadTasks, currentModel, currentProviderId, providers } = useApp();
   const [project, setProject] = useState<Project | null>(null);
   const [tree, setTree] = useState<ChapterNode[]>([]);
   const [selected, setSelected] = useState<ChapterNode | null>(null);
@@ -306,6 +306,12 @@ export default function ProjectDetail() {
   // 书名：默认跟随 project.title，用户手动改动后保留用户值
   const [coverBookTitle, setCoverBookTitle] = useState<string>('');
   const coverTitleTouchedRef = useRef(false);
+  // BUG3 修复: 封面预览图支持选择图像供应商
+  // 原 bug: onGenerateCoverPreview 硬编码调用 TRAE 系统 text_to_image 端点,
+  //        用户无法切换到自配的 OpenAI/KKAPI 等支持 DALL·E/SD/FLUX 的供应商
+  // 现方案: 加图像供应商下拉(默认 TRAE 兜底,可切换到 OpenAI 兼容网关的 /images/generations)
+  // 选值格式: `${providerId}::${model}` 或 '' 表示走 TRAE 系统默认
+  const [coverImageProvider, setCoverImageProvider] = useState<string>('');
   // G6 修复：脏标记防 coverDraft 被重拉的 agentState.cover 覆盖未保存编辑
   // 触发场景：用户编辑 textarea 未 blur → 切 Tab 触发 loadState 重拉 → effect 把 coverDraft 重置为服务端旧值
   const coverDirtyRef = useRef(false);
@@ -314,6 +320,8 @@ export default function ProjectDetail() {
     coverTitleTouchedRef.current = false;
     setCoverBookTitle('');
     coverDirtyRef.current = false;
+    // BUG3: 切项目重置图像供应商选择,避免上一项目选定的 provider::model 串到新项目
+    setCoverImageProvider('');
   }, [id]);
   useEffect(() => {
     if (!coverTitleTouchedRef.current && project) {
@@ -431,23 +439,77 @@ export default function ProjectDetail() {
     try {
       const enPrompt = extractEnPrompt(coverDraft);
       if (!enPrompt) { toast('无法从提示词中提取英文 Prompt', 'err'); return; }
-      // 调 text_to_image API（系统提供）
-      const url = `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=${encodeURIComponent(enPrompt)}&image_size=portrait_4_3`;
-      const resp = await fetch(url, { signal: ac.signal });
-      if (!resp.ok) throw new Error(`图片生成失败（${resp.status}）`);
-      // 响应是图片二进制
-      const blob = await resp.blob();
-      const objectUrl = URL.createObjectURL(blob);
+
+      // BUG3 修复: 支持选择图像供应商。两条路径:
+      //   A. coverImageProvider 选了 provider::model → 直连该 provider 的 /images/generations(OpenAI 兼容)
+      //   B. coverImageProvider 空 → 兜底走 TRAE 系统 text_to_image 端点
+      // 选 provider 路径: 前端直连(baseUrl + apiKey 在 store 已暴露),响应取 data[0].b64_json 转 dataURL
+      let objectUrl: string | null = null;
+      let imageDataUrl: string | null = null;
+      const sel = coverImageProvider;
+      const sepIdx = sel ? sel.indexOf('::') : -1;
+      const selProvider = sepIdx > 0 ? providers.find(p => p.id === sel.slice(0, sepIdx)) : undefined;
+      const selModel = sepIdx > 0 ? sel.slice(sepIdx + 2) : '';
+      if (selProvider && selModel) {
+        // 路径 A: OpenAI 兼容 images/generations
+        const ep = selProvider.baseUrl.replace(/\/+$/, '') + '/images/generations';
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (selProvider.kind !== 'ollama' && selProvider.kind !== 'kilo') {
+          headers['Authorization'] = `Bearer ${selProvider.apiKey}`;
+        }
+        // OpenAI 标准请求体: model / prompt / n / size / response_format
+        // dall-e-3 强制要求 size∈{1024x1024,1792x1024,1024x1792}; gpt-image-2 / SD / FLUX 走 1024x1024
+        const resp = await fetch(ep, {
+          method: 'POST',
+          headers,
+          signal: ac.signal,
+          body: JSON.stringify({
+            model: selModel,
+            prompt: enPrompt,
+            n: 1,
+            size: '1024x1024',
+            response_format: 'b64_json',
+          }),
+        });
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          throw new Error(`${selProvider.name} · ${selModel} 图片生成失败（${resp.status}）${errText ? '：' + errText.slice(0, 200) : ''}`);
+        }
+        const json = await resp.json() as { data?: Array<{ b64_json?: string; url?: string }> };
+        const item = json.data?.[0];
+        if (!item) throw new Error('图像供应商未返回 data 字段');
+        if (item.b64_json) {
+          imageDataUrl = `data:image/png;base64,${item.b64_json}`;
+        } else if (item.url) {
+          // 部分 provider 返回 url,前端再下载
+          const imgResp = await fetch(item.url, { signal: ac.signal });
+          if (!imgResp.ok) throw new Error(`下载图像失败（${imgResp.status}）`);
+          const blob = await imgResp.blob();
+          objectUrl = URL.createObjectURL(blob);
+        } else {
+          throw new Error('图像供应商返回 data 字段不含 b64_json 或 url');
+        }
+      } else {
+        // 路径 B: TRAE 系统默认端点（兜底）
+        const url = `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=${encodeURIComponent(enPrompt)}&image_size=portrait_4_3`;
+        const resp = await fetch(url, { signal: ac.signal });
+        if (!resp.ok) throw new Error(`图片生成失败（${resp.status}）`);
+        const blob = await resp.blob();
+        objectUrl = URL.createObjectURL(blob);
+      }
+
+      // canvas 叠加书名 + 作者（统一处理两条路径的图源）
       // B1 修复: try/finally 确保 objectUrl 在任何路径(包括 overlayTextOnImage 抛错)下都被释放
       try {
-        // 用 canvas 叠加书名+作者
         const titledAuthor = coverAuthor.trim() || '';
         const titledBook = coverBookTitle.trim() || project.title;
-        const dataUrl = await overlayTextOnImage(objectUrl, titledBook, titledAuthor);
+        const src = imageDataUrl || objectUrl;
+        if (!src) throw new Error('未拿到图片数据');
+        const dataUrl = await overlayTextOnImage(src, titledBook, titledAuthor);
         setCoverPreviewUrl(dataUrl);
-        toast('封面预览图已生成');
+        toast(selProvider ? `已通过 ${selProvider.name} · ${selModel} 生成预览图` : '封面预览图已生成');
       } finally {
-        URL.revokeObjectURL(objectUrl);
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
       }
     } catch (e) {
       if ((e as Error).name === 'AbortError') return;
@@ -710,6 +772,38 @@ export default function ProjectDetail() {
                           disabled={genCoverBusy}
                         />
                       </div>
+                    </div>
+                    {/* BUG3 修复: 图像供应商选择,默认 TRAE 系统兜底,可选 OpenAI 兼容网关的图像模型 */}
+                    <div className="mb-2">
+                      <label className="mb-1 block text-[10px] text-paper-mute">图像供应商（用于「生成预览图」）</label>
+                      <select
+                        className="input py-1.5 text-xs"
+                        value={coverImageProvider}
+                        onChange={e => setCoverImageProvider(e.target.value)}
+                        disabled={coverPreviewBusy}
+                      >
+                        <option value="">系统默认（TRAE 文生图）</option>
+                        {(() => {
+                          // 仅展示 OpenAI 兼容且 models 中含图像模型的 provider
+                          // 图像模型关键字: image / dall-e / sd3 / sdxl / flux / seedream / cogview / kolors / midjourney
+                          const IMAGE_RE = /(image|dall-?e|sd3|sdxl|stable-?diffusion|flux|seedream|cogview|kolors|midjourney|imagen)/i;
+                          const COMPATIBLE: ProviderKind[] = ['openai', 'kkai', 'custom', 'kilo'];
+                          const list = providers
+                            .filter(p => COMPATIBLE.includes(p.kind))
+                            .flatMap(p => p.models
+                              .filter(m => IMAGE_RE.test(m))
+                              .map(m => ({ providerId: p.id, providerName: p.name, model: m })));
+                          return list.map(o => (
+                            <option key={o.providerId + o.model} value={`${o.providerId}::${o.model}`}>
+                              {o.providerName} · {o.model}
+                            </option>
+                          ));
+                        })()}
+                      </select>
+                      <p className="mt-1 text-[10px] text-paper-mute">
+                        切换到自配供应商（OpenAI / KKAPI / 自定义 / Kilo）后,将走该供应商的 <code className="font-mono">/images/generations</code> 接口。
+                        需在「模型中心」配置 baseUrl 与 API Key。
+                      </p>
                     </div>
                     <textarea
                       className="input min-h-[140px] resize-y font-mono text-sm leading-relaxed"
@@ -979,11 +1073,11 @@ export default function ProjectDetail() {
         {project && (() => {
           const isShort = project.type === 'short';
           const min = isShort ? 2000 : 1500;
-          const max = isShort ? 10000 : 8000;
+          const max = isShort ? 12000 : 10000;
           const step = isShort ? 500 : 100;
           const presets = isShort
-            ? [{ label: '紧凑', value: 3000 }, { label: '标准', value: 5000 }, { label: '厚实', value: 7000 }]
-            : [{ label: '短章流', value: 1500 }, { label: '标准', value: 2500 }, { label: '厚重', value: 3500 }, { label: '大章', value: 5000 }];
+            ? [{ label: '紧凑', value: 3000 }, { label: '标准', value: 5000 }, { label: '厚实', value: 7000 }, { label: '大段', value: 10000 }]
+            : [{ label: '短章流', value: 1500 }, { label: '标准', value: 2500 }, { label: '厚重', value: 3500 }, { label: '大章', value: 5000 }, { label: '超大章', value: 8000 }];
           const matchedPreset = presets.find(p => p.value === continueBudget);
           const estChapters = Math.max(1, Math.ceil(project.targetWords / continueBudget));
           return (
@@ -999,6 +1093,11 @@ export default function ProjectDetail() {
                   value={matchedPreset ? continueBudget : -1}
                   onChange={v => setContinueBudget(v as number)}
                 />
+                {!matchedPreset && (
+                  <p className="mt-1.5 text-[10px] text-amber-deep">
+                    · 自定义值 {continueBudget} 字（不在预设档，将在 {min}-{max} 范围内生效）
+                  </p>
+                )}
               </Field>
               {/* 滑块 + 数值 */}
               <div className="flex items-center gap-3">
