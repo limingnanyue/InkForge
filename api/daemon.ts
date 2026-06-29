@@ -472,6 +472,13 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       if (total > 0) logTask(task.id, 'info', `补全剧情记忆 ${done}/${total}（重启回填）`);
     });
     if (recon.backfilled > 0) logTask(task.id, 'info', `补全 ${recon.backfilled} 章缺失记忆完成`);
+    // M2 修复(第十七轮): reconcileState 返回 issues 聚合,重启回填期的伏笔误埋/状态告警也进 task_log
+    if (recon.issues.length > 0) {
+      for (const issue of recon.issues.slice(0, 20)) {  // 限制最多 20 条,防 80 章回填刷屏
+        logTask(task.id, 'warn', `重启回填: ${issue}`);
+      }
+      if (recon.issues.length > 20) logTask(task.id, 'warn', `重启回填另有 ${recon.issues.length - 20} 条 issues 未显示`);
+    }
   }
 
   for (let i = startIdx; i < chapters.length; i++) {
@@ -634,8 +641,10 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
             temperature: 0.4, maxTokens: 400,
           });
           if (reviewText && reviewText.length > 20) {
-            const curState = stateRepo.get(projectId);
-            stateRepo.update(projectId, { ...(curState || {}), review: reviewText.slice(0, 800) });
+            // L1 修复(第十七轮): 删 curState 展开,直接传 { review },stateRepo.update 内部已做浅合并
+            // 原: { ...(curState || {}), review } 把 foreshadowing/characterState 等大数组也传入
+            //   → 触发整个对象 JSON.stringify 重复序列化,200 章项目每 10 章浪费数十 KB
+            stateRepo.update(projectId, { review: reviewText.slice(0, 800) });
             logTask(task.id, 'info', `第 ${i + 1} 章后卷级审稿完成,已更新 state.review`);
           }
         }

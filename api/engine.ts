@@ -11,6 +11,11 @@ import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, Cha
 // 题材元信息注入: 反查 genreId 拿 description + emotionMap,拼成 prompt 段
 // 原实现: 主线生成只用 config.genre(label),题材说明/情绪映射完全未注入,LLM 写作风格缺少题材特征引导
 // 现改进: 世界观/分卷大纲/全书大纲 3 处 prompt 都注入题材元信息,让生成更有题材针对性
+
+// M1 修复(第十七轮): 滑动窗口大纲 JSON.parse 失败 warn 去重 Set
+// 避免每章 render 都打 warn 刷屏,每个 projectId 仅打一次
+const _outlineParseWarnedProjectIds = new Set<string>();
+
 function buildGenreHint(config: GenerateConfig): string {
   if (!config.genreId) return '';
   const g = genreRepo.get(config.genreId);
@@ -87,8 +92,14 @@ export function buildContextPrompt(projectId: string, currentChapterIdx?: number
             .map(v => `· 第${v.idx + 1}卷《${v.title}》(${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章): ${v.premise}（${v.emotionArc}）`)
             .join('\n');
           sections.push(`【全书大纲 · 滑动窗口(第${windowStart + 1}-${windowEnd}章详记 + 其他卷 premise)】\n当前卷(第${curVol.idx + 1}卷)详记:\n${nearby}\n\n其他卷概览:\n${otherVols}`);
-        } catch {
-          // JSON 解析失败,降级到截断
+        } catch (e) {
+          // M1 修复(第十七轮): JSON 解析失败不再静默降级,打 console.warn 让滑动窗口失效可排查
+          // 原: catch{} 完全无日志 → state.outline 非 JSON 时永久走截断,200 章长篇后期看不到第 27 章后剧情
+          // 现: 打 warn 一次(按 projectId 去重避免刷屏),提示重新生成大纲
+          if (!_outlineParseWarnedProjectIds.has(projectId)) {
+            _outlineParseWarnedProjectIds.add(projectId);
+            console.warn(`[buildContextPrompt] 项目 ${projectId} 的 outline 不是合法 JSON,滑动窗口注入失效,降级到截断前 4000 字。建议重新生成大纲。原始错误: ${(e as Error).message}`);
+          }
           const outlineSnippet = state.outline.length > 4000 ? state.outline.slice(0, 4000) + '\n...(全书大纲节选)' : state.outline;
           sections.push(`【全书大纲主线】\n${outlineSnippet}`);
         }
@@ -257,19 +268,25 @@ export async function reconcileState(
   providerId?: string,
   outlineChapters?: { positioning?: ChapterPositioning; coreEmotion?: string }[],
   onProgress?: (done: number, total: number) => void,
-): Promise<{ backfilled: number }> {
+): Promise<{ backfilled: number; issues: string[] }> {
   const chapters = chapterRepo.listByProject(projectId).filter(c => c.content && c.status === 'done');
-  if (chapters.length === 0) return { backfilled: 0 };
+  if (chapters.length === 0) return { backfilled: 0, issues: [] };
   const state = stateRepo.get(projectId);
   const existingSummaries = new Set((state?.chapterSummaries || []).map(s => s.idx));
   // 缺失摘要的章节列表（按 idx 排序）
   const missing = chapters.filter(c => !existingSummaries.has(c.orderIdx));
   const total = missing.length;
   let backfilled = 0;
+  const allIssues: string[] = [];
   for (const ch of missing) {
     try {
       const oc = outlineChapters?.[ch.orderIdx];
-      await updateStateFromGeneration(projectId, model, providerId, ch.orderIdx, oc?.positioning, oc?.coreEmotion);  // H1 修复(第十六轮): 返回 issues 由调用方 daemon 接管打日志
+      // M2 修复(第十七轮): 接住 issues 数组聚合,让 daemon 重启回填期也能看到伏笔误埋/状态告警
+      // 原: 只 await 不接返回值 → H2 检测到的过期伏笔重埋在重启回填时静默丢失
+      const result = await updateStateFromGeneration(projectId, model, providerId, ch.orderIdx, oc?.positioning, oc?.coreEmotion);
+      if (result.issues.length > 0) {
+        for (const issue of result.issues) allIssues.push(`第${ch.orderIdx + 1}章: ${issue}`);
+      }
       backfilled++;
       // 进度回调：让调用方写 task_log，避免长时间无输出被误判卡死
       onProgress?.(backfilled, total);
@@ -277,9 +294,10 @@ export async function reconcileState(
       // M6 修复(第十三轮): 不再静默吞错,打 console.warn 让重启回填失败可排查
       // 原: catch{} 完全无日志 → 80 章回填全失败时 task_log 一片空白,排查者无从下手
       console.warn(`[reconcileState] 第 ${ch.orderIdx + 1} 章补全失败:`, (e as Error).message);
+      allIssues.push(`第${ch.orderIdx + 1}章补全失败: ${(e as Error).message.slice(0, 80)}`);
     }
   }
-  return { backfilled };
+  return { backfilled, issues: allIssues };
 }
 
 // 章节生成前的位置锚点：告诉 LLM 当前在第几章、已完成多少、本章目标 + 上一章结尾用于自然衔接
@@ -1315,7 +1333,11 @@ ${pendingList || '（无）'}
     if (paidDescs.length > 0) {
       foreshadowing = foreshadowing.map(f => {
         const hit = paidDescs.some(d => {
-          if (!d || d.length < 4) return false;
+          if (!d) return false;
+          // L2 修复(第十七轮): 短 desc(< 4 字符,如「剑」「玉佩」)走精确全等,避免误匹配也避免跳过
+          // 原: d.length < 4 直接 return false → 短伏笔永远命中失败 → 永远 planted → 最终 expired
+          // 现: 短串精确全等,既避免「剑」误中所有含「剑」的 desc,又能让短伏笔正常回收
+          if (d.length < 4) return f.desc === d;
           return f.desc.includes(d) || d.includes(f.desc);
         });
         return hit ? { ...f, status: 'paid' as const, paidAt: target.orderIdx } : f;
@@ -1330,7 +1352,9 @@ ${pendingList || '（无）'}
         // 现: 用 fuzzyMatch(双向 includes) 对比 expired 伏笔 desc,命中则跳过 push + 记 warn
         const expiredList = foreshadowing.filter(f => f.status === 'expired');
         const isExpiredDuplicate = expiredList.some(f => {
-          if (!nf.desc || nf.desc.length < 4) return false;
+          if (!nf.desc) return false;
+          // L2 修复(第十七轮): 短 desc 走精确全等,避免短伏笔跳过误埋检测
+          if (nf.desc.length < 4) return f.desc === nf.desc;
           return f.desc.includes(nf.desc) || nf.desc.includes(f.desc);
         });
         if (isExpiredDuplicate) {

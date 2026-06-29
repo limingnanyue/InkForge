@@ -17,7 +17,8 @@ import { cn } from '@/lib/utils';
 import { fmtWords } from '@/components/ui';
 import { POSITIONING_LABEL } from '@/lib/positioning';
 
-const STATUS_DOT: Record<string, string> = { draft: 'bg-ink-400', generating: 'bg-amber', done: 'bg-celadon' };
+// L3 修复(第十七轮): 补 failed 状态样式,原缺 → 失败章节 STATUS_DOT[n.status] 返回 undefined className
+const STATUS_DOT: Record<string, string> = { draft: 'bg-ink-400', generating: 'bg-amber', done: 'bg-celadon', failed: 'bg-cinnabar' };
 
 const ITEM_HEIGHT = 36;          // 单行高度（含间距），用于虚拟滚动定位
 const OVERSCAN = 5;              // 视口上下额外渲染项数

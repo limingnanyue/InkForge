@@ -955,9 +955,9 @@ export default function ProjectDetail() {
           {tab === 'state' && (
             <div className="mx-auto max-w-4xl space-y-4 p-4 md:p-8">
               {/* M1 修复(第十六轮): 项目健康度仪表盘 - 章节状态分布 StatCard */}
-              {/* 让作者一眼看到 done/draft/failed/generating 计数,快速判断哪些章节要重做 */}
+              {/* M4 修复(第十七轮): 用顶层 flatTree memo,避免每次 render 重算 flatten */}
               {(() => {
-                const flat = flatten(tree);
+                const flat = flatTree;
                 const total = flat.length;
                 if (total === 0) return null;
                 const stats: Record<string, number> = { done: 0, draft: 0, failed: 0, generating: 0 };
@@ -1156,7 +1156,7 @@ export default function ProjectDetail() {
               {/* M4 修复(第十五轮): 章节定位分布柱状图(实际 vs oh-story 目标) */}
               {/* 让用户一眼看到 LLM 实际生成的定位分布是否符合 oh-story 18%/45%/8%/8%/10%/5% 目标 */}
               {(() => {
-                const flat = flatten(tree);
+                const flat = flatTree;
                 const withPos = flat.filter(c => c.positioning);
                 if (withPos.length === 0) return null;
                 const total = withPos.length;
