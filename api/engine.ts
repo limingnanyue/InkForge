@@ -785,6 +785,12 @@ ${distLine}
       // 单卷解析失败：抛错让 daemon 走重试，不静默吞掉
       throw new Error(`第 ${vi + 1} 卷大纲解析失败（LLM 输出未含合法 JSON 数组）`);
     }
+    // BUG-6 修复：单卷返回章节数不足时也抛错（本地重试 2 次都返回不足才到这）
+    // 原代码：只检查 length===0，LLM 输出被截断返回 15/20 章时会被静默 push，
+    //   checkpoint 回写不完整的卷，重试时该卷被覆盖重做，且后续章节错位
+    if (volChapters.length < volChapterCount) {
+      throw new Error(`第 ${vi + 1} 卷大纲章节数不足：${volChapters.length}/${volChapterCount}（LLM 输出可能被截断）`);
+    }
     allChapters.push(...volChapters);
     onVolumeProgress?.(vi + 1, volumes.length);
     // 每完成一卷回写 checkpoint：daemon 重试时从该卷后继续，避免从头开始

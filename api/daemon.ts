@@ -262,8 +262,11 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   const { projectId, targetWords } = cfg;
 
   // 断点续传：从 checkpoint 读取进度
-  const checkpoint = task.checkpoint as { phase?: string; chapterIdx?: number; outlineJson?: string };
+  const checkpoint = task.checkpoint as { phase?: string; chapterIdx?: number; outlineJson?: string; scanInsight?: string };
   const phase = checkpoint.phase || 'scan';
+  // BUG-3 修复：scan 阶段生成的 scanInsight 在同次执行内不会回写到 task 对象
+  // 用局部变量 hold，setup 阶段优先取局部变量，重试场景才从 checkpoint 读
+  let scanInsight: string | undefined = checkpoint.scanInsight;
 
   if (phase === 'scan') {
     progress(task.id, 0.05, webSearch ? '扫榜 + 联网取材中…' : '扫榜分析中…');
@@ -278,6 +281,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       temperature: 0.7, maxTokens: 512,
     });
     stateRepo.update(projectId, { idea: cfg.idea + '\n\n【扫榜洞察】\n' + scanResult });
+    scanInsight = scanResult;  // 局部变量 hold，下方 setup 阶段直接用
     taskRepo.update(task.id, { checkpoint: { phase: 'setup', scanInsight: scanResult } });
     logTask(task.id, 'info', '扫榜完成');
   }
@@ -286,14 +290,14 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   // 原 bug：daemon 跳过此阶段，state.setting/state.characters 永远为空 →
   //   项目详情页「大纲/状态」Tab 的「世界观设定」「角色」永远空白
   if (phase === 'scan' || phase === 'setup') {
-    const cp = task.checkpoint as { scanInsight?: string };
     progress(task.id, 0.08, webSearch ? '生成世界观 + 角色档案 + 联网取材中…' : '生成世界观 + 角色档案…');
     // 已有 setting 则跳过（断点续传时避免重做）
     const curState = stateRepo.get(projectId);
     if (!curState?.setting) {
       await generateSetup({
         projectId, model, providerId, config: cfg.config, idea: cfg.idea,
-        scanInsight: cp.scanInsight, webSearch,
+        scanInsight,  // BUG-3 修复：用局部变量（首次执行）或 checkpoint.scanInsight（重试）
+        webSearch,
       });
       logTask(task.id, 'info', '世界观 + 角色档案生成完成');
     }
@@ -351,19 +355,24 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 
   // === 重启筛查：以数据库实际状态为准，防止跳过/重复 ===
   // 先确保所有大纲章节的记录都存在（标题/大纲补齐，content 不覆盖已有）
+  // BUG-1 修复：用 orderIdx 做 Map 索引，而非数组下标
+  // 原因：用户删除中间章节后 orderIdx 不连续，数组下标与 orderIdx 失去对应关系，
+  //   existing[i] 可能是 orderIdx=3 的章节而非 orderIdx=i，导致补建/续写错位
   const existing = chapterRepo.listByProject(projectId);
+  const existingMap = new Map(existing.map(c => [c.orderIdx, c]));
   for (let i = 0; i < chapters.length; i++) {
-    if (!existing[i]) {
+    if (!existingMap.has(i)) {
       chapterRepo.create({ projectId, title: chapters[i].title, outline: chapters[i].outline, orderIdx: i });
     }
   }
   const fresh = chapterRepo.listByProject(projectId);
+  const freshMap = new Map(fresh.map(c => [c.orderIdx, c]));
 
-  // 找出第一个「未完成」（content 为空 或 status !== done）的章节
+  // 找出第一个「未完成」（content 为空 或 status !== done）的章节（按 orderIdx）
   let startIdx = chapters.length;
-  for (let i = 0; i < fresh.length; i++) {
-    const c = fresh[i];
-    if (!c.content || c.status !== 'done') { startIdx = i; break; }
+  for (let i = 0; i < chapters.length; i++) {
+    const c = freshMap.get(i);
+    if (!c || !c.content || c.status !== 'done') { startIdx = i; break; }
   }
   // checkpoint 仅作下限兜底：仅当 checkpoint 比实际进度更靠后才前移（防止 DB 状态被外部篡改导致跳章）
   // 反之若 checkpoint 比 DB 更旧（崩溃前未及时写 checkpoint），信任 DB，不回退重做已 done 章节（避免覆盖正文）
@@ -388,9 +397,11 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     const ch = chapters[i];
     progress(task.id, 0.1 + (0.8 * (i / chapters.length)), `正在生成第 ${i + 1}/${chapters.length} 章《${ch.title}》`);
 
-    let chapter = fresh[i];
+    // BUG-1 修复：用 freshMap.get(i) 而非 fresh[i]，章节删除后下标错位
+    let chapter = freshMap.get(i);
     if (!chapter) {
       chapter = chapterRepo.create({ projectId, title: ch.title, outline: ch.outline, orderIdx: i });
+      freshMap.set(i, chapter);  // 同步到 Map，后续循环可直接取
     }
 
     // 生成正文（注入位置锚点 + 防跑偏上下文 + 上一章 assistant 作为 history 提升缓存命中）
@@ -408,8 +419,10 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 
 要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。剧情推进到位即可结束，不得为凑字数注水。`;
     // 上一章 assistant 输出作为 history（前缀稳定 → OpenAI/Anthropic 缓存命中）
-    const prevHistory = i > 0 && fresh[i - 1]?.content
-      ? [{ role: 'assistant' as const, content: fresh[i - 1].content.slice(0, 4000) }]
+    // BUG-1 修复：用 freshMap.get(i-1) 而非 fresh[i-1]
+    const prevChapter = i > 0 ? freshMap.get(i - 1) : undefined;
+    const prevHistory = prevChapter?.content
+      ? [{ role: 'assistant' as const, content: prevChapter.content.slice(0, 4000) }]
       : [];
     // maxTokens 按定位系数微调：高压章 1.1×，信息/低压章 0.8-0.85×（贴合字数预算Σ契约）
     const TOKEN_MULT: Record<string, number> = { 'high-pressure': 1.1, 'normal-progress': 1.0, 'trial-error': 0.9, 'relationship': 1.0, 'low-pressure': 0.85, 'info-organize': 0.8 };
@@ -459,13 +472,12 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       throw e;
     }
     chapterRepo.update(chapter.id, { content, status: 'done' });
-    // 同步把刚生成的正文写回 fresh[i] 快照，让下一章的 prevHistory 能取到本章正文
-    // 原 BUG：fresh 是循环开始前的快照，循环内 DB 已更新但 fresh 不变 →
+    // 同步把刚生成的正文写回 freshMap，让下一章的 prevHistory 能取到本章正文
+    // 原 BUG：fresh 是循环开始前的快照，循环内 DB 已更新但快照不变 →
     //   fresh[i-1].content 永远是空值 → 从第 2 章起 prevHistory 永远为空
     //   → 上一章承接信息丢失，跨章一致性变差，OpenAI/Anthropic 缓存命中也失效
-    if (fresh[i]) {
-      fresh[i] = { ...fresh[i], content, status: 'done' as const };
-    }
+    // BUG-1 修复：用 freshMap.set 而非 fresh[i]=
+    freshMap.set(i, { ...chapter, content, status: 'done' as const });
 
     // 每章后立即更新防跑偏三件套（章节摘要/伏笔/角色状态）
     // oh-story：传入大纲里的 positioning + coreEmotion，落库到 ChapterSummary 供三层归档展示
@@ -538,6 +550,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       searchQuery: `${cfg.config.genre} 短篇 结构 套路`,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.8, maxTokens: 8192,  // 与 book pipeline 一致；2048 会让 LLM 输出在段数多时被截断（无闭合 ]）
+      // BUG-5 修复：短篇 20 万字 = 40 段 JSON 输出，国产慢模型可能 >5min，按段数放宽 wall timeout
+      wallTimeoutMs: segmentCount > 20 ? 8 * 60 * 1000 : 5 * 60 * 1000,
     });
     outlineJson = outlineText;
     taskRepo.update(task.id, { checkpoint: { setupDone: true, outlineJson } });
@@ -550,10 +564,12 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   }
 
   // === 重启筛查：以数据库实际状态为准 ===
+  // BUG-1 修复：用 orderIdx Map 替代数组下标，章节删除后不致错位
   const existingShort = chapterRepo.listByProject(projectId);
+  const existingShortMap = new Map(existingShort.map(c => [c.orderIdx, c]));
   let startIdx = segments.length;
-  for (let i = 0; i < Math.max(existingShort.length, segments.length); i++) {
-    const c = existingShort[i];
+  for (let i = 0; i < segments.length; i++) {
+    const c = existingShortMap.get(i);
     if (!c || !c.content || c.status !== 'done') { startIdx = i; break; }
   }
   // checkpoint 仅作下限兜底：信任 DB 实际状态，不回退重做已 done 段（避免覆盖正文）
@@ -572,14 +588,18 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     if (isCancelled(task.id)) throw new Error(CANCEL_ERROR);
     const seg = segments[i];
     progress(task.id, 0.1 + 0.8 * (i / segments.length), `生成第 ${i + 1}/${segments.length} 段《${seg.title}》`);
-    let chapter = existingShort[i];
+    // BUG-1 修复：用 existingShortMap.get(i) 而非 existingShort[i]
+    let chapter = existingShortMap.get(i);
     if (!chapter) {
       chapter = chapterRepo.create({ projectId, title: seg.title, outline: seg.outline, orderIdx: i });
+      existingShortMap.set(i, chapter);
     }
     chapterRepo.update(chapter.id, { status: 'generating' });
     let content = '';
-    const segPrevHistory = i > 0 && existingShort[i - 1]?.content
-      ? [{ role: 'assistant' as const, content: existingShort[i - 1].content.slice(0, 4000) }]
+    // BUG-1 修复：用 existingShortMap.get(i-1) 而非 existingShort[i-1]
+    const segPrev = i > 0 ? existingShortMap.get(i - 1) : undefined;
+    const segPrevHistory = segPrev?.content
+      ? [{ role: 'assistant' as const, content: segPrev.content.slice(0, 4000) }]
       : [];
     // 短篇质量门：生成 → 质检 → 不达标重写一次（与 book 流水线一致，wordBudget=5000）
     try {
@@ -620,12 +640,11 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       throw e;
     }
     chapterRepo.update(chapter.id, { content, status: 'done' });
-    // 同步把刚生成的正文写回 existingShort[i] 快照，让下一段的 segPrevHistory 能取到本段正文
+    // 同步把刚生成的正文写回 existingShortMap，让下一段的 segPrevHistory 能取到本段正文
     // 原 BUG：existingShort 是循环开始前的快照，循环内 DB 已更新但快照不变 →
     //   existingShort[i-1].content 永远是空值 → 从第 2 段起 segPrevHistory 永远为空
-    if (existingShort[i]) {
-      existingShort[i] = { ...existingShort[i], content, status: 'done' as const };
-    }
+    // BUG-1 修复：用 existingShortMap.set 而非 existingShort[i]=
+    existingShortMap.set(i, { ...chapter, content, status: 'done' as const });
     // 每段后更新防跑偏记忆（传 positioning/coreEmotion 与 book 流水线一致）
     // 失败不阻断正文落库：状态更新失败只 warn，不让单段状态失败导致整任务重试
     try {
@@ -740,13 +759,20 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
   if (allChapters.length === 0) throw new Error('项目无已生成内容的章节，无可精修对象');
   const total = allChapters.length;
 
-  // 断点续传：用 lastChapterId 定位（比下标稳定，章节删改不会错位）
+  // 断点续传：用 lastChapterOrderIdx 定位（比 lastChapterId 更稳，章节 id 删除后下标错位）
   // refinedCount 用于前端显示「已精修 N/M」
-  const checkpoint = task.checkpoint as { lastChapterId?: string; totalChapters?: number; refinedCount?: number };
+  // BUG-2 修复：原用 lastChapterId + findIndex 定位，章节删除后下标错位
+  //   改用 lastChapterOrderIdx：找到第一个 orderIdx > lastChapterOrderIdx 的章节作为起点
+  const checkpoint = task.checkpoint as { lastChapterId?: string; lastChapterOrderIdx?: number; totalChapters?: number; refinedCount?: number };
   let startIdx = 0;
-  if (checkpoint.lastChapterId) {
+  if (typeof checkpoint.lastChapterOrderIdx === 'number') {
+    // 用 orderIdx 定位：章节删除不影响（找第一个 orderIdx > 已完成 orderIdx 的章节）
+    startIdx = allChapters.findIndex(c => c.orderIdx > checkpoint.lastChapterOrderIdx!);
+    if (startIdx < 0) startIdx = allChapters.length;
+  } else if (checkpoint.lastChapterId) {
+    // 兼容旧 checkpoint：用 id 定位（章节未删除时仍可用）
     const lastDoneIdx = allChapters.findIndex(c => c.id === checkpoint.lastChapterId);
-    if (lastDoneIdx >= 0) startIdx = lastDoneIdx + 1;  // 从下一章开始
+    if (lastDoneIdx >= 0) startIdx = lastDoneIdx + 1;
   }
 
   // 已全部精修过
@@ -766,7 +792,8 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
     // 跳过空内容（理论上前面 filter 已过滤，双保险）
     if (!ch.content || ch.content.length < 100) {
       logTask(task.id, 'warn', `第 ${i + 1} 章内容过短（${ch.content?.length || 0} 字），跳过精修`);
-      taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, totalChapters: total, refinedCount: i + 1 } });
+      // BUG-2 修复：checkpoint 同时记录 lastChapterOrderIdx，章节删除后续传不错位
+      taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, lastChapterOrderIdx: ch.orderIdx, totalChapters: total, refinedCount: i + 1 } });
       continue;
     }
 
@@ -786,7 +813,8 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
       if ((e as Error).message === CANCEL_ERROR) throw e;
       // 单章精修失败：不阻断整书流程，记 warn 继续下一章
       logTask(task.id, 'warn', `第 ${i + 1} 章精修失败（跳过，不影响其他章）：${(e as Error).message.slice(0, 100)}`);
-      taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, totalChapters: total, refinedCount: i + 1 } });
+      // BUG-2 修复：checkpoint 同时记录 lastChapterOrderIdx
+      taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, lastChapterOrderIdx: ch.orderIdx, totalChapters: total, refinedCount: i + 1 } });
       continue;
     }
 
@@ -801,7 +829,8 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
     }
 
     // checkpoint 推进（每章后立即写，断点续传粒度 = 1 章）
-    taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, totalChapters: total, refinedCount: i + 1 } });
+    // BUG-2 修复：checkpoint 同时记录 lastChapterOrderIdx，章节删除后续传不错位
+    taskRepo.update(task.id, { checkpoint: { lastChapterId: ch.id, lastChapterOrderIdx: ch.orderIdx, totalChapters: total, refinedCount: i + 1 } });
   }
 
   progress(task.id, 1, `整书精修完成（共 ${total} 章）`);

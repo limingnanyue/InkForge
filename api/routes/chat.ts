@@ -53,7 +53,9 @@ router.post('/', async (req: Request, res: Response) => {
 
   if (isDaemonCreate) {
     try {
-      const result = createContinueTask(projectId, finalWebSearch);
+      // BUG-4 修复：派发守护任务时透传用户选择的 model/providerId
+      // 原代码：createContinueTask(projectId, finalWebSearch) → 丢失 model 和 providerId，回落到 default provider
+      const result = createContinueTask(projectId, finalWebSearch, model, providerId);
       if (result) daemonTaskId = result.task.id;
       else daemonError = '项目不存在';
     } catch (e) {

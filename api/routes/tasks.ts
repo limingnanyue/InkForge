@@ -33,7 +33,13 @@ router.post('/:id/pause', (req: Request, res: Response) => {
   }
   // running 中：通过 cancel token 让 worker 在章节边界主动停止
   if (cur.status === 'running') cancelToken(req.params.id);
-  const task = taskRepo.update(req.params.id, { status: 'paused' });
+  // BUG-7 修复：用 CAS 更新防 TOCTOU 竞态
+  // 场景：状态守卫检查后、update 执行前 worker 恰好完成标记 done，原 update 会无脑覆盖 done 为 paused
+  // CAS 保证只在仍是 running/queued 时才置 paused，已完成任务不被覆盖
+  const task = taskRepo.updateIfStatusIn(req.params.id, ['running', 'queued'], { status: 'paused' });
+  if (!task) {
+    return res.status(409).json({ ok: false, error: { code: 'INVALID_STATUS', message: '任务状态已变更（可能已完成），不可暂停' } });
+  }
   ok(res, task);
 });
 
