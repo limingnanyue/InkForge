@@ -6,7 +6,7 @@
  */
 import { EventEmitter } from 'events';
 import { taskRepo, taskLogRepo, chapterRepo, projectRepo, stateRepo, providerRepo } from './repos.js';
-import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality, checkPositioningDistribution } from './engine.js';
+import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality, checkPositioningDistribution, compactVolumeSummary, SKILL_PROMPTS } from './engine.js';
 import { complete } from './llm.js';
 import type { Task, StreamEvent, ProviderKind, ProjectType } from '@shared/types';
 
@@ -325,20 +325,23 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 
   if (phase === 'scan') {
     progress(task.id, 0.05, webSearch ? '扫榜 + 联网取材中…' : '扫榜分析中…');
+    // M6 修复(第十四轮): scan 阶段改用 SKILL_PROMPTS.scan 完整 prompt
+    // 原: inline system "分析题材市场,输出切入点与人设方向,200字内" → 输出浅,缺题材空白/差异化分析
+    // 现: 复用 SKILL_PROMPTS.scan(3-5 切入点+人设方向+题材空白+差异化机会),maxTokens 提到 1024 给足空间
     const { text: scanResult } = await complete({
       providerId, model, webSearch,
       projectId,
       searchQuery: `${cfg.config.genre} 网文 热门 套路 2026`,
       messages: [
-        { role: 'system', content: '分析题材市场，输出切入点与人设方向，200字内。' },
-        { role: 'user', content: `题材：${cfg.config.genre}\n创意：${cfg.idea}` },
+        { role: 'system', content: SKILL_PROMPTS.scan },
+        { role: 'user', content: `题材：${cfg.config.genre}\n创意：${cfg.idea}\n请输出 3-5 个可行切入点与人设方向,并识别题材空白与差异化机会(800字内)。` },
       ],
-      temperature: 0.7, maxTokens: 512,
+      temperature: 0.7, maxTokens: 1024,
     });
     stateRepo.update(projectId, { idea: cfg.idea + '\n\n【扫榜洞察】\n' + scanResult });
     scanInsight = scanResult;  // 局部变量 hold，下方 setup 阶段直接用
     taskRepo.update(task.id, { checkpoint: { phase: 'setup', scanInsight: scanResult } });
-    logTask(task.id, 'info', '扫榜完成');
+    logTask(task.id, 'info', '扫榜完成（含 3-5 切入点 + 题材空白分析）');
   }
 
   // setup 阶段：生成世界观设定 + 角色档案，落库后进入 buildContextPrompt 稳定段
@@ -492,8 +495,9 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     const curState = stateRepo.get(projectId);
     const curVolumes = curState?.volumeOutlines || [];
     const curVol = curVolumes.find(v => i >= v.chapterRange[0] && i <= v.chapterRange[1]);
+    // M3 修复(第十四轮): volumeCtx 透传 keyForeshadows,buildChapterAnchor 注入本卷重点伏笔
     const volumeCtx = curVol
-      ? { idx: curVol.idx, title: curVol.title, premise: curVol.premise, emotionArc: curVol.emotionArc }
+      ? { idx: curVol.idx, title: curVol.title, premise: curVol.premise, emotionArc: curVol.emotionArc, keyForeshadows: curVol.keyForeshadows }
       : null;
     const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion, volumeCtx);
     // 章末钩子提示 + 定位对位的字数提示
@@ -585,6 +589,25 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // 原: 只写 chapterIdx,UI 无法显示总章数,200 章长篇作者无法判断整体进度
     // taskRepo.update 的 checkpoint 是浅合并(repos.ts),不会覆盖其他字段
     taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline, chapterIdx: i + 1, totalChapters: chapters.length } });
+
+    // H6 修复(第十四轮): 卷末触发远期摘要真压缩(oh-story: 远期内容按卷压缩,防长篇失忆)
+    // 检测: 下一章 idx 超出当前卷 chapterRange[1] → 当前卷已完结,触发压缩
+    // 幂等: compactVolumeSummary 内部检查已有 compactedSummary 时跳过
+    // 触发条件: 仅长篇(有 volumeOutlines)且当前卷已完结
+    if (curVol && i + 1 < chapters.length) {
+      const nextVol = curVolumes.find(v => (i + 1) >= v.chapterRange[0] && (i + 1) <= v.chapterRange[1]);
+      if (!nextVol) {
+        // 当前卷已完结,触发压缩(异步不阻塞,失败仅 warn)
+        try {
+          const compacted = await compactVolumeSummary(projectId, model, providerId, curVol.idx);
+          if (compacted) {
+            logTask(task.id, 'info', `第 ${curVol.idx + 1} 卷远期摘要压缩完成（${compacted.length} 字）`);
+          }
+        } catch (e) {
+          logTask(task.id, 'warn', `第 ${curVol.idx + 1} 卷摘要压缩失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
+        }
+      }
+    }
   }
 
   // 精修阶段（抽样精修最近几章）

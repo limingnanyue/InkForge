@@ -102,6 +102,11 @@ export interface VolumeOutline {
   emotionArc: string;      // 情绪弧线（如 V形/倒V形/W形/递进/延迟满足/急转弯）
   chapterRange: [number, number]; // 本卷章序号区间 [起, 终]
   keyForeshadows: string[]; // 本卷重点埋设/回收的伏笔 desc
+  // H6 修复(第十四轮): 远期卷摘要真压缩缓存
+  // 原: buildDynamicContext 远期卷摘要仅"采样 3 条 + 截断 30 字",非真压缩 → 长篇失忆
+  // 现: 每卷所有章节完成后调 LLM 压缩成 3 句话(主线推进+伏笔状态+角色弧线),缓存到此字段
+  //   buildDynamicContext 优先用 compactedSummary,无则降级到采样
+  compactedSummary?: string;
 }
 
 export interface AgentState {

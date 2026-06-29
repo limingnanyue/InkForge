@@ -5,7 +5,7 @@
  * 核心理念：套路 = 确定性的情绪满足
  */
 import { streamComplete, type LLMOptions } from './llm.js';
-import { stateRepo, chapterRepo, genreRepo } from './repos.js';
+import { stateRepo, chapterRepo, genreRepo, projectRepo } from './repos.js';
 import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, ChapterSummary, ChapterPositioning, VolumeOutline } from '@shared/types';
 
 // 题材元信息注入: 反查 genreId 拿 description + emotionMap,拼成 prompt 段
@@ -74,6 +74,21 @@ export function buildContextPrompt(projectId: string): string {
       : state.outline;
     sections.push(`【全书大纲主线】\n${outlineSnippet}`);
   }
+  // M2 修复(第十四轮): 注入题材元信息到稳定段,正文生成也能看到题材说明+情绪映射
+  // 原: buildGenreHint 仅在 generateSetup/generateOutline 注入,runSkill(write) 走 buildContextPrompt
+  //   → 正文阶段题材说明/情绪映射缺失,LLM 仅靠 SKILL_PROMPTS.write 通用路由表,题材特征引导不足
+  // 现: buildContextPrompt 反查 project.genreId → genreRepo 拿 description + emotionMap,注入稳定段
+  //   跨章不变 → 命中前缀缓存,不增额外 token 成本
+  const project = projectRepo.get(projectId);
+  if (project?.genreId) {
+    const g = genreRepo.get(project.genreId);
+    if (g) {
+      const parts: string[] = [];
+      if (g.description) parts.push(`题材说明：${g.description}`);
+      if (g.emotionMap) parts.push(`核心情绪：${g.emotionMap}`);
+      if (parts.length) sections.push(`【题材元信息】\n${parts.join('\n')}`);
+    }
+  }
   return sections.length ? `【当前项目智能体状态】\n${sections.join('\n\n')}` : '';
 }
 
@@ -134,17 +149,25 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
     const midOutline = summaries.slice(-15, -5);            // 6-15 章：单行概要
     const faraway = summaries.slice(0, -15);                // 16 章前：远期
     const parts: string[] = [];
-    // H6 修复: 远期摘要按卷压缩注入(若有 volumeOutlines),无卷大纲则按每 10 章压缩
+    // H6 修复(第十四轮): 远期卷摘要改真压缩,优先用 volumeOutlines[].compactedSummary
+    // 原: 远期摘要仅"采样 3 条 + 截断 30 字",非真压缩 → 30 字不足以承载关键事件,长篇失忆
+    // 现: 每卷所有章节完成后由 daemon 触发 compactVolumeSummary 调 LLM 压缩成 3 句话
+    //   (主线推进+伏笔状态+角色弧线),缓存到 compactedSummary,buildDynamicContext 优先用
+    //   无 compactedSummary 时降级到原采样策略(向后兼容,旧库无此字段)
     if (faraway.length > 0) {
       const vols = state.volumeOutlines || [];
       if (vols.length > 0) {
-        // 按卷分组,每卷取前 3 条摘要拼成一句话
+        // 优先用 compactedSummary,无则降级到采样
         const volSummaries = vols.map(v => {
           const inVol = faraway.filter(s => s.idx >= v.chapterRange[0] && s.idx <= v.chapterRange[1]);
           if (inVol.length === 0) return null;
-          // 每卷取首章 + 末章 + 中间章,拼成"卷内关键事件"
+          if (v.compactedSummary) {
+            // 真压缩:LLM 提炼的 3 句话,信息密度远高于采样
+            return `· 第${v.idx + 1}卷《${v.title}》(第${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章,共${inVol.length}章已完成):${v.compactedSummary}`;
+          }
+          // 降级:采样首/中/末章 + 截断 30 字
           const picks = inVol.length <= 3 ? inVol : [inVol[0], inVol[Math.floor(inVol.length / 2)], inVol[inVol.length - 1]];
-          return `· 第${v.idx + 1}卷《${v.title}》(第${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章,共${inVol.length}章已完成):${picks.map(s => `第${s.idx + 1}章${s.summary.slice(0, 30)}`).join(' / ')}`;
+          return `· 第${v.idx + 1}卷《${v.title}》(第${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章,共${inVol.length}章已完成):${picks.map(s => `第${s.idx + 1}章${s.summary.slice(0, 30)}`).join(' / ')}（采样,未压缩）`;
         }).filter(Boolean);
         if (volSummaries.length > 0) {
           parts.push(`【远期卷摘要（第1-${faraway[faraway.length - 1].idx + 1}章,按卷压缩)】\n${volSummaries.join('\n')}`);
@@ -172,8 +195,14 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
   }
 
   // 卷级总览（长篇专用，>50 章时尤其重要）
+  // M3 修复(第十四轮): 注入 keyForeshadows,让 LLM 知道本卷重点伏笔,正文可考虑回收
+  // 原: 卷级总览只注入 premise + emotionArc,keyForeshadows 字段虽填充但 prompt 不可见
+  //   → LLM 不知本卷有哪些待回收重点伏笔,可能错失回收时机
   if (state.volumeOutlines && state.volumeOutlines.length > 0) {
-    sections.push(`【卷级总览】\n${state.volumeOutlines.map(v => `· 第${v.idx + 1}卷《${v.title}》(${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章)：${v.premise} | 弧线：${v.emotionArc}`).join('\n')}`);
+    sections.push(`【卷级总览】\n${state.volumeOutlines.map(v => {
+      const kfs = v.keyForeshadows?.length ? ` | 重点伏笔：${v.keyForeshadows.slice(0, 5).join(' / ')}` : '';
+      return `· 第${v.idx + 1}卷《${v.title}》(${v.chapterRange[0] + 1}-${v.chapterRange[1] + 1}章)：${v.premise} | 弧线：${v.emotionArc}${kfs}`;
+    }).join('\n')}`);
   }
 
   if (state.memory) sections.push(`【前情总览记忆】\n${state.memory}`);
@@ -219,6 +248,7 @@ export async function reconcileState(
 
 // 章节生成前的位置锚点：告诉 LLM 当前在第几章、已完成多少、本章目标 + 上一章结尾用于自然衔接
 // oh-story：注入【本章定位】块（章节定位类型 + 字数预算 + 核心情绪），与 write prompt 的章节定位六类/字数预算Σ契约对位
+// M3 修复(第十四轮): volumeCtx 加 keyForeshadows,本卷主线块注入重点伏笔,LLM 知本章可回收哪些
 export function buildChapterAnchor(
   projectId: string,
   currentIdx: number,
@@ -228,7 +258,7 @@ export function buildChapterAnchor(
   positioning?: ChapterPositioning,
   baseWordTarget = 2500,
   coreEmotion?: string,
-  volumeCtx?: { idx: number; title: string; premise: string; emotionArc: string } | null,
+  volumeCtx?: { idx: number; title: string; premise: string; emotionArc: string; keyForeshadows?: string[] } | null,
 ): string {
   // BUG-1 修复：原 listByProject 全量加载只为取 prevChapters[currentIdx-1].content.slice(-300)，
   // 2000 章循环 = O(N²) 全表扫描。改用 getTail 仅查单行 content
@@ -255,11 +285,15 @@ export function buildChapterAnchor(
   // H2 修复(第十二轮): 注入本卷核心冲突 + 情绪弧线,防每章不知卷主线而跑题
   // 原: buildChapterAnchor 只注入本章定位 + 上一章结尾,LLM 看不到当前卷要解决什么主线冲突
   // 现: 通过 volumeOutlines 反查当前章所属卷,注入【本卷主线】段
+  // M3 修复(第十四轮): 加 keyForeshadows 注入,LLM 知本卷重点伏笔可考虑回收
+  const volKfs = volumeCtx?.keyForeshadows?.length
+    ? `\n· 本卷重点伏笔：${volumeCtx.keyForeshadows.slice(0, 5).join(' / ')}（可考虑本章回收其一）`
+    : '';
   const volumeBlock = volumeCtx
     ? `
 【本卷主线 · 第${volumeCtx.idx + 1}卷《${volumeCtx.title}》】
 · 核心冲突：${volumeCtx.premise}
-· 情绪弧线：${volumeCtx.emotionArc}
+· 情绪弧线：${volumeCtx.emotionArc}${volKfs}
 · 本章须推进本卷核心冲突,不得脱离卷主线写独立单元`
     : '';
 
@@ -547,13 +581,30 @@ export async function checkChapterQuality(opts: {
   // score >= 0.6 视为达标，< 0.6 → needRewrite
   let topicScore = 1.0;  // 默认通过（LLM 调用失败时不阻断生成）
   if (actualLen >= minHard) {
+    // H1 修复(第十四轮): 跑题门增第 5 维「伏笔回收度」,relationship 章未回收扣分
+    // oh-story: 标 positioning=relationship 的章必须回收至少 1 个前文伏笔
+    // 原: 跑题门只查大纲符合度/定位符合度/剧情推进/人设一致 4 维,伏笔回收完全无校验
+    //   → LLM 写 relationship 章但忘了回收伏笔,引擎不发现 → 长篇伏笔堆积
+    // 现: 增第 5 维,relationship 章未回收扣分;综合分按 5 维平均
+    // 注入待回收伏笔列表让 LLM 可判断"是否回收了其中之一"
+    const pendingFs = (stateRepo.get(projectId)?.foreshadowing || [])
+      .filter(f => f.status === 'planted')
+      .slice(0, 15)
+      .map(f => `- ${f.desc}（第${f.plantedAt + 1}章埋设${f.importance === 'high' ? '·主线' : ''}）`)
+      .join('\n');
+    const recycleBlock = positioning === 'relationship' && pendingFs
+      ? `\n【待回收伏笔（本章必须回收至少 1 个）】\n${pendingFs}`
+      : '';
+    const recycleHint = positioning === 'relationship'
+      ? `\n5. 伏笔回收度：本章为关系回收章,是否回收了至少 1 个上方【待回收伏笔】中的项（0-1,未回收给 ≤0.4,回收 1 个给 0.7+,回收多个给 1.0）`
+      : `\n5. 伏笔回收度：本章非关系回收章,默认给 0.7（0-1）`;
     const prompt = `请判断以下章节正文是否符合大纲要求。
 
 【章节信息】第 ${chapterIdx + 1} 章《${chapterTitle}》
 【章节定位】${positioning || '未指定'}
 【核心情绪】${coreEmotion || '未指定'}
 【本章大纲】
-${outline}
+${outline}${recycleBlock}
 
 【正文片段】（前 1500 字）
 ${content.slice(0, 1500)}
@@ -562,9 +613,9 @@ ${content.slice(0, 1500)}
 1. 大纲符合度：是否完成大纲设定的情节点（0-1）
 2. 章节定位符合度：是否体现 ${positioning || '通用'} 的特征（0-1）
 3. 剧情推进度：是否有实质推进，非重复/非注水（0-1）
-4. 人设一致性：角色行为是否符合前文人设（0-1，无法判断时给 0.7）
+4. 人设一致性：角色行为是否符合前文人设（0-1，无法判断时给 0.7）${recycleHint}
 
-输出 JSON：{"score": <0-1 综合分>, "reason": "<一句话说明不符合之处>"}
+输出 JSON：{"score": <0-1 综合分,5 维平均>, "reason": "<一句话说明不符合之处>"}
 只输出 JSON，不要其他文字。`;
 
     const ctxPrompt = buildContextPrompt(projectId);
@@ -653,6 +704,80 @@ export function buildVolumeOutlines(chapterCount: number): VolumeOutline[] {
     chapterRange: v.range,
     keyForeshadows: [], // 由 updateStateFromGeneration 在每章后动态填充
   }));
+}
+
+// H6 修复(第十四轮): 远期卷摘要真压缩
+// oh-story: 远期内容应"按卷压缩",而非采样首/中/末章 + 截断 30 字
+// 调用时机: daemon 在每卷所有章节完成后触发一次,把该卷所有章节摘要调 LLM 压缩成 3 句话
+//   ① 本卷主线推进 ② 本卷伏笔状态(埋设/回收/过期) ③ 本卷角色弧线变化
+// 缓存到 volumeOutlines[idx].compactedSummary,buildDynamicContext 优先用
+// 幂等: 已有 compactedSummary 时跳过(避免重复压缩)
+export async function compactVolumeSummary(
+  projectId: string,
+  model: string,
+  providerId: string | undefined,
+  volIdx: number,
+): Promise<string | null> {
+  const state = stateRepo.get(projectId);
+  if (!state) return null;
+  const vols = state.volumeOutlines || [];
+  const vol = vols.find(v => v.idx === volIdx);
+  if (!vol) return null;
+  // 幂等: 已有压缩结果则跳过
+  if (vol.compactedSummary) return vol.compactedSummary;
+  // 取本卷所有已完成的章节摘要
+  const summaries = (state.chapterSummaries || [])
+    .filter(s => s.idx >= vol.chapterRange[0] && s.idx <= vol.chapterRange[1])
+    .sort((a, b) => a.idx - b.idx);
+  if (summaries.length < 3) return null;  // 不足 3 章不压缩(信息量太少)
+  // 本卷涉及的伏笔(从 keyForeshadows + 全局 foreshadowing 落在本卷章序号区间的)
+  const volForeshadows = (state.foreshadowing || [])
+    .filter(f => f.plantedAt >= vol.chapterRange[0] && f.plantedAt <= vol.chapterRange[1])
+    .map(f => `- ${f.desc}（${f.status}${f.paidAt != null ? `,第${f.paidAt + 1}章回收` : ''}）`)
+    .slice(0, 10)
+    .join('\n');
+  // 本卷涉及的角色(从 characterState 全量,无法精确按卷过滤)
+  const volChars = (state.characterState || [])
+    .slice(0, 8)
+    .map(c => `- ${c.name}：${c.location} / ${c.mood} / ${c.relationships}`)
+    .join('\n');
+
+  const prompt = `请把以下「第 ${volIdx + 1} 卷」的所有章节摘要压缩成 3 句话,用于长篇写作的远期记忆注入。
+
+【卷信息】第 ${volIdx + 1} 卷《${vol.title}》(第 ${vol.chapterRange[0] + 1}-${vol.chapterRange[1] + 1} 章,情绪弧线 ${vol.emotionArc})
+【卷核心冲突】${vol.premise}
+
+【本卷各章摘要（共 ${summaries.length} 章）】
+${summaries.map(s => `第${s.idx + 1}章《${s.title}》${s.positioning ? `[${POSITIONING_META[s.positioning].label}]` : ''}${s.coreEmotion ? `「${s.coreEmotion}」` : ''}：${s.summary}`).join('\n')}
+
+【本卷伏笔状态】
+${volForeshadows || '（无）'}
+
+【本卷角色状态】
+${volChars || '（无）'}
+
+输出格式（3 句话,每句不超过 80 字,不要其他文字）：
+1. 主线推进：本卷主线发生了什么关键事件、推进到什么程度
+2. 伏笔状态：本卷埋设/回收/过期了哪些关键伏笔
+3. 角色弧线：本卷主要角色的弧线变化（位置/关系/能力/情绪转折）`;
+
+  const ctxPrompt = buildContextPrompt(projectId);
+  const systemStable = ctxPrompt
+    ? `${ctxPrompt}\n\n你是长篇小说一致性管理者,擅长把长篇章节摘要压缩成信息密度高的卷级总览。输出 3 句话,不要 markdown。`
+    : '你是长篇小说一致性管理者,擅长把长篇章节摘要压缩成信息密度高的卷级总览。输出 3 句话,不要 markdown。';
+  const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
+  const { complete } = await import('./llm.js');
+  try {
+    const { text } = await complete({ providerId, model, messages, systemStable, projectId, temperature: 0.3, maxTokens: 512 });
+    const compacted = text.trim().slice(0, 500);  // 3 句话约 200-300 字,上限 500 防止 LLM 输出超长
+    if (compacted.length < 30) return null;  // 输出过短视为失败
+    // 落库到 volumeOutlines[idx].compactedSummary
+    const updatedVols = vols.map(v => v.idx === volIdx ? { ...v, compactedSummary: compacted } : v);
+    stateRepo.update(projectId, { volumeOutlines: updatedVols });
+    return compacted;
+  } catch {
+    return null;  // 静默失败,不阻断主流程
+  }
 }
 
 // 单次 LLM 调用生成大纲的安全章数阈值。
@@ -1033,11 +1158,15 @@ ${pendingList || '（无）'}
 {
   "summary": "本章 80-150 字摘要，包含关键事件与情绪转折",
   "coreEmotion": "本章实际核心情绪(爽感释放/震撼/痛快/怅然/燃/治愈/期待/心动等,一个词)",
-  "newForeshadows": [{"desc": "本章新埋设的伏笔描述", "plantedAt": ${target.orderIdx}, "importance": "high|mid|low", "expectedRecycleAt": 预计回收章序号或null}],
-  "paidForeshadowDescs": ["本章回收的伏笔描述（匹配已有伏笔的 desc）"],
+  "newForeshadows": [{"desc": "本章新埋设的伏笔描述", "plantedAt": ${target.orderIdx}, "importance": "high|mid|low", "expectedRecycleAt": 预计回收章序号(主线伏笔建议 ${target.orderIdx + 5}-${target.orderIdx + 15} 章后回收,支线 ${target.orderIdx + 3}-${target.orderIdx + 8} 章,长线伏笔可设 ${target.orderIdx + 20}-${target.orderIdx + 30} 章或 null)}],
+  "paidForeshadowDescs": ["本章回收的伏笔描述（尽量匹配已有伏笔的 desc 原文,允许小幅出入）"],
   "characterState": [{"name": "角色名", "location": "当前所在", "mood": "情绪状态", "relationships": "与他人当前关系"}],
   "memory": "更新后的全局记忆（已发生关键事件+伏笔+待回收点），200 字内"
 }`;
+  // M7 修复(第十四轮): expectedRecycleAt 加预算引导 + paidForeshadowDescs 允许小幅出入
+  // 原: prompt 仅说"预计回收章序号或null",LLM 不知该填多少 → 经常不填或乱填
+  //   → 过期检测失效(无 expectedRecycleAt 时只能用统一容忍期,主线/支线不分级)
+  //   → paidDescs 全等匹配失败(M5 已修),prompt 也提示"允许小幅出入"双保险
 
   // —— 缓存优化：system 作为稳定段（跨章不变），prompt 作为 user 消息 ——
   // 每章提炼状态时，system 不变 → 缓存命中；只有 user 变化
@@ -1097,12 +1226,19 @@ ${pendingList || '（无）'}
     const summaries = [...curSummaries.filter(s => s.idx !== target.orderIdx), newSummary];
 
     // 2. 伏笔状态机合并：新增 planted（带重要度+预计回收章），回收的标 paid（带 paidAt）
+    // M5 修复(第十四轮): paid 匹配改 fuzzyMatch,防 LLM 输出 desc 与 planted desc 略有出入时全等失败
+    // 原: paidDescs.includes(f.desc) 字符串全等 → LLM 漏字/换词/截断时伏笔永远不标 paid → 长篇伏笔堆积
+    // 现: 双向 includes + 短串长度门槛(>=4 字符) 避免短串误匹配(如"剑"误中所有含"剑"的 desc)
     let foreshadowing = [...curForeshadowing];
     const paidDescs: string[] = Array.isArray(parsed.paidForeshadowDescs) ? parsed.paidForeshadowDescs : [];
     if (paidDescs.length > 0) {
-      foreshadowing = foreshadowing.map(f => paidDescs.includes(f.desc)
-        ? { ...f, status: 'paid' as const, paidAt: target.orderIdx }
-        : f);
+      foreshadowing = foreshadowing.map(f => {
+        const hit = paidDescs.some(d => {
+          if (!d || d.length < 4) return false;
+          return f.desc.includes(d) || d.includes(f.desc);
+        });
+        return hit ? { ...f, status: 'paid' as const, paidAt: target.orderIdx } : f;
+      });
     }
     if (Array.isArray(parsed.newForeshadows)) {
       for (const nf of parsed.newForeshadows) {
