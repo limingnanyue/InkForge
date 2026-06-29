@@ -191,6 +191,9 @@ export const api = {
     update: (id: string, data: Partial<{ label: string; category: GenreCategory; description: string; emotionMap: string }>) =>
       req<Genre>(`/genres/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
     delete: (id: string) => req<{ deleted: boolean }>(`/genres/${id}`, { method: 'DELETE' }),
+    // AI 补全题材说明: 联网搜索(AnySearch) + LLM 生成详细 description + emotionMap
+    enrich: (id: string, params?: { model?: string; providerId?: string; webSearch?: boolean }) =>
+      req<{ description: string; emotionMap: string }>(`/genres/${id}/enrich`, { method: 'POST', body: JSON.stringify(params || {}) }),
   },
   // Token 用量
   usage: {

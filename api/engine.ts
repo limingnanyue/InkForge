@@ -5,8 +5,21 @@
  * 核心理念：套路 = 确定性的情绪满足
  */
 import { streamComplete, type LLMOptions } from './llm.js';
-import { stateRepo, chapterRepo } from './repos.js';
+import { stateRepo, chapterRepo, genreRepo } from './repos.js';
 import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, ChapterSummary, ChapterPositioning, VolumeOutline } from '@shared/types';
+
+// 题材元信息注入: 反查 genreId 拿 description + emotionMap,拼成 prompt 段
+// 原实现: 主线生成只用 config.genre(label),题材说明/情绪映射完全未注入,LLM 写作风格缺少题材特征引导
+// 现改进: 世界观/分卷大纲/全书大纲 3 处 prompt 都注入题材元信息,让生成更有题材针对性
+function buildGenreHint(config: GenerateConfig): string {
+  if (!config.genreId) return '';
+  const g = genreRepo.get(config.genreId);
+  if (!g) return '';
+  const parts: string[] = [];
+  if (g.description) parts.push(`题材说明：${g.description}`);
+  if (g.emotionMap) parts.push(`核心情绪：${g.emotionMap}`);
+  return parts.length ? `\n【题材元信息】\n${parts.join('\n')}` : '';
+}
 
 // 伏笔过期阈值：埋设超过 N 章未回收 → 自动标记 expired（oh-story 状态机）
 // high 重要度的主线伏笔给予更长容忍期，避免核心伏笔被误判过期
@@ -379,7 +392,7 @@ export async function generateSetup(opts: {
   const prompt = `请为以下作品生成「世界观设定」与「角色档案」，供后续大纲与正文创作参考。
 
 【核心创意】${idea}
-【题材风格】${config.genre}
+【题材风格】${config.genre}${buildGenreHint(config)}
 【主要角色（用户提供）】${config.characters || '（未指定，请自行设计主角 + 对手 + 关键配角）'}
 【钩子风格】${config.hookStyle}
 【节奏要求】${config.pace}
@@ -620,7 +633,7 @@ async function generateOutlineForVolume(opts: {
   const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
 
 【核心创意】${idea}
-【题材风格】${config.genre}
+【题材风格】${config.genre}${buildGenreHint(config)}
 【主要角色】${config.characters}
 【钩子风格】${config.hookStyle}
 【节奏要求】${config.pace}
@@ -715,7 +728,7 @@ export async function generateOutline(opts: {
     const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字）。
 
 【核心创意】${idea}
-【题材风格】${config.genre}
+【题材风格】${config.genre}${buildGenreHint(config)}
 【主要角色】${config.characters}
 【钩子风格】${config.hookStyle}
 【节奏要求】${config.pace}

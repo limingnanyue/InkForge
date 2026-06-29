@@ -3,8 +3,9 @@
  * 替代分散在前端的硬编码常量，支持用户添加/编辑/删除自定义题材
  */
 import { useEffect, useMemo, useState } from 'react';
-import { Plus, Edit3, Trash2, Search, Tag, X, BookMarked } from 'lucide-react';
+import { Plus, Edit3, Trash2, Search, Tag, X, BookMarked, Sparkles } from 'lucide-react';
 import { api } from '@/api/client';
+import { useApp } from '@/stores/app';
 import { Spinner, Modal, useToast, EmptyState } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import type { Genre, GenreCategory } from '@shared/genres';
@@ -33,6 +34,8 @@ export default function Genres() {
   const [editing, setEditing] = useState<Genre | null>(null);
   const [creating, setCreating] = useState(false);
   const { toast, node } = useToast();
+  // AI 补全题材说明: 记录正在补全的题材 id(防止重复点击)
+  const [enrichingId, setEnrichingId] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -73,6 +76,28 @@ export default function Genres() {
       setGenres(list => list.filter(x => x.id !== g.id));
       toast('已删除');
     } catch (e) { toast((e as Error).message, 'err'); }
+  };
+
+  // AI 补全题材说明: 调 AnySearch 联网搜索 + LLM 生成详细 description + emotionMap
+  // 透传当前所选 model/providerId(不传则后端回落到 default 旗舰)
+  const handleEnrich = async (g: Genre) => {
+    if (enrichingId) return;  // 防重复点击
+    setEnrichingId(g.id);
+    toast(`正在为「${g.label}」联网搜索并生成详细说明...`);
+    try {
+      const { currentModel, currentProviderId } = useApp.getState();
+      await api.genres.enrich(g.id, {
+        model: currentModel || undefined,
+        providerId: currentProviderId || undefined,
+        webSearch: true,
+      });
+      toast(`已补全「${g.label}」的题材说明`);
+      load();  // 刷新列表展示新说明
+    } catch (e) {
+      toast(`补全失败：${(e as Error).message}`, 'err');
+    } finally {
+      setEnrichingId(null);
+    }
   };
 
   return (
@@ -158,6 +183,14 @@ export default function Genres() {
                 <p className="text-[11px] text-amber/80">情绪：{g.emotionMap}</p>
               )}
               <div className="mt-3 flex items-center justify-end gap-1 border-t pt-2" style={{ borderColor: 'var(--ink-600)' }}>
+                <button
+                  className="btn-ghost py-1 text-xs text-amber hover:text-amber-bright"
+                  onClick={() => handleEnrich(g)}
+                  disabled={enrichingId === g.id}
+                  title="联网搜索 + AI 生成详细题材说明"
+                >
+                  {enrichingId === g.id ? <Spinner className="h-3 w-3" /> : <Sparkles size={12} />} AI 补全
+                </button>
                 <button
                   className="btn-ghost py-1 text-xs"
                   onClick={() => setEditing(g)}
