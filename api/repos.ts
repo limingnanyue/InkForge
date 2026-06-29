@@ -223,10 +223,14 @@ export const taskRepo = {
   // BUG-7 修复：CAS 更新，仅在当前状态匹配期望值时才更新（防 TOCTOU 竞态）
   // 场景：pause 路由先读取 status=running，校验通过后 update 期间 worker 恰好完成标记 done，
   //   原 update 会无脑覆盖 done 为 paused。CAS 保证只在仍是 running/queued 时才置 paused。
+  // H1 修复(第十八轮): 用 COALESCE(?, 列名) 在 SQL 层保留旧值,避免 patch 字段缺失时写 NULL 触发 NOT NULL 约束
+  //   原 bug: patch.progress ?? null 把 progress 写成 NULL,但 progress REAL NOT NULL →
+  //     pause 路由只传 { status: 'paused' } 时报 "NOT NULL constraint failed: task.progress"
+  //   现: COALESCE(?, progress) 传 NULL 时保留原列值,CAS 原子性不变,progress/message/status 都安全
   updateIfStatusIn(id: string, allowedStatus: Task['status'][], patch: Partial<Pick<Task, 'status' | 'progress' | 'message'>>): Task | null {
     const placeholders = allowedStatus.map(() => '?').join(',');
     const result = db.prepare(
-      `UPDATE task SET status=?, progress=?, message=?, updated_at=? WHERE id=? AND status IN (${placeholders})`
+      `UPDATE task SET status=COALESCE(?, status), progress=COALESCE(?, progress), message=COALESCE(?, message), updated_at=? WHERE id=? AND status IN (${placeholders})`
     ).run(patch.status ?? null, patch.progress ?? null, patch.message ?? null, now(), id, ...allowedStatus);
     if (result.changes === 0) return null;
     return this.get(id);
