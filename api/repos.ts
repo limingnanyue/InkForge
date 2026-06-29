@@ -88,9 +88,10 @@ export const chapterRepo = {
     const id = cryptoRandomId();
     const content = data.content || '';
     // M5 修复(第十三轮): 透传 positioning/coreEmotion(oh-story 章节定位六类持久化)
+    // H1 修复(第十九轮): 13 列对应 13 个 ?,原少 1 个占位符 → chapterRepo.create 必崩
     db.prepare(
       `INSERT INTO chapter (id, project_id, parent_id, title, outline, content, order_idx, word_count, status, positioning, core_emotion, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
     ).run(id, data.projectId, data.parentId ?? null, data.title, data.outline || '', content, data.orderIdx ?? 0, countWords(content), 'draft', data.positioning ?? null, data.coreEmotion ?? null, t, t);
     return this.get(id)!;
   },
@@ -353,6 +354,21 @@ export const exportRepo = {
     db.prepare('INSERT INTO export_record (id, project_id, format, chapter_range, file_path, created_at) VALUES (?,?,?,?,?,?)')
       .run(id, data.projectId, data.format, chapterRange, data.filePath, now());
     return { id, projectId: data.projectId, format: data.format, chapterRange, filePath: data.filePath, createdAt: now() };
+  },
+  // H4 修复(第十九轮): 删除单条导出记录 + 关联文件,返回被删文件路径供路由清理磁盘
+  // 无记录返回 null(404 由路由处理)
+  delete(id: string): string | null {
+    const row = db.prepare('SELECT file_path FROM export_record WHERE id=?').get(id) as { file_path: string } | undefined;
+    if (!row) return null;
+    db.prepare('DELETE FROM export_record WHERE id=?').run(id);
+    return row.file_path;
+  },
+  // H4 修复(第十九轮): 清空指定项目的所有导出记录 + 关联文件,返回被删文件路径列表
+  clearByProject(projectId: string): string[] {
+    const rows = db.prepare('SELECT file_path FROM export_record WHERE project_id=?').all(projectId) as { file_path: string }[];
+    const paths = rows.map(r => r.file_path);
+    db.prepare('DELETE FROM export_record WHERE project_id=?').run(projectId);
+    return paths;
   },
 };
 

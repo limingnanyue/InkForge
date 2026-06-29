@@ -21,7 +21,7 @@ const MAX_SHORT = 200_000;
  * 可被 generate 路由与 chat 路由（守护进程意图）共同调用
  * model/providerId：可选，前端从全局 store currentModel/currentProviderId 透传
  */
-export function createContinueTask(projectId: string, webSearch?: boolean, model?: string, providerId?: string, chapterWordBudget?: number): { task: Task; project: Project } | null {
+export function createContinueTask(projectId: string, webSearch?: boolean, model?: string, providerId?: string, chapterWordBudget?: number, chapterWordMin?: number, chapterWordMax?: number): { task: Task; project: Project } | null {
   const project = projectRepo.get(projectId);
   if (!project) return null;
 
@@ -62,6 +62,9 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
       ...(providerId ? { providerId } : {}),
       // 每章字数预算透传到 task.config，daemon 从 cfg 读
       ...(chapterWordBudget ? { chapterWordBudget } : {}),
+      // H3 修复(第十九轮): 每章字数上下限透传,daemon 用其替代硬编码 budget*0.8/1.2
+      ...(chapterWordMin != null ? { chapterWordMin } : {}),
+      ...(chapterWordMax != null ? { chapterWordMax } : {}),
     },
   });
 
@@ -75,7 +78,7 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
 }
 
 router.post('/', (req: Request, res: Response) => {
-  const { projectId, title, kind, targetWords, config, idea, webSearch, model, providerId, chapterWordBudget } = req.body || {};
+  const { projectId, title, kind, targetWords, config, idea, webSearch, model, providerId, chapterWordBudget, chapterWordMin, chapterWordMax } = req.body || {};
   if (!kind || !['book', 'short'].includes(kind)) return fail(res, 'INVALID', 'kind 必须为 book 或 short');
 
   const limit = kind === 'book' ? MAX_BOOK : MAX_SHORT;
@@ -87,6 +90,11 @@ router.post('/', (req: Request, res: Response) => {
   if (chapterWordBudget != null && (typeof chapterWordBudget !== 'number' || chapterWordBudget < budgetMin || chapterWordBudget > budgetMax)) {
     return fail(res, 'INVALID', `每章字数预算须在 ${budgetMin}-${budgetMax} 之间`);
   }
+  // H3 修复(第十九轮): 每章字数上下限校验
+  // 约束: min <= budget <= max; min >= budgetMin*0.5; max <= budgetMax*1.5
+  // (允许比 budget 范围更宽,因为上下限是浮动区间不是固定档位)
+  const minErr = validateWordRange(chapterWordMin, chapterWordMax, chapterWordBudget ?? (kind === 'book' ? 2500 : 5000), budgetMin, budgetMax);
+  if (minErr) return fail(res, 'INVALID', minErr);
 
   // 获取或创建项目
   let project = projectId ? projectRepo.get(projectId) : null;
@@ -119,30 +127,52 @@ router.post('/', (req: Request, res: Response) => {
       ...(providerId ? { providerId } : {}),
       // 每章字数预算透传到 task.config，daemon 从 cfg 读
       ...(chapterWordBudget ? { chapterWordBudget } : {}),
+      // H3 修复(第十九轮): 每章字数上下限透传,daemon 用其替代硬编码 budget*0.8/1.2
+      ...(chapterWordMin != null ? { chapterWordMin } : {}),
+      ...(chapterWordMax != null ? { chapterWordMax } : {}),
     },
   });
 
   ok(res, { task, project });
 });
 
+// H3 修复(第十九轮): 每章字数上下限校验
+// 规则: min/max 可选,但若传则必须满足 min <= budget <= max 且各自在 [budgetMin*0.5, budgetMax*1.5] 内
+// 返回错误消息字符串(校验失败)或 null(校验通过)
+function validateWordRange(min: unknown, max: unknown, budget: number, budgetMin: number, budgetMax: number): string | null {
+  const loBound = Math.round(budgetMin * 0.5);
+  const hiBound = Math.round(budgetMax * 1.5);
+  if (min != null) {
+    if (typeof min !== 'number' || min < loBound) return `每章字数下限不能小于 ${loBound}`;
+    if (min > budget) return `每章字数下限(${min})不能大于预算(${budget})`;
+  }
+  if (max != null) {
+    if (typeof max !== 'number' || max > hiBound) return `每章字数上限不能大于 ${hiBound}`;
+    if (max < budget) return `每章字数上限(${max})不能小于预算(${budget})`;
+  }
+  if (min != null && max != null && min > max) return `每章字数下限(${min})不能大于上限(${max})`;
+  return null;
+}
+
 // 继续写作：基于已有项目派发续写任务到守护进程
 router.post('/continue', (req: Request, res: Response) => {
-  const { projectId, webSearch, model, providerId, chapterWordBudget } = req.body || {};
+  const { projectId, webSearch, model, providerId, chapterWordBudget, chapterWordMin, chapterWordMax } = req.body || {};
   if (!projectId) return fail(res, 'INVALID', '项目 ID 必填');
   // M4 修复：/continue 路由也校验 chapterWordBudget 范围（与 POST / 一致）
   // H1 修复(第十一轮): book 边界 8000→10000, short 边界 10000→12000,与 Generate 页 + POST /generate 同步
   // 项目 type=short → 范围 2000-12000；其余（long/script）→ 1500-10000（book）
-  if (chapterWordBudget != null) {
-    const project = projectRepo.get(projectId);
-    if (!project) return fail(res, 'NOT_FOUND', '项目不存在', 404);
-    const isShort = project.type === 'short';
-    const budgetMin = isShort ? 2000 : 1500;
-    const budgetMax = isShort ? 12000 : 10000;
-    if (typeof chapterWordBudget !== 'number' || chapterWordBudget < budgetMin || chapterWordBudget > budgetMax) {
-      return fail(res, 'INVALID', `每章字数预算须在 ${budgetMin}-${budgetMax} 之间`);
-    }
+  const project0 = projectRepo.get(projectId);
+  if (!project0) return fail(res, 'NOT_FOUND', '项目不存在', 404);
+  const isShort = project0.type === 'short';
+  const budgetMin = isShort ? 2000 : 1500;
+  const budgetMax = isShort ? 12000 : 10000;
+  if (chapterWordBudget != null && (typeof chapterWordBudget !== 'number' || chapterWordBudget < budgetMin || chapterWordBudget > budgetMax)) {
+    return fail(res, 'INVALID', `每章字数预算须在 ${budgetMin}-${budgetMax} 之间`);
   }
-  const result = createContinueTask(projectId, webSearch, model, providerId, chapterWordBudget);
+  // H3 修复(第十九轮): /continue 路由也校验 chapterWordMin/Max 范围
+  const minErr = validateWordRange(chapterWordMin, chapterWordMax, chapterWordBudget ?? (isShort ? 5000 : 2500), budgetMin, budgetMax);
+  if (minErr) return fail(res, 'INVALID', minErr);
+  const result = createContinueTask(projectId, webSearch, model, providerId, chapterWordBudget, chapterWordMin, chapterWordMax);
   if (!result) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   ok(res, result);
 });

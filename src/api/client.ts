@@ -132,8 +132,9 @@ export const api = {
     // BUG1 修复:补 chapterWordBudget 参数,继续写作时透传到后端
     // 原签名漏掉此参数 → ProjectDetail.continueWriting 调用时丢字段 → daemon 回落 infer(取项目历史平均)
     // → 若用户在 Generate 页选了 2000 字,但项目历史章节是 2500 字,续写会用 2500 字 → 字数不一致
-    continue: (projectId: string, webSearch?: boolean, model?: string, providerId?: string, chapterWordBudget?: number) =>
-      req<{ task: Task; project: Project }>('/generate/continue', { method: 'POST', body: JSON.stringify({ projectId, webSearch, model, providerId, chapterWordBudget }) }),
+    // H3 修复(第十九轮): 补 chapterWordMin/Max 参数,继续写作时透传用户配置的上下限
+    continue: (projectId: string, webSearch?: boolean, model?: string, providerId?: string, chapterWordBudget?: number, chapterWordMin?: number, chapterWordMax?: number) =>
+      req<{ task: Task; project: Project }>('/generate/continue', { method: 'POST', body: JSON.stringify({ projectId, webSearch, model, providerId, chapterWordBudget, chapterWordMin, chapterWordMax }) }),
   },
   tasks: {
     list: (projectId?: string) => req<Task[]>(`/tasks${projectId ? `?projectId=${projectId}` : ''}`),
@@ -169,6 +170,10 @@ export const api = {
       req<{ filePath: string; fileName: string }>('/exports', { method: 'POST', body: JSON.stringify(data) }),
     list: (projectId?: string) => req<ExportRecord[]>(`/exports${projectId ? `?projectId=${projectId}` : ''}`),
     downloadUrl: (fileName: string) => `${BASE}/exports/download/${fileName}`,
+    // H4 修复(第十九轮): 删除单条导出记录 + 关联文件
+    deleteRecord: (id: string) => req<{ id: string }>(`/exports/${id}`, { method: 'DELETE' }),
+    // H4 修复(第十九轮): 清空指定项目的全部导出记录 + 关联文件
+    clearByProject: (projectId: string) => req<{ deleted: number }>(`/exports/project/${projectId}`, { method: 'DELETE' }),
   },
   // 分析工具：市场风向扫榜（风向标）+ 拆书
   analyze: {

@@ -3,6 +3,7 @@
  */
 import { Router, type Request, type Response } from 'express';
 import path from 'path';
+import fs from 'fs';
 import { exportProject } from '../exporter.js';
 import { exportRepo } from '../repos.js';
 import { EXPORT_DIR } from '../db.js';
@@ -13,6 +14,16 @@ const router = Router();
 const ok = (res: Response, data?: unknown) => res.json({ ok: true, data });
 const fail = (res: Response, code: string, message: string, status = 400) =>
   res.status(status).json({ ok: false, error: { code, message } });
+
+// H4 修复(第十九轮): 安全删除导出文件,文件不存在视为已删成功(不阻断)
+function safeDeleteFile(filePath: string): void {
+  try {
+    const abs = path.isAbsolute(filePath) ? filePath : path.join(EXPORT_DIR, path.basename(filePath));
+    if (fs.existsSync(abs)) fs.unlinkSync(abs);
+  } catch (e) {
+    console.warn(`[export] 删除文件失败 ${filePath}:`, (e as Error).message);
+  }
+}
 
 router.post('/', (req: Request, res: Response) => {
   const { projectId, format, chapterRange } = req.body || {};
@@ -37,6 +48,34 @@ router.get('/', (req: Request, res: Response) => {
   const raw = req.query.projectId;
   const projectId = typeof raw === 'string' ? raw : undefined;
   ok(res, exportRepo.list(projectId));
+});
+
+// H4 修复(第十九轮): 清空指定项目的全部导出记录 + 关联文件
+// 放在 /:id 之前,避免被通配匹配(:projectId 误吞 "project" 字面量虽不会发生,显式靠前更稳)
+router.delete('/project/:projectId', (req: Request, res: Response) => {
+  const { projectId } = req.params;
+  if (!projectId) return fail(res, 'INVALID', 'projectId 必填');
+  try {
+    const paths = exportRepo.clearByProject(projectId);
+    paths.forEach(p => safeDeleteFile(p));
+    ok(res, { deleted: paths.length });
+  } catch (e) {
+    fail(res, 'CLEAR_FAILED', (e as Error).message || '清空失败', 500);
+  }
+});
+
+// H4 修复(第十九轮): 删除单条导出记录 + 关联文件
+router.delete('/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  if (!id) return fail(res, 'INVALID', 'id 必填');
+  try {
+    const filePath = exportRepo.delete(id);
+    if (filePath === null) return fail(res, 'NOT_FOUND', '导出记录不存在', 404);
+    safeDeleteFile(filePath);
+    ok(res, { id });
+  } catch (e) {
+    fail(res, 'DELETE_FAILED', (e as Error).message || '删除失败', 500);
+  }
 });
 
 router.get('/download/:fileName', (req: Request, res: Response) => {

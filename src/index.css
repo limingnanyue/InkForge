@@ -87,6 +87,17 @@ body {
   .btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
   .btn-ghost:disabled:hover { color: var(--paper-dim); border-color: var(--ink-400); background: transparent; }
 
+  /* H4 修复(第十九轮): 危险按钮 —— 删除/清空等不可逆操作,朱砂红实底 + 内发光 */
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-5 py-2.5 text-sm font-medium transition-all duration-200;
+    background: linear-gradient(180deg, #dc2626, #b91c1c);
+    color: #fff;
+    box-shadow: 0 0 0 1px #7f1d1d, 0 2px 12px -2px rgba(220, 38, 38, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  }
+  .btn-danger:hover { box-shadow: 0 0 0 1px #991b1b, 0 4px 20px -2px rgba(220, 38, 38, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.25); transform: translateY(-1px); }
+  .btn-danger:active { transform: translateY(0); }
+  .btn-danger:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
   /* 面板 */
   .panel {
     background: var(--ink-800);

@@ -18,6 +18,9 @@ interface Form {
   hookStyle: string; pace: string; ending: string;
   viewpoint: string; tone: string;
   chapterWordBudget: number;
+  // H3 修复(第十九轮): 每章字数上下限 - 用户可自定义浮动范围,默认 = budget*0.8/1.2
+  chapterWordMin: number;
+  chapterWordMax: number;
 }
 
 const KIND_PRESET: Record<GenerateKind, {
@@ -61,6 +64,8 @@ export default function Generate() {
     hookStyle: '强冲突', pace: '中等', ending: '圆满',
     viewpoint: '第三人称', tone: '爽文',
     chapterWordBudget: 2500,
+    // H3 修复(第十九轮): 默认 min/max = budget*0.8/1.2
+    chapterWordMin: 2000, chapterWordMax: 3000,
   });
   // BUG3 修复：targetWords 用独立字符串 state 暂存，允许清空重输；onBlur 写入 form.targetWords，submit 校验此原始值
   const [targetWordsInput, setTargetWordsInput] = useState<string>(String(300_000));
@@ -87,10 +92,28 @@ export default function Generate() {
   const pickKind = (k: GenerateKind) => {
     setKind(k);
     const preset = KIND_PRESET[k];
-    setForm(f => ({ ...f, targetWords: preset.default, chapterWordBudget: preset.budgetDefault }));
+    // H3 修复(第十九轮): 切换 kind 时同步更新 budget + min/max(默认 budget*0.8/1.2)
+    const budget = preset.budgetDefault;
+    setForm(f => ({
+      ...f,
+      targetWords: preset.default,
+      chapterWordBudget: budget,
+      chapterWordMin: Math.round(budget * 0.8),
+      chapterWordMax: Math.round(budget * 1.2),
+    }));
     setTargetWordsInput(String(preset.default));
     setStep(2);
   };
+
+  // H3 修复(第十九轮): budget 变化时自动联动 min/max(默认 = budget*0.8/1.2)
+  // 用户可单独调整 min/max,但调 budget 后 min/max 会被重置为默认值(budget 是主控)
+  useEffect(() => {
+    setForm(f => ({
+      ...f,
+      chapterWordMin: Math.round(f.chapterWordBudget * 0.8),
+      chapterWordMax: Math.round(f.chapterWordBudget * 1.2),
+    }));
+  }, [form.chapterWordBudget]);
 
   const submit = async () => {
     if (!form.idea.trim()) { toast('请填写核心创意', 'err'); return; }
@@ -102,6 +125,16 @@ export default function Generate() {
     if (n > KIND_PRESET[kind].cap) { toast(`字数不能超过 ${KIND_PRESET[kind].cap}`, 'err'); return; }
     if (!form.genre.trim()) { toast('请选择或输入题材', 'err'); return; }
     if (!currentModel || !currentProviderId) { toast('请先选择模型', 'err'); return; }
+    // H3 修复(第十九轮): 前端校验 chapterWordMin/Max 约束 min <= budget <= max
+    if (form.chapterWordMin > form.chapterWordBudget) {
+      toast(`每章字数下限(${form.chapterWordMin})不能大于预算(${form.chapterWordBudget})`, 'err'); return;
+    }
+    if (form.chapterWordMax < form.chapterWordBudget) {
+      toast(`每章字数上限(${form.chapterWordMax})不能小于预算(${form.chapterWordBudget})`, 'err'); return;
+    }
+    if (form.chapterWordMin > form.chapterWordMax) {
+      toast(`每章字数下限(${form.chapterWordMin})不能大于上限(${form.chapterWordMax})`, 'err'); return;
+    }
     setBusy(true);
     const config: GenerateConfig = {
       genre: form.genre.trim(),
@@ -117,6 +150,9 @@ export default function Generate() {
         webSearch,
         // 每章字数预算透传到 daemon（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
         chapterWordBudget: form.chapterWordBudget,
+        // H3 修复(第十九轮): 透传用户配置的每章字数上下限,daemon 用其替代硬编码 budget*0.8/1.2
+        chapterWordMin: form.chapterWordMin,
+        chapterWordMax: form.chapterWordMax,
         // 透传当前所选模型，daemon 会优先用此 model/providerId 而非 default 旗舰
         model: currentModel,
         providerId: currentProviderId || undefined,
@@ -314,6 +350,51 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
             <Hash size={11} />
             预估 <span className="font-mono text-amber">{estChapters}</span> {kind === 'book' ? '章' : '段'} ·
             总计约 <span className="font-mono text-amber">{(form.targetWords / 10000).toFixed(1)}</span> 万字
+          </div>
+          {/* H3 修复(第十九轮): 每章字数上下限输入 - daemon 会在此范围内浮动生成
+              默认 = budget*0.8/1.2(由 useEffect 自动联动),用户可单独调整 */}
+          <div className="mt-3 rounded-md border p-2.5" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-[10px] uppercase tracking-wider text-paper-mute">每章字数浮动范围</span>
+              <span className="text-[10px] text-paper-mute">默认 = 预算 ×0.8 / ×1.2</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="flex flex-1 items-center gap-1">
+                <label className="shrink-0 text-[10px] text-paper-mute">下限</label>
+                <input
+                  type="number"
+                  min={Math.round(preset.budgetMin * 0.5)}
+                  max={form.chapterWordBudget}
+                  step={preset.budgetStep}
+                  className="input px-2 py-1 text-xs"
+                  value={form.chapterWordMin}
+                  onChange={e => {
+                    const v = Number(e.target.value);
+                    if (!isNaN(v)) set('chapterWordMin', Math.min(form.chapterWordBudget, Math.max(Math.round(preset.budgetMin * 0.5), v)));
+                  }}
+                />
+              </div>
+              <span className="shrink-0 text-[10px] text-paper-mute">—</span>
+              <div className="flex flex-1 items-center gap-1">
+                <label className="shrink-0 text-[10px] text-paper-mute">上限</label>
+                <input
+                  type="number"
+                  min={form.chapterWordBudget}
+                  max={Math.round(preset.budgetMax * 1.5)}
+                  step={preset.budgetStep}
+                  className="input px-2 py-1 text-xs"
+                  value={form.chapterWordMax}
+                  onChange={e => {
+                    const v = Number(e.target.value);
+                    if (!isNaN(v)) set('chapterWordMax', Math.max(form.chapterWordBudget, Math.min(Math.round(preset.budgetMax * 1.5), v)));
+                  }}
+                />
+              </div>
+              <span className="shrink-0 text-[10px] text-paper-mute">字</span>
+            </div>
+            <p className="mt-1.5 text-[10px] text-paper-mute">
+              守护进程生成时,每章字数将在 <span className="font-mono text-amber">{form.chapterWordMin}</span>-<span className="font-mono text-amber">{form.chapterWordMax}</span> 区间内浮动(影响大纲 prompt 与正文 prompt)
+            </p>
           </div>
         </div>
       </Field>

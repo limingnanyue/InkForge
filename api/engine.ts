@@ -303,6 +303,7 @@ export async function reconcileState(
 // 章节生成前的位置锚点：告诉 LLM 当前在第几章、已完成多少、本章目标 + 上一章结尾用于自然衔接
 // oh-story：注入【本章定位】块（章节定位类型 + 字数预算 + 核心情绪），与 write prompt 的章节定位六类/字数预算Σ契约对位
 // M3 修复(第十四轮): volumeCtx 加 keyForeshadows,本卷主线块注入重点伏笔,LLM 知本章可回收哪些
+// H3 修复(第十九轮): 加 wordMin/wordMax 参数,用户配置的每章字数上下限注入 prompt,替代硬编码 budget*0.8/1.2
 export function buildChapterAnchor(
   projectId: string,
   currentIdx: number,
@@ -313,26 +314,36 @@ export function buildChapterAnchor(
   baseWordTarget = 2500,
   coreEmotion?: string,
   volumeCtx?: { idx: number; title: string; premise: string; emotionArc: string; keyForeshadows?: string[] } | null,
+  wordMin?: number,
+  wordMax?: number,
 ): string {
   // BUG-1 修复：原 listByProject 全量加载只为取 prevChapters[currentIdx-1].content.slice(-300)，
   // 2000 章循环 = O(N²) 全表扫描。改用 getTail 仅查单行 content
   const prevTail = (currentIdx > 0 ? chapterRepo.getTail(projectId, currentIdx - 1) : '') || '（首章，无需承接）';
+
+  // H3 修复(第十九轮): 用户配置的上下限,不传则按 baseWordTarget*0.8/1.2 计算(向后兼容)
+  const lo = wordMin ?? Math.round(baseWordTarget * 0.8);
+  const hi = wordMax ?? Math.round(baseWordTarget * 1.2);
 
   // 本章定位块：章节定位类型 + 字数预算 + 核心情绪（与 write prompt 的【本章定位】字段对位）
   let positioningBlock = '';
   if (positioning) {
     const meta = POSITIONING_META[positioning];
     const wordBudget = Math.round(baseWordTarget * meta.budgetMult);
+    // H3 修复(第十九轮): 定位章字数预算按 budgetMult 调整,但浮动区间用用户配置的 [lo, hi]
+    // 原: 硬编码 wordBudget*0.95/1.1; 现: 保持浮动宽度一致,以 wordBudget 为中心 ±(hi-baseWordTarget)/(baseWordTarget-lo)
+    const positioningLo = Math.max(lo, Math.round(wordBudget - (baseWordTarget - lo)));
+    const positioningHi = Math.round(wordBudget + (hi - baseWordTarget));
     positioningBlock = `
 【本章定位】
 · 章节类型：${meta.label}（${positioning}）—— 情绪强度对位：${meta.emotion}
-· 字数预算：${wordBudget} 字（Σ 落在 [${Math.round(wordBudget * 0.95)}, ${Math.round(wordBudget * 1.1)}] 内，防注水/防欠字）
+· 字数预算：${wordBudget} 字（Σ 落在 [${positioningLo}, ${positioningHi}] 内，防注水/防欠字）
 · 核心情绪：${coreEmotion || meta.emotion}`;
   } else {
     positioningBlock = `
 【本章定位】
 · 章节类型：普通推进章（默认）
-· 字数预算：${baseWordTarget} 字（约 ${Math.round(baseWordTarget * 0.8)}-${Math.round(baseWordTarget * 1.2)} 字）
+· 字数预算：${baseWordTarget} 字（约 ${lo}-${hi} 字）
 · 核心情绪：按题材对位（见题材→情绪路由表）`;
   }
 
@@ -897,13 +908,19 @@ async function generateOutlineForVolume(opts: {
   prevVolumeTail?: string;     // 上一卷最后一章标题+钩子（用于承接）
   webSearch?: boolean;
   chapterWordBudget?: number;  // 每章字数预算（默认 2500，影响 prompt 中的"每章约 X 字"提示）
+  // H3 修复(第十九轮): 每章字数上下限,不传则按 budget*0.8/1.2 计算
+  chapterWordMin?: number;
+  chapterWordMax?: number;
 }): Promise<ParsedOutlineItem[]> {
   const { projectId, model, providerId, config, idea, volIndex, volTotal, volChapterCount, globalStartIdx, emotionArc, premiseHint, prevVolumeTail, webSearch } = opts;
   const chapterWordBudget = opts.chapterWordBudget ?? 2500;
+  // H3 修复(第十九轮): 用用户配置的上下限替代硬编码 budget*0.8/1.2
+  const chapterWordMin = opts.chapterWordMin ?? Math.round(chapterWordBudget * 0.8);
+  const chapterWordMax = opts.chapterWordMax ?? Math.round(chapterWordBudget * 1.2);
   const dist = computePositioningDistribution(volChapterCount);
   const distLine = `高压章 ${dist['high-pressure']} 章 / 普通推进章 ${dist['normal-progress']} 章 / 修炼试错章 ${dist['trial-error']} 章 / 关系回收章 ${dist['relationship']} 章 / 低压生活章 ${dist['low-pressure']} 章 / 信息整理章 ${dist['info-organize']} 章`;
 
-  const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
+  const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 ${chapterWordMin}-${chapterWordMax} 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
 
 【核心创意】${idea}
 【题材风格】${config.genre}${buildGenreHint(config)}
@@ -980,10 +997,16 @@ export async function generateOutline(opts: {
   onVolumeCheckpoint?: (accumulated: ParsedOutlineItem[], doneVolumes: number, totalVolumes: number) => void;
   /** 每章字数预算：影响章数估算与 prompt 中的"每章约 X 字"提示，默认 2500 */
   chapterWordBudget?: number;
+  // H3 修复(第十九轮): 每章字数上下限,不传则按 budget*0.8/1.2 计算
+  chapterWordMin?: number;
+  chapterWordMax?: number;
 }): Promise<string> {
   const { projectId, model, providerId, targetWords, config, idea, webSearch, onVolumeProgress, prevVolumes, onVolumeCheckpoint } = opts;
   // 每章字数预算：用户可配置，默认 2500（影响章数估算与 prompt 中的字数提示）
   const chapterWordBudget = opts.chapterWordBudget ?? 2500;
+  // H3 修复(第十九轮): 用用户配置的上下限替代硬编码 budget*0.8/1.2
+  const chapterWordMin = opts.chapterWordMin ?? Math.round(chapterWordBudget * 0.8);
+  const chapterWordMax = opts.chapterWordMax ?? Math.round(chapterWordBudget * 1.2);
   const chapterCount = Math.max(1, Math.ceil(targetWords / chapterWordBudget));
 
   // —— 单次调用足够时走原逻辑（小卷，<= 200 章）——
@@ -998,7 +1021,7 @@ export async function generateOutline(opts: {
     const volLine = volumes.length > 0
       ? `\n【卷纲】共 ${volumes.length} 卷，每卷 ~20 章，卷情绪弧线依次：${volumes.map((v, i) => `第${i + 1}卷(${v.range[0] + 1}-${v.range[1] + 1}章,${v.emotionArc})`).join('；')}`
       : '';
-    const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字）。
+    const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 ${chapterWordMin}-${chapterWordMax} 字）。
 
 【核心创意】${idea}
 【题材风格】${config.genre}${buildGenreHint(config)}
@@ -1072,6 +1095,8 @@ ${distLine}
       emotionArc: vol.emotionArc, premiseHint: volPremiseHints(vi),
       prevVolumeTail: prevTail, webSearch,
       chapterWordBudget,
+      // H3 修复(第十九轮): 透传用户配置的上下限
+      chapterWordMin, chapterWordMax,
     });
 
     if (volChapters.length === 0) {

@@ -732,6 +732,106 @@ export default function ProjectDetail() {
           {/* 简介 Tab */}
           {tab === 'brief' && (
             <div className="mx-auto max-w-3xl space-y-4 p-4 md:p-8">
+              {/* H2 修复(第十九轮): 独立封面栏 - 直出封面,不再藏在提示词编辑流程里
+                  有图: 左封面右元信息 + 生成/下载按钮
+                  无图: 占位 + 一键生成按钮(调 onGenerateCoverPreview; 若无提示词则引导先生成提示词) */}
+              <section className="panel-elevated animate-fade-up p-5">
+                <div className="mb-3 flex items-center justify-between">
+                  <h2 className="font-display text-lg text-paper">封面</h2>
+                  {coverPreviewUrl && (
+                    <button
+                      className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-amber hover:text-amber-bright"
+                      onClick={onGenerateCoverPreview}
+                      disabled={coverPreviewBusy}
+                      title="基于当前提示词重新生成封面预览图"
+                    >
+                      {coverPreviewBusy ? <Spinner className="h-3 w-3" /> : <RotateCw size={12} />} 重新生成
+                    </button>
+                  )}
+                </div>
+                <div className="flex flex-col gap-4 sm:flex-row">
+                  {/* 封面图区域:固定宽高比 3:4,模拟书籍封面 */}
+                  <div className="shrink-0 self-start" style={{ width: '180px' }}>
+                    {coverPreviewUrl ? (
+                      <div className="relative overflow-hidden rounded-md border shadow-lg" style={{ borderColor: 'var(--ink-500)', boxShadow: '0 8px 24px -8px rgba(0,0,0,0.6)' }}>
+                        <img src={coverPreviewUrl} alt="封面预览" className="block w-full" />
+                      </div>
+                    ) : (
+                      <div
+                        className="flex aspect-[3/4] w-full flex-col items-center justify-center gap-2 rounded-md border-2 border-dashed text-paper-mute"
+                        style={{ borderColor: 'var(--ink-400)', background: 'var(--ink-800)' }}
+                      >
+                        <ImageIcon size={32} className="opacity-40" />
+                        <span className="text-[10px]">尚未生成封面</span>
+                      </div>
+                    )}
+                  </div>
+                  {/* 右侧:元信息 + 操作 */}
+                  <div className="flex min-w-0 flex-1 flex-col gap-3">
+                    <div className="space-y-1.5 text-sm">
+                      <div className="flex gap-2">
+                        <span className="w-16 shrink-0 text-[11px] uppercase tracking-wider text-paper-mute">书名</span>
+                        <span className="truncate text-paper-dim">{coverBookTitle.trim() || project.title}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <span className="w-16 shrink-0 text-[11px] uppercase tracking-wider text-paper-mute">作者</span>
+                        <span className="truncate text-paper-dim">{coverAuthor.trim() || '（未署名）'}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <span className="w-16 shrink-0 text-[11px] uppercase tracking-wider text-paper-mute">风格</span>
+                        <span className="text-paper-dim">{COVER_STYLE_OPTIONS.find(o => o.key === coverStyle)?.label || coverStyle}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <span className="w-16 shrink-0 text-[11px] uppercase tracking-wider text-paper-mute">平台</span>
+                        <span className="text-paper-dim">{COVER_PLATFORM_OPTIONS.find(o => o.key === coverPlatform)?.label || coverPlatform}</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <span className="w-16 shrink-0 text-[11px] uppercase tracking-wider text-paper-mute">图源</span>
+                        <span className="truncate text-paper-dim">
+                          {coverImageProvider
+                            ? `${providers.find(p => p.id === coverImageProvider.split('::')[0])?.name || '未知'} · ${coverImageProvider.split('::')[1] || ''}`
+                            : '系统默认（TRAE 文生图）'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="mt-auto flex flex-wrap gap-2">
+                      {!coverPreviewUrl && (
+                        <button
+                          className="btn-primary flex items-center gap-1.5 py-1.5 text-xs"
+                          onClick={onGenerateCoverPreview}
+                          disabled={coverPreviewBusy || !coverDraft.trim()}
+                          title={!coverDraft.trim() ? '请先在下方生成封面提示词' : '生成封面预览图'}
+                        >
+                          {coverPreviewBusy ? <Spinner className="h-3.5 w-3.5" /> : <ImageIcon size={13} />}
+                          {coverPreviewBusy ? '生成中…' : '生成封面'}
+                        </button>
+                      )}
+                      {coverPreviewUrl && (
+                        <button
+                          className="btn-ghost flex items-center gap-1.5 py-1.5 text-xs"
+                          onClick={onDownloadCover}
+                          title="下载封面 PNG"
+                        >
+                          <Download size={13} /> 下载 PNG
+                        </button>
+                      )}
+                      <button
+                        className="btn-ghost flex items-center gap-1.5 py-1.5 text-xs"
+                        onClick={onGenerateCover}
+                        disabled={genCoverBusy}
+                        title="基于项目信息 AI 生成中英双段封面绘图 prompt"
+                      >
+                        {genCoverBusy ? <Spinner className="h-3.5 w-3.5" /> : <Camera size={13} />}
+                        {genCoverBusy ? '生成提示词中…' : '重新生成提示词'}
+                      </button>
+                    </div>
+                    {!coverDraft.trim() && (
+                      <p className="text-[11px] text-paper-mute">提示：先点击「重新生成提示词」生成封面提示词，再生成封面。</p>
+                    )}
+                  </div>
+                </div>
+              </section>
+
               <div className="panel-elevated p-5">
                 <h2 className="mb-4 font-display text-lg text-paper">项目信息</h2>
                 <div className="space-y-4">
@@ -879,23 +979,7 @@ export default function ProjectDetail() {
                         </button>
                       </div>
                     )}
-                    {/* 封面预览图展示 + 下载 */}
-                    {coverPreviewUrl && (
-                      <div className="mt-3 space-y-2">
-                        <div className="relative overflow-hidden rounded-md border" style={{ borderColor: 'var(--ink-500)' }}>
-                          <img src={coverPreviewUrl} alt="封面预览" className="block w-full" />
-                        </div>
-                        <div className="flex items-center justify-between text-[10px] text-paper-mute">
-                          <span>已叠加书名「{coverBookTitle.trim() || project.title}」{coverAuthor.trim() ? ` · 作者「${coverAuthor.trim()}」` : ''}</span>
-                          <button
-                            className="flex items-center gap-1 text-amber hover:text-amber-bright"
-                            onClick={onDownloadCover}
-                          >
-                            <Download size={11} /> 下载 PNG
-                          </button>
-                        </div>
-                      </div>
-                    )}
+                    {/* H2 修复(第十九轮): 预览图展示已移到顶部独立封面栏,此处不再重复渲染 */}
                   </div>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <div>

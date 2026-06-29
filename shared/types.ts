@@ -256,6 +256,11 @@ export interface GenerateRequest {
   // 每章字数预算（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
   // 不传则按 kind 回落：book=2500，short=5000
   chapterWordBudget?: number;
+  // H3 修复(第十九轮): 每章字数上下限 - 用户可自定义浮动范围,替代原硬编码 budget*0.8/1.2
+  // 不传则后端按 budget*0.8/1.2 计算(向后兼容)
+  // 约束: chapterWordMin <= chapterWordBudget <= chapterWordMax
+  chapterWordMin?: number;
+  chapterWordMax?: number;
   // 任务级模型选择（不传则回落到 default provider 旗舰模型）
   // 用法：前端从全局 store currentModel/currentProviderId 透传到 generate 接口
   model?: string;

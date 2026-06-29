@@ -308,13 +308,20 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   const cfg = task.config as {
     projectId: string; targetWords: number; config: any; idea: string; title: string;
     chapterWordBudget?: number;
+    // H3 修复(第十九轮): 每章字数上下限(可选,不传则按 budget*0.8/1.2 计算)
+    chapterWordMin?: number;
+    chapterWordMax?: number;
   };
   const { projectId, targetWords } = cfg;
   // 每章字数预算：用户可配置，默认 2500（影响大纲章数估算、章节 maxTokens、质量门字数门判定）
   // H1 修复：续写任务未显式传时，从历史章节平均字数推断（防字数不一致）
   const chapterWordBudget = cfg.chapterWordBudget ?? inferChapterWordBudget(projectId);
-  // BUG1 辅助：把实际生效的 chapterWordBudget 打到 task log，方便用户排查"选了 2000 但实际 2500"
-  logTask(task.id, 'info', `每章字数预算：${chapterWordBudget} 字${cfg.chapterWordBudget ? '（用户配置）' : '（从历史章节平均推断）'} · token 系数 ${tokenCharRatio(providerId)}×`);
+  // H3 修复(第十九轮): 每章字数上下限 - 用户可自定义浮动范围,替代原硬编码 budget*0.8/1.2
+  // 不传则按 budget*0.8/1.2 计算(向后兼容)
+  const chapterWordMin = cfg.chapterWordMin ?? Math.round(chapterWordBudget * 0.8);
+  const chapterWordMax = cfg.chapterWordMax ?? Math.round(chapterWordBudget * 1.2);
+  // BUG1 辅助：把实际生效的 chapterWordBudget + 上下限打到 task log，方便用户排查"选了 2000 但实际 2500"
+  logTask(task.id, 'info', `每章字数预算：${chapterWordBudget} 字（浮动 ${chapterWordMin}-${chapterWordMax}）${cfg.chapterWordBudget ? '（用户配置）' : '（从历史章节平均推断）'} · token 系数 ${tokenCharRatio(providerId)}×`);
 
   // 断点续传：从 checkpoint 读取进度
   const checkpoint = task.checkpoint as { phase?: string; chapterIdx?: number; outlineJson?: string; scanInsight?: string };
@@ -390,6 +397,8 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       outline = await generateOutline({
         projectId, model, providerId, targetWords, config: cfg.config, idea: cfg.idea, webSearch,
         chapterWordBudget,
+        // H3 修复(第十九轮): 透传用户配置的每章字数上下限
+        chapterWordMin, chapterWordMax,
         prevVolumes,
         onVolumeProgress: (done, total) => {
           logTask(task.id, 'info', `大纲分卷生成 ${done}/${total} 卷完成`);
@@ -506,7 +515,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     const volumeCtx = curVol
       ? { idx: curVol.idx, title: curVol.title, premise: curVol.premise, emotionArc: curVol.emotionArc, keyForeshadows: curVol.keyForeshadows }
       : null;
-    const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion, volumeCtx);
+    const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion, volumeCtx, chapterWordMin, chapterWordMax);
     // 章末钩子提示 + 定位对位的字数提示
     const positioningHint = ch.positioning
       ? `（本章为${ch.positioning}，按【本章定位】的字数预算与情绪强度写作）`
@@ -529,7 +538,8 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     const wordBudget = Math.round(chapterWordBudget * positioningMult);
     // H4 修复：maxTokens 按国产模型 token/字 系数放大（1 字 ≈ 1.5-2 token），
     // 否则国产模型实际可输出字数 ≈ maxTokens / 1.5，章节被截断
-    const chapterMaxTokens = Math.round(wordBudget * tokenCharRatio(providerId));
+    // H3 修复(第十九轮): 取 wordBudget 与用户配置上限 chapterWordMax 的较大值,保证上限字数能写满
+    const chapterMaxTokens = Math.round(Math.max(wordBudget, chapterWordMax) * tokenCharRatio(providerId));
 
     // 章节质量门：生成 → 质检 → 不达标重写一次（避免死循环 + 浪费 token，最多 1 次重写）
     try {
@@ -604,21 +614,19 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     taskRepo.update(task.id, { checkpoint: { phase: 'chapter', outlineJson: outline, chapterIdx: i + 1, totalChapters: chapters.length } });
 
     // H6 修复(第十四轮): 卷末触发远期摘要真压缩(oh-story: 远期内容按卷压缩,防长篇失忆)
-    // 检测: 下一章 idx 超出当前卷 chapterRange[1] → 当前卷已完结,触发压缩
+    // M1 修复(第十九轮): 原 `!nextVol` 永远为 false(computeVolumeRanges 连续覆盖 [0, N-1],任意 i+1 都在某卷里)
+    //   导致整套远期卷真压缩机制实际从未运行,长篇后期远期记忆永远走 buildDynamicContext 的降级采样分支
+    // 改用「当前章是本卷最后一章」作为触发条件,即 i === curVol.chapterRange[1]
     // 幂等: compactVolumeSummary 内部检查已有 compactedSummary 时跳过
-    // 触发条件: 仅长篇(有 volumeOutlines)且当前卷已完结
-    if (curVol && i + 1 < chapters.length) {
-      const nextVol = curVolumes.find(v => (i + 1) >= v.chapterRange[0] && (i + 1) <= v.chapterRange[1]);
-      if (!nextVol) {
-        // 当前卷已完结,触发压缩(异步不阻塞,失败仅 warn)
-        try {
-          const compacted = await compactVolumeSummary(projectId, model, providerId, curVol.idx);
-          if (compacted) {
-            logTask(task.id, 'info', `第 ${curVol.idx + 1} 卷远期摘要压缩完成（${compacted.length} 字）`);
-          }
-        } catch (e) {
-          logTask(task.id, 'warn', `第 ${curVol.idx + 1} 卷摘要压缩失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
+    if (curVol && i === curVol.chapterRange[1] && i + 1 < chapters.length) {
+      // 当前卷已完结,触发压缩(异步不阻塞,失败仅 warn)
+      try {
+        const compacted = await compactVolumeSummary(projectId, model, providerId, curVol.idx);
+        if (compacted) {
+          logTask(task.id, 'info', `第 ${curVol.idx + 1} 卷远期摘要压缩完成（${compacted.length} 字）`);
         }
+      } catch (e) {
+        logTask(task.id, 'warn', `第 ${curVol.idx + 1} 卷摘要压缩失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
       }
     }
 
@@ -700,6 +708,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   const cfg = task.config as {
     projectId: string; targetWords: number; config: any; idea: string;
     chapterWordBudget?: number;
+    // H3 修复(第十九轮): 每章字数上下限(可选,不传则按 budget*0.8/1.2 计算)
+    chapterWordMin?: number;
+    chapterWordMax?: number;
   };
   const { projectId, targetWords } = cfg;
   // 短篇默认 5000 字/段；若项目已有段落则从平均字数推断（H1：防字数不一致）
@@ -711,8 +722,12 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     ? Math.max(2000, Math.min(12000, Math.round(doneSegs.reduce((s, c) => s + (c.wordCount || 0), 0) / doneSegs.length)))
     : 5000;
   const chapterWordBudget = cfg.chapterWordBudget ?? inferred;
-  // BUG1 辅助：把实际生效的 chapterWordBudget 打到 task log
-  logTask(task.id, 'info', `每章字数预算：${chapterWordBudget} 字${cfg.chapterWordBudget ? '（用户配置）' : '（从历史段落平均推断）'} · token 系数 ${tokenCharRatio(providerId)}×`);
+  // H3 修复(第十九轮): 每章字数上下限 - 用户可自定义浮动范围,替代原硬编码 budget*0.9/1.1
+  // 不传则按 budget*0.8/1.2 计算(与 book 流水线统一,向后兼容)
+  const chapterWordMin = cfg.chapterWordMin ?? Math.round(chapterWordBudget * 0.8);
+  const chapterWordMax = cfg.chapterWordMax ?? Math.round(chapterWordBudget * 1.2);
+  // BUG1 辅助：把实际生效的 chapterWordBudget + 上下限打到 task log
+  logTask(task.id, 'info', `每段字数预算：${chapterWordBudget} 字（浮动 ${chapterWordMin}-${chapterWordMax}）${cfg.chapterWordBudget ? '（用户配置）' : '（从历史段落平均推断）'} · token 系数 ${tokenCharRatio(providerId)}×`);
   const segmentCount = Math.max(1, Math.ceil(targetWords / chapterWordBudget));
   const checkpoint = task.checkpoint as { segmentIdx?: number; outlineJson?: string; setupDone?: boolean };
 
@@ -800,10 +815,11 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
         // 短篇段约 chapterWordBudget 字，maxTokens 按国产模型 token/字 系数放大（H4 防截断）
-        // B6 修复: prompt 上界是 chapterWordBudget * 1.1,maxTokens 需匹配上界
+        // B6 修复: prompt 上界是 chapterWordMax(用户配置),maxTokens 需匹配上界
+        // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.9/1.1
         // wordBudget 保持字数语义不变，用于质量门判定
-        const segMaxTokens = Math.round(chapterWordBudget * 1.1 * tokenCharRatio(providerId));
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${Math.round(chapterWordBudget * 0.9)}-${Math.round(chapterWordBudget * 1.1)} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
+        const segMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
           content += chunk;
         }
         // 质量门检测（字数门 + 跑题门）
@@ -898,11 +914,15 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
 
 // ============ 单章生成 ============
 async function runChapterGeneration(task: Task, model: string, providerId?: string, webSearch = false): Promise<void> {
-  const cfg = task.config as { projectId: string; chapterId: string; prompt: string; chapterWordBudget?: number };
+  const cfg = task.config as { projectId: string; chapterId: string; prompt: string; chapterWordBudget?: number; chapterWordMin?: number; chapterWordMax?: number };
   // 单章字数预算：用户可指定，否则从项目历史章节平均字数推断（H1：防字数不一致）
   // M2 修复(第十三轮): 传 projectType,short 项目无历史回落 5000(与 short pipeline 一致)
   const project = projectRepo.get(cfg.projectId);
   const chapterWordBudget = cfg.chapterWordBudget ?? inferChapterWordBudget(cfg.projectId, project?.type);
+  // H3 修复(第十九轮): 每章字数上下限 - 用户可自定义浮动范围,替代原硬编码 budget*0.8/1.2
+  // 不传则按 budget*0.8/1.2 计算(向后兼容)
+  const chapterWordMin = cfg.chapterWordMin ?? Math.round(chapterWordBudget * 0.8);
+  const chapterWordMax = cfg.chapterWordMax ?? Math.round(chapterWordBudget * 1.2);
   const chapter = chapterRepo.get(cfg.chapterId);
   if (!chapter) throw new Error('章节不存在');
   chapterRepo.update(chapter.id, { status: 'generating' });
@@ -915,10 +935,11 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
     for (let attempt = 0; attempt < 2; attempt++) {
       content = '';
       // H4 修复：maxTokens 按国产模型 token/字 系数放大，否则章节被截断
-      // B6 修复: prompt 上界是 chapterWordBudget * 1.2,maxTokens 需匹配上界(否则 LLM 按上界写满会被截断)
+      // B6 修复: prompt 上界是 chapterWordMax(用户配置),maxTokens 需匹配上界(否则 LLM 按上界写满会被截断)
+      // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.8/1.2
       // wordBudget 保持字数语义不变，用于质量门判定
-      const chMaxTokens = Math.round(chapterWordBudget * 1.2 * tokenCharRatio(providerId));
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 ${Math.round(chapterWordBudget * 0.8)}-${Math.round(chapterWordBudget * 1.2)} 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch }))) {
+      const chMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
+      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 ${chapterWordMin}-${chapterWordMax} 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch }))) {
         content += chunk;
       }
       try {

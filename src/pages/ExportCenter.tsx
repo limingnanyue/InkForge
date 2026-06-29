@@ -2,10 +2,10 @@
  * 导出中心 —— 多格式成书导出与历史
  */
 import { useEffect, useState } from 'react';
-import { Download, FileText, FileCode, BookOpen, FileType, History, Link2 } from 'lucide-react';
+import { Download, FileText, FileCode, BookOpen, FileType, History, Link2, Trash2 } from 'lucide-react';
 import { api } from '@/api/client';
 import BlurText from '@/components/BlurText';
-import { Spinner, EmptyState, fmtTime, useToast } from '@/components/ui';
+import { Spinner, EmptyState, fmtTime, useToast, Modal } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import type { Project, ExportRecord, ExportFormat } from '@shared/types';
 
@@ -25,6 +25,10 @@ export default function ExportCenter() {
   const [lastFile, setLastFile] = useState<{ fileName: string } | null>(null);
   const [history, setHistory] = useState<ExportRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  // H4 修复(第十九轮): 删除/清空确认弹窗 + 删除中态
+  const [deleteTarget, setDeleteTarget] = useState<ExportRecord | null>(null);
+  const [clearTarget, setClearTarget] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const { toast, node } = useToast();
 
   const loadHistory = async () => {
@@ -56,7 +60,35 @@ export default function ExportCenter() {
     finally { setBusy(false); }
   };
 
+  // H4 修复(第十九轮): 删除单条导出记录
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    try {
+      await api.exports.deleteRecord(deleteTarget.id);
+      toast('已删除导出记录');
+      setDeleteTarget(null);
+      loadHistory();
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setDeleting(false); }
+  };
+
+  // H4 修复(第十九轮): 清空指定项目的全部导出历史
+  const confirmClear = async () => {
+    if (!clearTarget) return;
+    setDeleting(true);
+    try {
+      const r = await api.exports.clearByProject(clearTarget);
+      toast(`已清空 ${r.deleted} 条导出记录`);
+      setClearTarget(null);
+      loadHistory();
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setDeleting(false); }
+  };
+
   const projectTitle = (id: string) => projects.find(p => p.id === id)?.title || '已删除项目';
+  // 当前选中项目的导出记录数（用于显示"清空"按钮可用态）
+  const projectHistoryCount = history.filter(r => r.projectId === projectId).length;
 
   if (loading) return <div className="flex h-full items-center justify-center text-paper-mute"><Spinner /></div>;
 
@@ -117,7 +149,19 @@ export default function ExportCenter() {
 
         {/* 历史 */}
         <section className="panel-elevated animate-fade-up p-6">
-          <h2 className="mb-4 flex items-center gap-2 font-display text-lg text-paper-dim"><History size={16} /> 导出历史</h2>
+          <div className="mb-4 flex items-center justify-between gap-2">
+            <h2 className="flex items-center gap-2 font-display text-lg text-paper-dim"><History size={16} /> 导出历史</h2>
+            {/* H4 修复(第十九轮): 清空当前项目全部导出记录按钮,无选中项目或无记录时禁用 */}
+            {projectId && projectHistoryCount > 0 && (
+              <button
+                className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-red-400 hover:text-red-300"
+                onClick={() => setClearTarget(projectId)}
+                title={`清空「${projectTitle(projectId)}」的 ${projectHistoryCount} 条导出记录`}
+              >
+                <Trash2 size={12} /> 清空当前项目
+              </button>
+            )}
+          </div>
           {history.length === 0 ? (
             <EmptyState icon={<Download size={32} />} title="尚无导出记录" desc="完成第一次导出后，记录会出现在这里。" />
           ) : (
@@ -130,6 +174,14 @@ export default function ExportCenter() {
                     <div className="flex items-center gap-2">
                       <span className="badge badge-amber">{f?.label || r.format}</span>
                       <span className="truncate text-sm text-paper-dim">{r.filePath.split(/[\\/]/).pop()}</span>
+                      {/* H4 修复(第十九轮): 单条删除按钮 */}
+                      <button
+                        className="ml-auto shrink-0 rounded p-1 text-paper-mute opacity-60 transition hover:bg-red-500/10 hover:text-red-400 hover:opacity-100"
+                        onClick={() => setDeleteTarget(r)}
+                        title="删除此记录"
+                      >
+                        <Trash2 size={13} />
+                      </button>
                     </div>
                     <p className="mt-1 text-[11px] text-paper-mute">{projectTitle(r.projectId)} · {fmtTime(r.createdAt)}</p>
                     <a className="mt-1.5 inline-flex items-center gap-1 text-xs text-amber hover:text-amber-bright"
@@ -143,6 +195,43 @@ export default function ExportCenter() {
           )}
         </section>
       </div>
+
+      {/* H4 修复(第十九轮): 删除单条确认弹窗 */}
+      <Modal
+        open={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        title="删除导出记录"
+      >
+        <p className="text-sm text-paper-dim">
+          确定删除导出记录「<span className="font-mono text-amber">{deleteTarget?.filePath.split(/[\\/]/).pop()}</span>」吗？
+        </p>
+        <p className="mt-2 text-xs text-paper-mute">将同时删除关联的导出文件，此操作不可撤销。</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setDeleteTarget(null)} disabled={deleting}>取消</button>
+          <button className="btn-danger" onClick={confirmDelete} disabled={deleting}>
+            {deleting ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 删除
+          </button>
+        </div>
+      </Modal>
+
+      {/* H4 修复(第十九轮): 清空项目确认弹窗 */}
+      <Modal
+        open={!!clearTarget}
+        onClose={() => setClearTarget(null)}
+        title="清空导出历史"
+      >
+        <p className="text-sm text-paper-dim">
+          确定清空项目「<span className="text-amber">{clearTarget ? projectTitle(clearTarget) : ''}</span>」的全部 <span className="font-mono text-amber">{projectHistoryCount}</span> 条导出记录吗？
+        </p>
+        <p className="mt-2 text-xs text-paper-mute">将同时删除所有关联的导出文件，此操作不可撤销。</p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setClearTarget(null)} disabled={deleting}>取消</button>
+          <button className="btn-danger" onClick={confirmClear} disabled={deleting}>
+            {deleting ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 清空全部
+          </button>
+        </div>
+      </Modal>
+
       {node}
     </div>
   );
