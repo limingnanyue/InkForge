@@ -292,12 +292,28 @@ export default function ProjectDetail() {
     { key: 'monochrome', label: '黑白' },
     { key: 'inkwash',    label: '东方水墨' },
   ];
+  // 平台风格库(参考 oh-story-claudecode/skills/story-cover cover-styles.md)
+  // 各网文平台有明确视觉风格:番茄高饱和/起点精致/晋江唯美/知乎极简/七猫冲击/刺猬猫二次元
+  const COVER_PLATFORM_OPTIONS: Array<{ key: string; label: string }> = [
+    { key: 'generic',   label: '通用' },
+    { key: 'fanqie',    label: '番茄小说' },
+    { key: 'qidian',    label: '起点中文网' },
+    { key: 'jjwxc',     label: '晋江文学城' },
+    { key: 'zhihu',     label: '知乎盐言' },
+    { key: 'qimao',     label: '七猫小说' },
+    { key: 'ciweimao',  label: '刺猬猫' },
+  ];
   const [coverDraft, setCoverDraft] = useState('');
   const [genCoverBusy, setGenCoverBusy] = useState(false);
-  // 风格 / 作者：跨项目记忆（localStorage 持久化）
+  // 风格 / 作者 / 平台：跨项目记忆（localStorage 持久化）
   const [coverStyle, setCoverStyle] = useState<string>(() => {
     try { return localStorage.getItem('inkforge.cover.style') || 'realistic'; }
     catch { return 'realistic'; }
+  });
+  // 平台风格(oh-story 移植):番茄/起点/晋江等,影响 prompt 的视觉关键词与字体风格
+  const [coverPlatform, setCoverPlatform] = useState<string>(() => {
+    try { return localStorage.getItem('inkforge.cover.platform') || 'generic'; }
+    catch { return 'generic'; }
   });
   const [coverAuthor, setCoverAuthor] = useState<string>(() => {
     try { return localStorage.getItem('inkforge.cover.author') || ''; }
@@ -347,15 +363,17 @@ export default function ProjectDetail() {
     if (!project) return;
     setGenCoverBusy(true);
     try {
-      // 持久化风格 / 作者（跨项目复用，避免每次重选）
+      // 持久化风格 / 平台 / 作者（跨项目复用，避免每次重选）
       try {
         localStorage.setItem('inkforge.cover.style', coverStyle);
+        localStorage.setItem('inkforge.cover.platform', coverPlatform);
         localStorage.setItem('inkforge.cover.author', coverAuthor);
       } catch { /* localStorage 不可用，忽略 */ }
       const { cover } = await api.projects.generateCover(project.id, {
         model: currentModel || undefined,
         providerId: currentProviderId || undefined,
         style: coverStyle,
+        platform: coverPlatform,
         bookTitle: coverBookTitle.trim() || project.title,
         author: coverAuthor.trim() || undefined,
       });
@@ -457,6 +475,10 @@ export default function ProjectDetail() {
       //   B. coverImageProvider 空 → 兜底走 TRAE 系统 text_to_image 端点(浏览器内置,无 apiKey)
       let objectUrl: string | null = null;
       let imageDataUrl: string | null = null;
+      // textRendered: 图像模型是否已渲染中文书名/作者(GPT-Image-2 等)
+      // true  → 跳过 canvas 叠加(图像已是完整封面)
+      // false → 走 canvas 叠加兜底
+      let textRendered = false;
       const sel = coverImageProvider;
       const sepIdx = sel ? sel.indexOf('::') : -1;
       const selProvider = sepIdx > 0 ? providers.find(p => p.id === sel.slice(0, sepIdx)) : undefined;
@@ -472,8 +494,9 @@ export default function ProjectDetail() {
         });
         // data.image 已是 data URL 形式
         imageDataUrl = data.image;
+        textRendered = !!data.textRendered;
       } else {
-        // 路径 B: TRAE 系统默认端点（兜底）
+        // 路径 B: TRAE 系统默认端点（兜底，不支持中文文字渲染）
         const url = `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=${encodeURIComponent(enPrompt)}&image_size=portrait_4_3`;
         const resp = await fetch(url, { signal: ac.signal });
         if (!resp.ok) throw new Error(`图片生成失败（${resp.status}）`);
@@ -481,13 +504,23 @@ export default function ProjectDetail() {
         objectUrl = URL.createObjectURL(blob);
       }
 
-      // canvas 叠加书名 + 作者（统一处理两条路径的图源）
+      const titledAuthor = coverAuthor.trim() || '';
+      const titledBook = coverBookTitle.trim() || project.title;
+      const src = imageDataUrl || objectUrl;
+      if (!src) throw new Error('未拿到图片数据');
+
+      if (textRendered) {
+        // 图像模型已渲染中文书名/作者(GPT-Image-2 等),跳过 canvas 叠加
+        // 守卫: 仅当 ref 仍指向当前请求时才 setCoverPreviewUrl,避免竞态覆盖
+        if (coverPreviewAbortRef.current !== ac) return;
+        setCoverPreviewUrl(src);
+        toast(`已通过 ${selProvider!.name} · ${selModel} 生成预览图（含书名作者）`);
+        return;
+      }
+
+      // canvas 叠加书名 + 作者兜底(SD/FLUX/TRAE 等不支持中文渲染的图源)
       // B1 修复: try/finally 确保 objectUrl 在任何路径(包括 overlayTextOnImage 抛错)下都被释放
       try {
-        const titledAuthor = coverAuthor.trim() || '';
-        const titledBook = coverBookTitle.trim() || project.title;
-        const src = imageDataUrl || objectUrl;
-        if (!src) throw new Error('未拿到图片数据');
         const dataUrl = await overlayTextOnImage(src, titledBook, titledAuthor);
         // M1 修复(第十一轮): overlayTextOnImage 内的 Image() 不受 ac.signal 控制,
         // 快速连点时旧请求的 Image 可能晚于新请求完成并覆盖 setCoverPreviewUrl
@@ -496,8 +529,8 @@ export default function ProjectDetail() {
         setCoverPreviewUrl(dataUrl);
         // M3 修复(第十二轮): TRAE 兜底路径明示,避免用户误以为用的是自配供应商
         toast(selProvider
-          ? `已通过 ${selProvider.name} · ${selModel} 生成预览图`
-          : '封面预览图已生成（系统默认文生图）');
+          ? `已通过 ${selProvider.name} · ${selModel} 生成预览图（已叠加书名作者）`
+          : '封面预览图已生成（系统默认文生图，已叠加书名作者）');
       } finally {
         if (objectUrl) URL.revokeObjectURL(objectUrl);
       }
@@ -727,8 +760,8 @@ export default function ProjectDetail() {
                         {genCoverBusy ? '生成中…' : 'AI 生成'}
                       </button>
                     </div>
-                    {/* 生成参数：风格 / 书名 / 作者（升级） */}
-                    <div className="mb-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {/* 生成参数：风格 / 平台 / 书名 / 作者（升级） */}
+                    <div className="mb-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
                       <div>
                         <label className="mb-1 block text-[10px] text-paper-mute">风格</label>
                         <select
@@ -738,6 +771,20 @@ export default function ProjectDetail() {
                           disabled={genCoverBusy}
                         >
                           {COVER_STYLE_OPTIONS.map(o => (
+                            <option key={o.key} value={o.key}>{o.label}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="mb-1 block text-[10px] text-paper-mute">平台风格</label>
+                        <select
+                          className="input py-1.5 text-xs"
+                          value={coverPlatform}
+                          onChange={e => setCoverPlatform(e.target.value)}
+                          disabled={genCoverBusy}
+                          title="目标网文平台视觉风格（参考 oh-story 封面方法论）"
+                        >
+                          {COVER_PLATFORM_OPTIONS.map(o => (
                             <option key={o.key} value={o.key}>{o.label}</option>
                           ))}
                         </select>

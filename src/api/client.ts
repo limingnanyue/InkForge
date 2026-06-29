@@ -42,13 +42,13 @@ export const api = {
     // 封面提示词升级：支持 style（风格预设）/ bookTitle（书名覆盖）/ author（作者署名）/ tone（文风）
     generateCover: (id: string, params: {
       model?: string; providerId?: string;
-      style?: string; bookTitle?: string; author?: string; tone?: string;
+      style?: string; platform?: string; bookTitle?: string; author?: string; tone?: string;
     }) =>
       req<{ cover: string }>(`/projects/${id}/generate-cover`, { method: 'POST', body: JSON.stringify(params) }),
     // H2+H3 修复(第十一轮): 封面预览图后端代理,避免前端直连第三方导致 CORS + apiKey 暴露
     // 后端拿 provider.apiKey 调 /images/generations,返回 data URL
     coverPreview: (id: string, params: { prompt: string; providerId: string; model: string }) =>
-      req<{ image: string }>(`/projects/${id}/cover-preview`, { method: 'POST', body: JSON.stringify(params) }),
+      req<{ image: string; textRendered: boolean }>(`/projects/${id}/cover-preview`, { method: 'POST', body: JSON.stringify(params) }),
     // 整书去 AI 味精修：入队守护进程批量任务，透传模型选择
     refineBook: (id: string, model?: string, providerId?: string) =>
       req<Task>(`/projects/${id}/refine-book`, { method: 'POST', body: JSON.stringify({ model, providerId }) }),

@@ -4,6 +4,7 @@
 import { Router, type Request, type Response } from 'express';
 import { projectRepo, chapterRepo, stateRepo, messageRepo, providerRepo, taskRepo } from '../repos.js';
 import { complete } from '../llm.js';
+import { PLATFORM_STYLES, inferGenreStyle, supportsTextRendering } from '../cover-styles.js';
 import type { ProjectType } from '@shared/types';
 
 const router = Router();
@@ -180,16 +181,22 @@ export const COVER_STYLES: Record<string, { name: string; zh: string; en: string
 };
 
 // POST /:id/generate-cover
-// 基于项目信息 + 风格/书名/作者 生成封面图像提示词（中文描述 + 英文 prompt 双段），落 agent_state.cover
-// 升级：支持多种风格、书名覆盖、作者署名
+// 基于项目信息 + 平台风格 + 题材推断 生成封面图像提示词（中文描述 + 英文 prompt 双段），落 agent_state.cover
+// 升级(参考 oh-story-claudecode/skills/story-cover):
+//   1. 平台风格库(番茄/起点/晋江/知乎盐言/七猫/刺猬猫/通用)
+//   2. 题材推断规则(书名关键词→题材→风格标签+色彩+光效)
+//   3. 提示词公式: [平台风格]+[文字层]+[题材风格]+[人物]+[背景]+[色彩]+[光效]+[通用修饰]
+//   4. 文字层指令: GPT-Image-2 支持中文渲染时,直接 "Title text '书名' at top center" 一步到位
 router.post('/:id/generate-cover', async (req: Request, res: Response) => {
   const project = projectRepo.get(req.params.id);
   if (!project) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   const state = stateRepo.get(project.id);
   const { model, providerId } = pickLLM(req);
   const body = req.body || {};
-  const styleKey = (typeof body.style === 'string' && body.style) ? body.style : 'realistic';
-  const styleDef = COVER_STYLES[styleKey] || COVER_STYLES.realistic;
+  // 兼容旧 style 参数 + 新 platform 参数(优先 platform)
+  const platformKey = (typeof body.platform === 'string' && body.platform) ? body.platform
+    : (typeof body.style === 'string' && body.style) ? body.style : 'generic';
+  const platform = PLATFORM_STYLES[platformKey] || PLATFORM_STYLES.generic;
   // 书名默认回落到 project.title，允许前端覆盖（如想用副标题）
   const bookTitle = (typeof body.bookTitle === 'string' && body.bookTitle.trim())
     ? body.bookTitle.trim() : project.title;
@@ -198,23 +205,44 @@ router.post('/:id/generate-cover', async (req: Request, res: Response) => {
     ? body.author.trim() : '';
   // 文风（可选）
   const tone = (typeof body.tone === 'string' && body.tone) ? body.tone : '通用';
+  // 题材推断(oh-story 规则: 书名关键词→题材→风格标签)
+  const genreStyle = inferGenreStyle(bookTitle, project.genre);
 
-  const prompt = `请为这部作品生成封面图像提示词，用于 AI 绘图（如 Stable Diffusion / Midjourney）。
+  const prompt = `请为这部作品生成封面图像提示词，用于 AI 绘图（GPT-Image-2 / Stable Diffusion / Midjourney）。
 
 作品信息：
 - 书名：${bookTitle}
 - 作者：${author || '（未署名）'}
-- 题材：${project.genre || '通用'}
+- 题材：${project.genre || '通用'}（推断风格：${genreStyle.label}）
 - 创意：${state?.idea || '（无）'}
 - 世界观设定：${state?.setting || '（无设定）'}
 - 文风：${tone}
-- 封面风格：${styleDef.name}（${styleDef.zh}）
+- 目标平台：${platform.label}
+- 平台视觉风格关键词：${platform.keywords}
+- 书名字体：${platform.titleFont}
+- 作者名字体：${platform.authorFont}
+- 题材风格标签：${genreStyle.styleTag}
+- 色彩指令：${genreStyle.palette}
+- 光效指令：${genreStyle.lighting}
 
 要求输出两段：
-1. 【中文描述】封面画面构思，30-80 字，描述主体、场景、氛围、关键视觉元素，需呼应书名与题材
-2. 【英文 Prompt】可直接喂给 SD/MJ 的 prompt，含主体、风格、镜头、光线、画质标签，逗号分隔，50-100 词；务必包含风格关键词：${styleDef.en}
+1. 【中文描述】封面画面构思，30-80 字，描述主体人物(具体到服饰/动作/表情)、场景(前景/中景/远景三层)、氛围、关键视觉元素，需呼应书名与题材
+2. 【英文 Prompt】可直接喂给 GPT-Image-2 / SD / MJ 的 prompt，遵循公式:
+   [平台风格] + [文字层] + [题材风格] + [人物描述] + [背景三层] + [色彩指令] + [光效指令] + [通用修饰]
+   逗号分隔，60-120 词
 
-重要：封面是书籍封面，画面构图必须预留顶部或底部的文字排版空间（用于后期叠加书名与作者署名），主体元素不要占据整张画面。Prompt 末尾加上 "negative space for title text, book cover layout, no text" 引导模型留出文字区域。
+文字层处理(关键):
+- 若目标图像模型是 GPT-Image-2 / dall-e-3 / seedream 等支持中文渲染的模型,文字层用指令:
+  "Title text '${bookTitle}' at top center in ${platform.titleFont}"
+  ${author ? `"Author name '${author}' at bottom center in ${platform.authorFont}"` : '（无作者署名则不加作者文字层）'}
+- 若目标模型不支持中文渲染(SD/FLUX 等),文字层改为:
+  "negative space at top and bottom for title text overlay, book cover layout, no text in image"
+  (后期由前端 canvas 叠加书名作者)
+
+务必包含题材风格关键词: ${genreStyle.styleTag}
+务必包含色彩指令: ${genreStyle.palette}
+务必包含光效指令: ${genreStyle.lighting}
+末尾加通用修饰: "professional book cover design, high detail digital painting, portrait orientation 2:3 ratio, no watermark"
 
 格式：
 中文：...
@@ -225,7 +253,7 @@ Prompt: ...
   try {
     const { text } = await complete({
       providerId, model,
-      systemStable: `你是资深插画师与 AI 绘图 prompt 工程师，擅长把文学作品转化为视觉画面，精通 ${styleDef.name} 风格。`,
+      systemStable: `你是资深网文封面设计师与 AI 绘图 prompt 工程师，参考 oh-story 方法论，擅长把文学作品转化为视觉画面，精通 ${platform.label} 平台风格与 ${genreStyle.label} 题材。`,
       messages: [{ role: 'user', content: prompt }],
       temperature: 0.8, maxTokens: 1024,
       projectId: project.id,
@@ -245,10 +273,11 @@ Prompt: ...
 //   2) apiKey 暴露: Authorization Bearer 从浏览器明文发往第三方域名, DevTools/扩展/MITM 可抓
 // 现方案: 前端只调自己的 /api/v1/projects/:id/cover-preview, 后端拿 apiKey 调第三方,
 //        返回 base64 图片数据, apiKey 永不离开服务端
-// 入参: { prompt: string, providerId: string, model: string }
+// 入参: { prompt: string, providerId: string, model: string, bookTitle?: string, author?: string }
 //   - providerId/model 必填(指定用哪个 provider 的哪个图像模型)
 //   - prompt 是英文 Prompt(从 coverDraft 提取)
-// 出参: { image: string }  // data URL 形式: "data:image/png;base64,xxxx"
+//   - bookTitle/author 可选,用于检测图像模型是否已渲染文字层
+// 出参: { image: string, textRendered: boolean }  // textRendered=true 时图像已含书名作者,前端跳过 canvas 叠加
 router.post('/:id/cover-preview', async (req: Request, res: Response) => {
   try {
     const project = projectRepo.get(req.params.id);
@@ -264,22 +293,33 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
       return fail(res, 'INVALID', `provider ${provider.name} 未配置 API Key`);
     }
 
+    // 检测图像模型是否支持中文文字渲染(oh-story 备注: gpt-image-2 等可直接渲染中文)
+    // 支持: prompt 已含 Title text/Author name 指令,图像一步到位含书名作者,前端跳过 canvas 叠加
+    // 不支持: prompt 含 negative space 指令,前端 canvas 叠加兜底
+    const textRendered = supportsTextRendering(model);
+
     // 调 OpenAI 兼容 /images/generations
     const ep = provider.baseUrl.replace(/\/+$/, '') + '/images/generations';
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (provider.kind !== 'ollama' && provider.kind !== 'kilo') {
       headers['Authorization'] = `Bearer ${provider.apiKey}`;
     }
+    // oh-story 备注: gpt-image-2 始终返回 base64,请求体不要带 response_format(旧 DALL-E 参数,gpt-image 系列不支持)
+    // 故对 gpt-image 系列不传 response_format,其他模型仍传 b64_json
+    const reqBody: Record<string, unknown> = {
+      model,
+      prompt: prompt.trim(),
+      n: 1,
+      size: '1024x1536',  // oh-story 默认 2:3 竖版比例
+    };
+    if (!textRendered) {
+      // 非 gpt-image 系列(如 dall-e-3)显式要 b64_json
+      reqBody.response_format = 'b64_json';
+    }
     const upstream = await fetch(ep, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        model,
-        prompt: prompt.trim(),
-        n: 1,
-        size: '1024x1024',
-        response_format: 'b64_json',
-      }),
+      body: JSON.stringify(reqBody),
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
@@ -303,7 +343,7 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
     } else {
       return fail(res, 'UPSTREAM_ERROR', '图像供应商返回 data 字段不含 b64_json 或 url', 502);
     }
-    ok(res, { image: dataUrl });
+    ok(res, { image: dataUrl, textRendered });
   } catch (e) {
     fail(res, 'COVER_PREVIEW_FAILED', (e as Error).message || '封面预览生成失败', 500);
   }
