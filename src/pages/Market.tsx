@@ -45,8 +45,11 @@ export default function Market() {
     try {
       const list = await api.analyze.marketScanList();
       setHistory(list);
-    } catch { /* 静默 */ }
-    finally { setLoadingHistory(false); }
+    } catch (e) {
+      // H-02 修复(第二十轮): 原 catch 静默吞掉错误,用户看不到加载失败提示
+      // 与同文件 submit()/viewScan() 风格不一致;Studio.tsx 已修过同型问题
+      toast(`加载历史失败：${(e as Error).message}`, 'err');
+    } finally { setLoadingHistory(false); }
   };
 
   useEffect(() => { loadHistory(); }, []);

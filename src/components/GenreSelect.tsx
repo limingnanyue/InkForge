@@ -15,6 +15,9 @@ import { Spinner } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import { groupGenres, type Genre, type GenreCategory } from '@shared/genres';
 
+// H-03 修复(第二十轮): 题材库加载失败时显示"重试"按钮，而非静默吞错误后给空下拉
+// 静默会让用户误以为"项目无题材可填"，实际上只是接口挂了
+
 const CATEGORY_BADGE: Record<GenreCategory, string> = {
   male: 'badge badge-mute',
   female: 'badge badge-green',
@@ -41,17 +44,22 @@ export default function GenreSelect({
 }: GenreSelectProps) {
   const [genres, setGenres] = useState<Genre[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [customMode, setCustomMode] = useState(false);
   const [customInput, setCustomInput] = useState('');
   const reloadRef = useRef<(() => void) | null>(null);
 
   const loadGenres = async () => {
     setLoading(true);
+    setLoadError(null);
     try {
       const list = await api.genres.list();
       setGenres(list);
-    } catch { /* 静默 */ }
-    finally { setLoading(false); }
+    } catch (e) {
+      // H-03 修复(第二十轮): 原 catch 静默吞掉错误，组件复用于 Generate/ProjectDetail/Market 三处
+      //   接口挂掉时用户看到空下拉且无提示，会以为"无题材可填"
+      setLoadError((e as Error).message || '加载题材库失败');
+    } finally { setLoading(false); }
   };
   reloadRef.current = loadGenres;
 
@@ -122,6 +130,18 @@ export default function GenreSelect({
     return (
       <div className={cn('flex items-center gap-2 text-xs text-paper-mute', className)}>
         <Spinner className="h-3 w-3" /> 加载题材库…
+      </div>
+    );
+  }
+
+  // H-03 修复(第二十轮): 加载失败时显示错误 + 重试按钮，而非空下拉
+  if (loadError) {
+    return (
+      <div className={cn('flex items-center justify-between gap-2 rounded-md border px-3 py-2 text-xs', className)}
+        style={{ borderColor: 'var(--cinnabar)', background: 'rgba(178,58,72,0.08)' }}>
+        <span className="text-cinnabar">加载题材库失败：{loadError}</span>
+        <button type="button" className="text-amber hover:text-amber-bright underline-offset-2 hover:underline"
+          onClick={() => loadGenres()}>重试</button>
       </div>
     );
   }

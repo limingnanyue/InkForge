@@ -11,6 +11,8 @@ import BlurText from '@/components/BlurText';
 import { Spinner, EmptyState, ProgressRing, fmtWords, useToast, Tabs } from '@/components/ui';
 import type { ChatMessage, AgentState, Task } from '@shared/types';
 import { cn } from '@/lib/utils';
+// L2 修复(第二十轮): 任务状态徽章常量,与 Daemon.tsx 共用
+import { TASK_STATUS_BADGE, TASK_STATUS_TEXT } from '@/lib/project';
 
 export default function Studio() {
   const { projects, currentProject, setCurrentProject, loadProjects, loadProviders, providers, defaultProviderId, tasks, loadTasks, currentModel, currentProviderId, setCurrentModel } = useApp();
@@ -395,8 +397,9 @@ function TaskPanel({ tasks, toast }: { tasks: Task[]; toast: (msg: string, type?
 }
 
 function TaskRow({ task, toast }: { task: Task; toast: (msg: string, type?: 'ok' | 'err') => void }) {
-  const statusColor: Record<string, string> = { running: 'badge-amber', queued: 'badge-mute', done: 'badge-green', failed: 'badge-red', paused: 'badge-mute' };
-  const statusText: Record<string, string> = { running: '运行中', queued: '排队', done: '完成', failed: '失败', paused: '已暂停' };
+  // L2 修复(第二十轮): 改用 @/lib/project 共享常量,与 Daemon.tsx 一致
+  const statusColor = TASK_STATUS_BADGE;
+  const statusText = TASK_STATUS_TEXT;
   const [retrying, setRetrying] = useState(false);
   const onRetry = async () => {
     setRetrying(true);

@@ -3,7 +3,7 @@
  */
 import type {
   Project, Chapter, ChapterNode, AgentState, ChatMessage, Task, TaskLog,
-  Provider, ExportRecord, GenerateRequest, ExportRequest, UsageStats, TokenUsageRecord,
+  Provider, ExportRecord, GenerateRequest, ExportRequest, UsageStats,
   MarketScan,
 } from '@shared/types';
 import type { Genre, GenreCategory } from '@shared/genres';
@@ -57,6 +57,7 @@ export const api = {
   chapters: {
     update: (id: string, data: Partial<Chapter>) =>
       req<Chapter>(`/chapters/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    // M2 修复(第二十轮): ProjectDetail 编辑器顶栏「删除」按钮调用
     delete: (id: string) => req(`/chapters/${id}`, { method: 'DELETE' }),
     snapshot: (id: string) => req(`/chapters/${id}/snapshot`, { method: 'POST' }),
     generate: (id: string, prompt?: string) =>
@@ -138,7 +139,7 @@ export const api = {
   },
   tasks: {
     list: (projectId?: string) => req<Task[]>(`/tasks${projectId ? `?projectId=${projectId}` : ''}`),
-    get: (id: string) => req<Task>(`/tasks/${id}`),
+    // M5 修复(第二十轮): 删 get(id) 单条查询（前端零调用,Daemon 走 list + SSE 刷新）
     logs: (id: string) => req<TaskLog[]>(`/tasks/${id}/logs`),
     pause: (id: string) => req<Task>(`/tasks/${id}/pause`, { method: 'POST' }),
     resume: (id: string) => req<Task>(`/tasks/${id}/resume`, { method: 'POST' }),
@@ -163,7 +164,7 @@ export const api = {
     // 拉取远端可用模型列表并写回
     fetchModels: (id: string) =>
       req<{ ok: boolean; models: string[]; fetched?: number; provider?: Provider; message?: string }>(`/models/providers/${id}/fetch-models`, { method: 'POST' }),
-    list: () => req<{ providerId: string; providerName: string; model: string }[]>('/models'),
+    // M3 修复(第二十轮): 删 list() 扁平 model 列表查询（前端零调用,Models.tsx 改用 providers() 拿带 models 数组的 provider）
   },
   exports: {
     create: (data: ExportRequest) =>
@@ -190,7 +191,7 @@ export const api = {
   // 题材库：内置 + 用户自定义题材 CRUD
   genres: {
     list: () => req<Genre[]>('/genres'),
-    get: (id: string) => req<Genre>(`/genres/${id}`),
+    // M6 修复(第二十轮): 删 get(id)（前端零调用,Genres.tsx + GenreSelect 都用 list() 全量缓存再本地过滤）
     create: (data: { id: string; label: string; category: GenreCategory; description?: string; emotionMap?: string }) =>
       req<Genre>('/genres', { method: 'POST', body: JSON.stringify(data) }),
     update: (id: string, data: Partial<{ label: string; category: GenreCategory; description: string; emotionMap: string }>) =>
@@ -203,7 +204,8 @@ export const api = {
   // Token 用量
   usage: {
     stats: () => req<UsageStats>('/usage/stats'),
-    list: (projectId?: string) => req<TokenUsageRecord[]>(`/usage${projectId ? `?projectId=${projectId}` : ''}`),
+    // M4 修复(第二十轮): 删 list(projectId?)（前端零调用,Settings.tsx 只调 stats() 拉聚合统计）
+    // 后端 GET /usage 路由保留,以便未来在 Settings 增加逐条用量记录表时复用
     clear: () => req<{ cleared: boolean }>('/usage', { method: 'DELETE' }),
   },
   // 任务事件 SSE 订阅

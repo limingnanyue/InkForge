@@ -9,9 +9,9 @@ import BlurText from '@/components/BlurText';
 import { Spinner, ProgressBar, fmtTime, useToast } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import type { Task, TaskLog } from '@shared/types';
+// L2 修复(第二十轮): 抽取自 @/lib/project 的共享常量,与 Studio.tsx 共用
+import { TASK_STATUS_BADGE as STATUS_BADGE, TASK_STATUS_TEXT as STATUS_TEXT } from '@/lib/project';
 
-const STATUS_BADGE: Record<string, string> = { running: 'badge-amber', queued: 'badge-mute', paused: 'badge-mute', done: 'badge-green', failed: 'badge-red' };
-const STATUS_TEXT: Record<string, string> = { running: '运行中', queued: '排队', paused: '已暂停', done: '完成', failed: '失败' };
 const TYPE_TEXT: Record<string, string> = { book: '成书', short: '成短篇', chapter: '章节生成', refine: '精修', 'refine-book': '整书精修' };
 
 interface DaemonStatus { running: number; queued: number; done: number; failed: number; total: number; }

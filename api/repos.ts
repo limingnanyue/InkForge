@@ -469,10 +469,6 @@ export const genreRepo = {
     const rows = db.prepare('SELECT * FROM genre ORDER BY category ASC, label ASC').all() as any[];
     return rows.map(rowToGenre);
   },
-  listByCategory(category: GenreCategory): Genre[] {
-    const rows = db.prepare('SELECT * FROM genre WHERE category=? ORDER BY label ASC').all(category) as any[];
-    return rows.map(rowToGenre);
-  },
   get(id: string): Genre | null {
     const row = db.prepare('SELECT * FROM genre WHERE id=?').get(id) as any;
     return row ? rowToGenre(row) : null;

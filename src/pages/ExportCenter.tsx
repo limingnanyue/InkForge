@@ -154,7 +154,7 @@ export default function ExportCenter() {
             {/* H4 修复(第十九轮): 清空当前项目全部导出记录按钮,无选中项目或无记录时禁用 */}
             {projectId && projectHistoryCount > 0 && (
               <button
-                className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-red-400 hover:text-red-300"
+                className="btn-ghost flex items-center gap-1 py-1.5 text-xs text-cinnabar hover:text-cinnabar"
                 onClick={() => setClearTarget(projectId)}
                 title={`清空「${projectTitle(projectId)}」的 ${projectHistoryCount} 条导出记录`}
               >
@@ -176,7 +176,7 @@ export default function ExportCenter() {
                       <span className="truncate text-sm text-paper-dim">{r.filePath.split(/[\\/]/).pop()}</span>
                       {/* H4 修复(第十九轮): 单条删除按钮 */}
                       <button
-                        className="ml-auto shrink-0 rounded p-1 text-paper-mute opacity-60 transition hover:bg-red-500/10 hover:text-red-400 hover:opacity-100"
+                        className="ml-auto shrink-0 rounded p-1 text-paper-mute opacity-60 transition hover:bg-cinnabar/10 hover:text-cinnabar hover:opacity-100"
                         onClick={() => setDeleteTarget(r)}
                         title="删除此记录"
                       >

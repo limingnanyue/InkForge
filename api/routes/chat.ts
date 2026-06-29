@@ -57,7 +57,7 @@ router.post('/', async (req: Request, res: Response) => {
       // 原代码：createContinueTask(projectId, finalWebSearch) → 丢失 model 和 providerId，回落到 default provider
       const result = createContinueTask(projectId, finalWebSearch, model, providerId);
       if (result) daemonTaskId = result.task.id;
-      else daemonError = '项目不存在';
+      else daemonError = '项目不存在或已有生成任务在进行中';
     } catch (e) {
       daemonError = (e as Error).message;
     }

@@ -25,7 +25,13 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
   const project = projectRepo.get(projectId);
   if (!project) return null;
 
+  // H2 修复(第二十轮): 同项目已有 queued/running book/short 任务时拒绝二次派发
+  // 防 Studio 工作台 daemon_create 意图重复触发 + 用户 Generate 页手动重复派发 → 多 task 串行覆盖章节
+  // 返回特殊标记 { duplicate: true } 让调用方(chat 路由)区分"项目不存在"和"已存在任务"
   const kind: GenerateKind = project.type === 'short' ? 'short' : 'book';
+  const dup = taskRepo.list(projectId).some(t =>
+    (t.type === 'book' || t.type === 'short') && (t.status === 'queued' || t.status === 'running'));
+  if (dup) return null;
   const state = stateRepo.get(projectId);
   const idea = state?.idea || project.title;
   const finalWebSearch = typeof webSearch === 'boolean' ? webSearch : project.webSearchEnabled;
@@ -107,6 +113,12 @@ router.post('/', (req: Request, res: Response) => {
     projectRepo.update(project.id, { targetWords, ...(genre ? { genre } : {}), ...(genreId ? { genreId } : {}) });
   }
 
+  // H2 修复(第二十轮): 同项目已有 queued/running book/short 任务时拒绝二次派发
+  // 防 Generate 页 fetch 抖动用户重试时绕过前端 busy 守卫 → 多 task 串行覆盖章节
+  const dup = taskRepo.list(project.id).some(t =>
+    (t.type === 'book' || t.type === 'short') && (t.status === 'queued' || t.status === 'running'));
+  if (dup) return fail(res, 'CONFLICT', '已有生成任务在进行中，请前往守护进程查看', 409);
+
   // 写入创意到状态
   if (idea) stateRepo.update(project.id, { idea });
 
@@ -172,6 +184,11 @@ router.post('/continue', (req: Request, res: Response) => {
   // H3 修复(第十九轮): /continue 路由也校验 chapterWordMin/Max 范围
   const minErr = validateWordRange(chapterWordMin, chapterWordMax, chapterWordBudget ?? (isShort ? 5000 : 2500), budgetMin, budgetMax);
   if (minErr) return fail(res, 'INVALID', minErr);
+  // H2 修复(第二十轮): /continue 路由先做项目级 dup 检测,与 createContinueTask 内部一致
+  // 区分 404(项目不存在) 与 409(已有任务进行中),让前端能给出不同提示
+  const dup = taskRepo.list(projectId).some(t =>
+    (t.type === 'book' || t.type === 'short') && (t.status === 'queued' || t.status === 'running'));
+  if (dup) return fail(res, 'CONFLICT', '已有生成任务在进行中，请前往守护进程查看', 409);
   const result = createContinueTask(projectId, webSearch, model, providerId, chapterWordBudget, chapterWordMin, chapterWordMax);
   if (!result) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   ok(res, result);

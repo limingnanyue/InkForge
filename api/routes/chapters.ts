@@ -39,6 +39,11 @@ router.post('/:id/snapshot', (req: Request, res: Response) => {
 router.post('/:id/generate', (req: Request, res: Response) => {
   const chapter = chapterRepo.get(req.params.id);
   if (!chapter) return fail(res, 'NOT_FOUND', '章节不存在', 404);
+  // H1 修复(第二十轮): 同章节已有 queued/running chapter 任务时拒绝二次派发
+  // 防 UI 双击或 SSE 重连重置 busy 后再次点击 → 两 task 串行执行时第二个覆盖第一个的 content
+  const dup = taskRepo.list(chapter.projectId).some(t =>
+    t.type === 'chapter' && (t.config as any).chapterId === chapter.id && (t.status === 'queued' || t.status === 'running'));
+  if (dup) return fail(res, 'CONFLICT', '该章节已有生成任务在进行中', 409);
   const task = taskRepo.create({
     projectId: chapter.projectId,
     type: 'chapter',
@@ -51,6 +56,10 @@ router.post('/:id/generate', (req: Request, res: Response) => {
 router.post('/:id/refine', (req: Request, res: Response) => {
   const chapter = chapterRepo.get(req.params.id);
   if (!chapter) return fail(res, 'NOT_FOUND', '章节不存在', 404);
+  // H1 修复(第二十轮): 同章节已有 queued/running refine 任务时拒绝二次派发
+  const dup = taskRepo.list(chapter.projectId).some(t =>
+    t.type === 'refine' && (t.config as any).chapterId === chapter.id && (t.status === 'queued' || t.status === 'running'));
+  if (dup) return fail(res, 'CONFLICT', '该章节已有精修任务在进行中', 409);
   const task = taskRepo.create({
     projectId: chapter.projectId,
     type: 'refine',

@@ -32,10 +32,6 @@ export function flatten(nodes: ChapterNode[]): ChapterNode[] {
   return out;
 }
 
-export function countAll(nodes: ChapterNode[]): number {
-  return flatten(nodes).length;
-}
-
 // 已完成章节近似为快照基数（精确快照数需后端提供）
 export function countSnapshots(nodes: ChapterNode[]): number {
   return flatten(nodes).filter(n => n.status === 'done').length;

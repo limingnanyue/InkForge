@@ -68,14 +68,27 @@ export default function Genres() {
     return c;
   }, [genres]);
 
-  const handleDelete = async (g: Genre) => {
+  // H-20 修复(第二十轮): 删除题材改用 Modal 二次确认,与全局风格一致
+  //   原 bug: 用原生 confirm(),会被浏览器扩展/iframe 屏蔽,且与暗色主题视觉割裂
+  //   其他页面(Projects/ProjectDetail/ExportCenter)全部用 <Modal> 二次确认
+  const [deleteTarget, setDeleteTarget] = useState<Genre | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const handleDelete = (g: Genre) => {
     if (g.isBuiltin) { toast('内置题材不可删除（可编辑）', 'err'); return; }
-    if (!confirm(`确认删除自定义题材「${g.label}」？`)) return;
+    setDeleteTarget(g);
+  };
+
+  const confirmDelete = async () => {
+    if (!deleteTarget) return;
+    setDeleteBusy(true);
     try {
-      await api.genres.delete(g.id);
-      setGenres(list => list.filter(x => x.id !== g.id));
+      await api.genres.delete(deleteTarget.id);
+      setGenres(list => list.filter(x => x.id !== deleteTarget.id));
       toast('已删除');
+      setDeleteTarget(null);
     } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setDeleteBusy(false); }
   };
 
   // AI 补全题材说明: 调 AnySearch 联网搜索 + LLM 生成详细 description + emotionMap
@@ -220,6 +233,23 @@ export default function Genres() {
           onSaved={() => { setEditing(null); setCreating(false); load(); }}
         />
       )}
+
+      {/* H-20 修复(第二十轮): 删除题材二次确认 Modal */}
+      <Modal open={!!deleteTarget} onClose={() => setDeleteTarget(null)} title="删除题材">
+        <p className="text-sm leading-relaxed text-paper-dim">
+          确定删除自定义题材 <span className="font-display text-cinnabar">「{deleteTarget?.label}」</span> 吗？
+        </p>
+        <p className="mt-2 text-xs leading-relaxed text-paper-mute">
+          已关联此题材的项目不会删除，但其 genreId 会保留为旧值（需手动改回）。
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setDeleteTarget(null)} disabled={deleteBusy}>取消</button>
+          <button className="btn-danger" onClick={confirmDelete} disabled={deleteBusy}>
+            {deleteBusy ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 删除
+          </button>
+        </div>
+      </Modal>
+
       {node}
     </div>
   );

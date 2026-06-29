@@ -8,8 +8,10 @@ import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
 import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch, Field, SegmentedControl, Slider } from '@/components/ui';
 import GenreSelect from '@/components/GenreSelect';
-import type { Project, Chapter, ChapterNode, AgentState, ProjectType, ProviderKind } from '@shared/types';
+import type { Project, Chapter, ChapterNode, AgentState, ProviderKind } from '@shared/types';
 import { cn } from '@/lib/utils';
+// L1 修复(第二十轮): 抽取自 @/lib/project 的共享常量,与 Projects.tsx 共用
+import { TYPE_LABEL, TYPE_BADGE } from '@/lib/project';
 import ChapterTree, { flatten, countSnapshots, mutateNode } from './ChapterTree';
 import { POSITIONING_LABEL, POSITIONING_TARGET_RATIO, POSITIONING_BAR_COLOR, POSITIONING_ORDER } from '@/lib/positioning';
 
@@ -18,8 +20,6 @@ const STATUS: Record<string, [string, string]> = {
   failed: ['badge-red', '失败'],
 };
 
-const TYPE_LABEL: Record<ProjectType, string> = { long: '长篇', short: '短篇', script: '剧本' };
-const TYPE_BADGE: Record<ProjectType, string> = { long: 'badge-amber', short: 'badge-green', script: 'badge-mute' };
 // 伏笔状态：planted→琥珀"待回收" / paid→绿色"已回收"
 const FORESHADOW_STATUS: Record<string, [string, string]> = {
   planted: ['badge-amber', '待回收'], paid: ['badge-green', '已回收'], expired: ['badge-red', '已过期'],
@@ -47,6 +47,11 @@ export default function ProjectDetail() {
   const [summary, setSummary] = useState('');
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
+  // M2 修复(第二十轮): 章节删除二次确认弹窗
+  //   原 bug: api.chapters.delete 后端路由存在但前端 UI 零调用 → 章节无法删除
+  //   现在编辑器顶栏加「删除」按钮,弹出 Modal 二次确认
+  const [chapterDeleteTarget, setChapterDeleteTarget] = useState<ChapterNode | null>(null);
+  const [chapterDeleteBusy, setChapterDeleteBusy] = useState(false);
   const [continueBusy, setContinueBusy] = useState(false);
   const [refineBookBusy, setRefineBookBusy] = useState(false);
   // BUG1 修复: 续写时让用户选 chapterWordBudget(默认从项目历史章节平均字数推断)
@@ -179,8 +184,27 @@ export default function ProjectDetail() {
         // BUG1 修复：setTree 延迟到防抖保存成功后执行，避免每次按键都 mutateNode（O(n) 全树复制）
         setTree(prev => mutateNode(prev, sid, n => Object.assign(n, patch)));
       } catch (e) { toast((e as Error).message, 'err'); }
+      finally { saveRef.current = null; }
     }, 800);
   };
+  // H-21 修复(第二十轮): flushPendingSave - 切 Tab/卸载前立即保存未提交的 patch
+  //   原 bug: 切走 chapters Tab 会卸载编辑器,800ms 内的输入未保存就丢失
+  //   useEffect cleanup 用 setTimeout 0 推迟到下一 tick,React 已卸载组件无法 await
+  //   解法: 暴露 flush 函数,setTab 前先同步调用
+  const flushPendingSave = useCallback(() => {
+    if (!saveRef.current || !selected) return;
+    window.clearTimeout(saveRef.current);
+    const sid = selected.id;
+    // 取 selected 的当前 content/outline/title 作为 patch
+    const patch: Partial<Chapter> = {
+      title: selected.title, outline: selected.outline, content: selected.content,
+    };
+    saveRef.current = null;
+    // 异步保存,不等返回(切 Tab 不阻塞)
+    api.chapters.update(sid, patch).then(() => {
+      setTree(prev => mutateNode(prev, sid, n => Object.assign(n, patch)));
+    }).catch(e => toast((e as Error).message, 'err'));
+  }, [selected, toast]);
   // BUG-5 修复：组件卸载时清理防抖定时器，避免编辑后立刻返回作品库时 800ms 定时器
   // 仍触发 api.chapters.update（对已删除章节 404，对仍存在章节写脏值）
   useEffect(() => () => { if (saveRef.current) window.clearTimeout(saveRef.current); }, []);
@@ -219,6 +243,26 @@ export default function ProjectDetail() {
     if (!selected) return;
     try { await api.chapters.snapshot(selected.id); setSnapshotCount(c => c + 1); toast('已保存快照'); }
     catch (e) { toast((e as Error).message, 'err'); }
+  };
+
+  // M2 修复(第二十轮): 删除章节 - 调用 api.chapters.delete（之前 client.ts 方法定义但 UI 零调用）
+  const confirmDeleteChapter = async () => {
+    if (!chapterDeleteTarget) return;
+    setChapterDeleteBusy(true);
+    try {
+      await api.chapters.delete(chapterDeleteTarget.id);
+      toast(`已删除章节「${chapterDeleteTarget.title}」`);
+      // 重新加载章节树
+      const tree = await api.projects.chapters(id!);
+      setTree(tree);
+      const flat = flatten(tree);
+      // M2 修复(第二十轮): flatten 已扁平化,直接对 flat 调 countSnapshots(传整棵 array)
+      setSnapshotCount(countSnapshots(flat));
+      // 选中清空或退到下一个可用章节
+      setSelected(flat[0] || null);
+      setChapterDeleteTarget(null);
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setChapterDeleteBusy(false); }
   };
 
   const toggleWebSearch = async () => {
@@ -635,7 +679,8 @@ export default function ProjectDetail() {
           { key: 'outline', label: '大纲' },
           { key: 'state', label: '状态' },
         ] as const).map(t => (
-          <button key={t.key} onClick={() => setTab(t.key)}
+          // H-21 修复(第二十轮): 切 Tab 前先 flush 800ms 内未保存的章节正文，防丢失
+          <button key={t.key} onClick={() => { if (tab === 'chapters' && t.key !== 'chapters') flushPendingSave(); setTab(t.key); }}
             className={cn('relative px-4 py-2.5 text-sm font-medium transition-colors', tab === t.key ? 'text-amber' : 'text-paper-mute hover:text-paper-dim')}>
             {t.label}
             {tab === t.key && <span className="absolute bottom-0 left-0 right-0 h-0.5" style={{ background: 'var(--amber)' }} />}
@@ -684,6 +729,14 @@ export default function ProjectDetail() {
                 </button>
                 <button className="btn-ghost py-1.5 text-xs" onClick={() => gen('refine')} disabled={busy}><Wand2 size={13} /> 精修</button>
                 <button className="btn-ghost py-1.5 text-xs" onClick={snapshot}><Camera size={13} /> 快照</button>
+                {/* M2 修复(第二十轮): 删除章节按钮(原 api.chapters.delete UI 零调用) */}
+                <button
+                  className="btn-ghost py-1.5 text-xs text-cinnabar hover:text-cinnabar"
+                  onClick={() => setChapterDeleteTarget(selected)}
+                  title="删除此章节（含正文与子章节）"
+                >
+                  <Trash2 size={13} /> 删除
+                </button>
                 {/* H3 修复(第十六轮): failed 状态显式「重试生成」按钮,UX 比复用「AI 生成」更清晰 */}
                 {selected.status === 'failed' ? (
                   <button className="btn-primary py-1.5 text-xs" onClick={() => gen('generate')} disabled={busy}>
@@ -1058,7 +1111,8 @@ export default function ProjectDetail() {
                       <h3 className="font-display text-base text-paper">项目健康度</h3>
                       <span className="text-[11px] text-paper-mute">共 {total} 章</span>
                     </div>
-                    <div className="grid grid-cols-4 gap-2">
+                    {/* H-26 修复(第二十轮): 移动端挤压,改 grid-cols-2 sm:grid-cols-4 自适应 */}
+                    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                       {cards.map(([k, badge, label]) => {
                         const count = stats[k];
                         const pct = total > 0 ? (count / total) * 100 : 0;
@@ -1253,7 +1307,8 @@ export default function ProjectDetail() {
                     <p className="mb-4 text-[11px] text-paper-mute">
                       实际分布 vs oh-story 目标比例（共 {total} 章已分配定位）· 偏离 &gt;30% 标红
                     </p>
-                    <div className="grid grid-cols-6 gap-2">
+                    {/* H-26 修复(第二十轮): 移动端 6 列太挤,改 grid-cols-3 sm:grid-cols-6 自适应 */}
+                    <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
                       {POSITIONING_ORDER.map(k => {
                         const actual = counts[k];
                         const actualRatio = actual / total;
@@ -1311,6 +1366,22 @@ export default function ProjectDetail() {
           <button className="btn-ghost" onClick={() => setDeleteOpen(false)}>取消</button>
           <button className="btn-primary" onClick={confirmDelete} disabled={deleteBusy}>
             {deleteBusy ? <Spinner className="h-4 w-4" /> : <Trash2 size={16} />} 确认删除
+          </button>
+        </div>
+      </Modal>
+
+      {/* M2 修复(第二十轮): 删除章节确认弹窗 */}
+      <Modal open={!!chapterDeleteTarget} onClose={() => setChapterDeleteTarget(null)} title="删除章节">
+        <p className="text-sm leading-relaxed text-paper-dim">
+          确定删除章节 <span className="font-display text-cinnabar">《{chapterDeleteTarget?.title}》</span> 吗？
+        </p>
+        <p className="mt-2 text-xs leading-relaxed text-paper-mute">
+          该操作不可恢复，将一并删除其子章节（若存在）与正文快照。
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setChapterDeleteTarget(null)} disabled={chapterDeleteBusy}>取消</button>
+          <button className="btn-danger" onClick={confirmDeleteChapter} disabled={chapterDeleteBusy}>
+            {chapterDeleteBusy ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 删除章节
           </button>
         </div>
       </Modal>

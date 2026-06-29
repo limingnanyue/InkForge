@@ -2,9 +2,12 @@
  * 项目 + 章节 + 智能体状态 路由
  */
 import { Router, type Request, type Response } from 'express';
-import { projectRepo, chapterRepo, stateRepo, messageRepo, providerRepo, taskRepo } from '../repos.js';
+import path from 'path';
+import fs from 'fs';
+import { projectRepo, chapterRepo, stateRepo, messageRepo, providerRepo, taskRepo, exportRepo, genreRepo } from '../repos.js';
 import { complete } from '../llm.js';
 import { PLATFORM_STYLES, inferGenreStyle, supportsTextRendering } from '../cover-styles.js';
+import { EXPORT_DIR } from '../db.js';
 import type { ProjectType } from '@shared/types';
 
 const router = Router();
@@ -13,6 +16,17 @@ const ok = (res: Response, data?: unknown) => res.json({ ok: true, data });
 const fail = (res: Response, code: string, message: string, status = 400) =>
   res.status(status).json({ ok: false, error: { code, message } });
 
+// H3 修复(第二十轮): 安全删除导出文件（与 export.ts 同实现，避免循环依赖提到此处）
+// 文件不存在视为已删成功（不阻断）
+function safeDeleteFile(filePath: string): void {
+  try {
+    const abs = path.isAbsolute(filePath) ? filePath : path.join(EXPORT_DIR, path.basename(filePath));
+    if (fs.existsSync(abs)) fs.unlinkSync(abs);
+  } catch (e) {
+    console.warn(`[projects] 删除导出文件失败 ${filePath}:`, (e as Error).message);
+  }
+}
+
 // ===== 项目 =====
 router.get('/', (_req: Request, res: Response) => ok(res, projectRepo.list()));
 
@@ -20,7 +34,11 @@ router.post('/', (req: Request, res: Response) => {
   const { title, type, targetWords, summary, webSearchEnabled, genre, genreId } = req.body || {};
   if (!title || !type) return fail(res, 'INVALID', '标题和类型必填');
   if (!['long', 'short', 'script'].includes(type)) return fail(res, 'INVALID', '类型不合法');
-  const project = projectRepo.create({ title, type: type as ProjectType, targetWords: targetWords || 0, summary, webSearchEnabled, genre, genreId });
+  // H3 修复(第二十轮): 校验 targetWords 范围，防 0/负数/NaN 落库导致后续 daemon 章数为 0
+  if (typeof targetWords !== 'number' || !Number.isFinite(targetWords) || targetWords <= 0) {
+    return fail(res, 'INVALID', '目标字数须为正整数');
+  }
+  const project = projectRepo.create({ title, type: type as ProjectType, targetWords, summary, webSearchEnabled, genre, genreId });
   ok(res, project);
 });
 
@@ -40,15 +58,26 @@ router.patch('/:id', (req: Request, res: Response) => {
   if (typeof body.coverSeed === 'string') patch.coverSeed = body.coverSeed;
   if (typeof body.webSearchEnabled === 'boolean') patch.webSearchEnabled = body.webSearchEnabled;
   if (typeof body.genre === 'string') patch.genre = body.genre;
-  if (typeof body.genreId === 'string' || body.genreId === null) patch.genreId = body.genreId;
+  // L6 修复(第二十轮): genreId 非空时校验存在性，防关联到已删除题材导致 GenreSelect 显示空
+  if (typeof body.genreId === 'string' || body.genreId === null) {
+    if (typeof body.genreId === 'string' && body.genreId && !genreRepo.get(body.genreId)) {
+      return fail(res, 'INVALID', '题材不存在', 400);
+    }
+    patch.genreId = body.genreId;
+  }
   const project = projectRepo.update(req.params.id, patch);
   if (!project) return fail(res, 'NOT_FOUND', '项目不存在', 404);
   ok(res, project);
 });
 
 router.delete('/:id', (req: Request, res: Response) => {
+  // H3 修复(第二十轮): 删除项目前先清理磁盘上的导出文件，防永久残留
+  //   原 bug: export_record 行靠 CASCADE 删除,但 EXPORT_DIR 上的 .txt/.md/.epub 文件永久残留
+  //   记录已不存在,无法再通过 export 路由清理,只能手动 fs
+  const exports = exportRepo.list(req.params.id);
+  exports.forEach(r => safeDeleteFile(r.filePath));
   projectRepo.delete(req.params.id);
-  ok(res, { id: req.params.id });
+  ok(res, { id: req.params.id, deletedFiles: exports.length });
 });
 
 // ===== 章节 =====
@@ -111,10 +140,15 @@ router.patch('/:id/state', (req: Request, res: Response) => {
 // 解析请求里的 model/providerId，不传则回落到 default provider 旗舰（与 daemon.runTask 一致）
 // G3 修复：原逻辑仅当 model 与 providerId 同时存在才校验，二者仅传其一时全部丢弃用户选择
 // 现分两段：先定 provider（指定 providerId 不存在则回落 default），再定 model（不在 provider.models 则回落旗舰）
+// H4 修复(第二十轮): p.models 为空数组时 p.models[0] 返回 undefined → 下游 400/500
+//   场景: 用户添加 custom provider 不填模型设为默认; 或 fetchModels 失败 models 被清空
 function pickLLM(req: Request): { model: string; providerId?: string } {
   const { model, providerId } = req.body || {};
   const p = (providerId && providerRepo.get(providerId)) || providerRepo.getDefault();
   if (!p) throw new Error('未配置任何 LLM 提供商');
+  if (!p.models || p.models.length === 0) {
+    throw new Error(`提供商「${p.name}」未配置任何模型，请先在模型中心拉取或手动填写`);
+  }
   const validModel = model && p.models.includes(model) ? model : p.models[0];
   return { model: validModel, providerId: p.id };
 }
@@ -320,6 +354,9 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
       method: 'POST',
       headers,
       body: JSON.stringify(reqBody),
+      // M2 修复(第二十轮): 加 30s 超时,防第三方图像 provider 握手后挂起导致 Express 连接被永久占满
+      //   多个 cover-preview 请求堆积可耗尽连接池,影响其他路由
+      signal: AbortSignal.timeout(30000),
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
@@ -336,7 +373,8 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
       dataUrl = `data:image/png;base64,${item.b64_json}`;
     } else if (item.url) {
       // 部分 provider 返回 url, 后端再下载转 base64
-      const imgResp = await fetch(item.url);
+      // M2 修复(第二十轮): 同样加 30s 超时防挂起
+      const imgResp = await fetch(item.url, { signal: AbortSignal.timeout(30000) });
       if (!imgResp.ok) return fail(res, 'UPSTREAM_ERROR', `下载图像失败（${imgResp.status}）`, 502);
       const buf = Buffer.from(await imgResp.arrayBuffer());
       dataUrl = `data:image/png;base64,${buf.toString('base64')}`;

@@ -9,9 +9,8 @@ import { useApp } from '@/stores/app';
 import BlurText from '@/components/BlurText';
 import { Spinner, ProgressRing, fmtWords, fmtTime, EmptyState, Modal, useToast } from '@/components/ui';
 import type { Project, ProjectType } from '@shared/types';
-
-const TYPE_LABEL: Record<ProjectType, string> = { long: '长篇', short: '短篇', script: '剧本' };
-const TYPE_BADGE: Record<ProjectType, string> = { long: 'badge-amber', short: 'badge-green', script: 'badge-mute' };
+// L1 修复(第二十轮): 抽取自 @/lib/project 的共享常量,与 ProjectDetail.tsx 共用
+import { TYPE_LABEL, TYPE_BADGE } from '@/lib/project';
 
 // 由 coverSeed 生成稳定的色相，叠加琥珀金基调
 function coverGradient(seed: string): string {
