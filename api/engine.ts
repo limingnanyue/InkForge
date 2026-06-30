@@ -382,7 +382,17 @@ ${positioningBlock}${volumeBlock}
 【上一章结尾 300 字】（必须自然承接此情境，不得重复）
 ${prevTail}
 
-约束：严格承接上一章结尾的情境/对话/动作，不得让角色做出与人设矛盾的行为；按【本章定位】的情绪强度与字数预算写作；${volumeCtx ? '推进【本卷主线】的核心冲突,不得跑题；' : ''}伏笔已在上方列出，本章可考虑回收其中之一（过期伏笔不可再埋）。`;
+约束：严格承接上一章结尾的情境/对话/动作，不得让角色做出与人设矛盾的行为；按【本章定位】的情绪强度与字数预算写作；${volumeCtx ? '推进【本卷主线】的核心冲突,不得跑题；' : ''}伏笔已在上方列出，本章可考虑回收其中之一（过期伏笔不可再埋）。
+
+【伏笔硬对应规则】（参考 inkos hook 账本 + oh-story 伏笔状态机）
+· 若本章回收伏笔,必须在正文写出≥60 字的可定位兑现段(具体动作/物件/对话),内心提及("他想起借条还在抽屉")不算兑现,必须写出真实场景
+· "揭1埋1"硬底线:每回收 1 个伏笔,本章应新埋或推进至少 1 个伏笔,避免埋设耗尽后剧情悬空
+· 过期伏笔(上方标"已过期")不可再埋,可作废案一笔带过
+
+【核心冲突节奏保护】（oh-story 三规则）
+· 非大结局章节(第 ${currentIdx + 1}/${totalChapters})禁止彻底解决全书核心冲突,只能推进或转折
+· 章末 200 字必须包含悬念元素(钩子/未解问题/新威胁),不得平淡收尾
+· 局部胜利必须伴随新的代价或风险(打赢了但暴露身份/获得宝物但引来强敌),不得纯爽收`;
 }
 
 // 构建最近章节记忆（防止上下文过长，仅取最近 N 章摘要）
@@ -1012,6 +1022,9 @@ ${distLine}
 - 节奏紧凑，每章都有推进与爽点
 - 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
 - positioning 分布严格符合上方约束
+- 【字数预算Σ契约】(oh-story v0.6.19):每章大纲 outline 末尾标注本章情节点密/疏配比,如"密点×2(爽点/反转,各≥250字) + 疏点×3(过场,各≈40字)";密点展开写、疏点带过,Σ 落在[${chapterWordMin}, ${chapterWordMax}]内
+- 【黄金三章】第1章大纲必须 800 字内触发主线冲突且前 300 字最后一句反转;第2章金手指"做出来";第3章锁定可量化短期目标
+- 【矛盾网三层】全书保持 2-3 条矛盾线同时运行(章级 2-3 章解决/卷级卷末解决/书级大结局解决),每次解决一个矛盾必须激活或加深另一个
 - 只输出 JSON，不要其他文字`;
 
   const ctxPrompt = buildContextPrompt(projectId);
@@ -1110,6 +1123,9 @@ ${distLine}
 - 节奏紧凑，每章都有推进与爽点
 - 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
 - positioning 分布严格符合上方约束
+- 【字数预算Σ契约】(oh-story v0.6.19):每章大纲 outline 末尾标注本章情节点密/疏配比,如"密点×2(爽点/反转,各≥250字) + 疏点×3(过场,各≈40字)";密点展开写、疏点带过,Σ 落在[${chapterWordMin}, ${chapterWordMax}]内
+- 【黄金三章】第1章大纲必须 800 字内触发主线冲突且前 300 字最后一句反转;第2章金手指"做出来";第3章锁定可量化短期目标
+- 【矛盾网三层】全书保持 2-3 条矛盾线同时运行(章级 2-3 章解决/卷级卷末解决/书级大结局解决),每次解决一个矛盾必须激活或加深另一个
 - 只输出 JSON，不要其他文字`;
 
     const ctxPrompt = buildContextPrompt(projectId);
@@ -1263,6 +1279,10 @@ function parseOutlineArray(arr: unknown[]): ParsedOutlineItem[] {
 // LLM 完全可全部输出 normal-progress,引擎不会发现 → oh-story 节奏控制方法论形同虚设
 // 本函数统计实际计数,与目标比例比较,偏差 > 30% 时返回 warn 描述(由调用方打 task_log)
 // 不强制重生成,避免 LLM 卡死循环;仅打日志让用户可见,后续可人工介入调整大纲
+// 第二十五轮优化(oh-story v0.6.20): 固定百分比 → 区间占比校验
+//   旧版用固定 0.18/0.45/0.08/0.08/0.10/0.05 + 绝对偏差 0.30 判定 → 题材分档时误报
+//   (番茄短平快高压可到 30%+,女频关系/低压可更多)。新版按区间上下界判定:
+//   超过区间上界才告警(高压过多/信息章过多),低于下界且为非普通推进章才告警(缺呼吸/缺关系)
 export function checkPositioningDistribution(items: ParsedOutlineItem[]): {
   ok: boolean;
   actual: Record<ChapterPositioning, number>;
@@ -1279,18 +1299,25 @@ export function checkPositioningDistribution(items: ParsedOutlineItem[]): {
   }
   const target = computePositioningDistribution(total);
   const warnings: string[] = [];
-  const TARGET_RATIOS: Record<ChapterPositioning, number> = {
-    'high-pressure': 0.18, 'normal-progress': 0.45, 'trial-error': 0.08,
-    'relationship': 0.08, 'low-pressure': 0.10, 'info-organize': 0.05,
+  // 第二十五轮: 改区间占比校验(oh-story v0.6.20)。区间=[下,上],单位为占比
+  //   高压 15-20% / 普通 40-50% / 试错 5-10% / 关系 5-10% / 低压 ≤10% / 信息 ≤5%
+  //   普通/试错/关系"低于下界"不告警(题材可能本就少),仅"高压/信息超过上界"告警,
+  //   避免题材分档(番茄高压多/女频关系多)的误报
+  const RATIO_RANGE: Record<ChapterPositioning, [number, number]> = {
+    'high-pressure': [0.15, 0.30],     // 上界放宽到 30%(番茄分档)
+    'normal-progress': [0.30, 0.60],  // 区间放宽
+    'trial-error': [0.02, 0.15],
+    'relationship': [0.02, 0.20],
+    'low-pressure': [0.00, 0.15],
+    'info-organize': [0.00, 0.08],     // 信息章上界 8%
   };
   for (const k of Object.keys(actual) as ChapterPositioning[]) {
     if (total === 0) continue;
     const actualRatio = actual[k] / total;
-    const targetRatio = TARGET_RATIOS[k];
-    // 偏差 > 30%(绝对值)视为异常
-    if (Math.abs(actualRatio - targetRatio) > 0.30) {
+    const hi = RATIO_RANGE[k][1];
+    if (actualRatio > hi + 0.05) {  // 超区间上界 +5% 容差才告警
       warnings.push(
-        `${POSITIONING_META[k].label}实际 ${actual[k]} 章(${(actualRatio * 100).toFixed(0)}%) vs 目标 ${(targetRatio * 100).toFixed(0)}%,偏离 > 30%`,
+        `${POSITIONING_META[k].label}实际 ${actual[k]} 章(${(actualRatio * 100).toFixed(0)}%)超过区间上界 ${(hi * 100).toFixed(0)}%,节奏可能失衡`,
       );
     }
   }

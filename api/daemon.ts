@@ -534,11 +534,37 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // 第二十三轮修复(剧情混乱 BUG): const → let,重写时把质检 issues 拼进去
     //   原: 重写 prompt 与首次相同,LLM 不知第一次哪里不达标 → 重写效果与首次基本相同(仅靠 LLM 随机性)
     //   现: attempt === 0 重写前把 quality.issues 拼到 prompt,LLM 知道要修正什么(字数/人设/伏笔/跑题等)
+    // 第二十五轮优化(oh-story 黄金三章纪律 + inkos 开篇约束):
+    //   网文黄金三章决定追读留存,前 3 章必须有专用硬约束,不能按普通推进章写
     let prompt = `${anchor}
 
 请写本章正文${positioningHint}。章末钩子：${ch.hook}
 
 要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。剧情推进到位即可结束，不得为凑字数注水。`;
+    // 黄金三章硬约束(参考 oh-story + inkos):第1章 800 字内触发主线冲突、前 300 字最后一句必反转;
+    //   第2章"做出来"金手指而非"说出来";第3章锁定可量化短期目标;场景≤2、有名冲突人物≤2
+    if (i === 0) {
+      prompt = `【黄金第一章 · 追读生死线】
+· 前 300 字(手机第一屏)最后一句必须是戏剧反转/信息炸弹,不得是环境/心理描写
+· 800 字内必须触发主线冲突(主角被欺压/遭遇突变/金手指觉醒),不得慢热铺垫
+· 场景≤2 个,有名冲突人物≤2 个,集中写透不散铺
+· 金手指/核心金手指若本章登场,必须用"做出来"(动作/事件)而非"说出来"(旁白介绍)
+
+${prompt}`;
+    } else if (i === 1) {
+      prompt = `【黄金第二章】
+· 金手指/核心能力本章必须"做出来"(展示一次效果),禁止"说出来"(旁白解释设定)
+· 场景≤2 个,有名冲突人物≤2 个
+· 本章必须有 1 个小爽点兑现(让读者尝到甜头),不得纯铺垫
+
+${prompt}`;
+    } else if (i === 2) {
+      prompt = `【黄金第三章】
+· 本章必须锁定一个可量化的短期目标(如"三天内拿到 X""打败 Y""进入 Z 境界"),给读者明确期待
+· 场景≤2 个,有名冲突人物≤2 个
+
+${prompt}`;
+    }
     // 上一章 assistant 输出作为 history（前缀稳定 → OpenAI/Anthropic 缓存命中）
     // BUG-1 修复：用 freshMap.get(i-1) 而非 fresh[i-1]
     const prevChapter = i > 0 ? freshMap.get(i - 1) : undefined;
@@ -770,9 +796,28 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
   let outlineJson = checkpoint.outlineJson;
   if (!outlineJson) {
     progress(task.id, 0.1, webSearch ? '短篇结构 + 联网取材中…' : '生成短篇结构…');
+    // 第二十五轮优化(短篇方法论,参考 oh-story v0.6.21 short-format + inkos short-fiction):
+    //   短篇不是长篇缩写,有专属结构:五段式(开头/铺垫/升级/反转/结尾) + 一个反转撑一篇 +
+    //   开头零环境(前3句禁无事件环境描写) + 节数守恒(段数不得合并) + 每段≥800字
+    //   旧 prompt 只说"生成 N 段结构",LLM 可能按长篇卷纲思路铺世界观 → 短篇变慢热
     const prompt = `为短篇生成 ${segmentCount} 段结构。每段约 ${chapterWordBudget} 字。
+
+【短篇五段结构】（oh-story v0.6.21,一个反转撑一篇,不多线不铺世界观）
+· 开头段(前1段,300-500字):前3句必须是事件/对话/动作/信息炸弹之一,禁止无事件承载的环境描写(灯光/天气/气味/装修);第1段末尾必须含开篇钩子
+· 铺垫段(占30-40%):埋≥3个反转线索,每2-3节一个钩子
+· 升级段(占20-30%):冲突必须比上一段升级,插倒计时/代价钩子
+· 反转段(占10-15%):一节内完成揭示,反转节情绪冲击须>前所有段最高值
+· 结尾段(占5-10%):用安静细节收尾,不写大段抒情
+
+【短篇硬约束】
+· 节数守恒:生成的段数必须等于 ${segmentCount},正文不得合并段落
+· 每段≥800字(爽文等高信息密度题材≥500字)
+· 默认第一人称在场(除非创意显式第三人称)
+· 所有铺垫为唯一反转服务,不多线挖填(这是短篇与长篇的根本差异)
+· 开头3句定生死,结尾定传播
+
 题材：${cfg.config.genre} | 创意：${cfg.idea} | 钩子风格：${cfg.config.hookStyle} | 结局：${cfg.config.ending}
-输出 JSON 数组：[{"title":"段落标题","outline":"段落大纲"}]，只输出 JSON。`;
+输出 JSON 数组：[{"title":"段落标题","outline":"段落大纲(含本段在五段结构中的角色定位)"}]，只输出 JSON。`;
 
     const { text: outlineText } = await complete({
       providerId, model, webSearch,
@@ -840,7 +885,22 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     //   短篇段约 800+ 字/节,情绪直给 + 体感焊接,不要写成梗概。
     let segPrompt = `【短篇叙事姿态】本段属短篇,默认第一人称在场（除非大纲显式第三人称）。允许主角主观审判句、火葬场前瞻预告、剧透勾子;受虐段直白宣泄,反击段冷静审判。只删中立无情绪的作者讲解,保留带主角偏色的审判/预告。情绪直给 + 体感焊接,不要写成梗概。
 
-写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
+【三维度揉进】(oh-story short-craft)每个子事件将"发生/感知/反应"揉进同一段连续正文,子事件合计≥150字,禁止"先写发生再补感知再补反应"的堆叠写法。`;
+
+    // 第二十五轮优化:短篇首段开头零环境规则(oh-story short-format)
+    if (i === 0) {
+      segPrompt += `\n【开头零环境规则】前3句禁止无事件承载的环境描写(灯光/天气/气味/温度/装修),前3句必须是事件/对话/动作/信息炸弹之一;环境细节只能揉进角色动作与感知中自然带出。`;
+    }
+    // 反转段(倒数第2段)强调情绪冲击须>前所有段
+    if (i === segments.length - 2 && segments.length >= 4) {
+      segPrompt += `\n【反转段要求】本段为反转段,一节内完成揭示,反转节情绪冲击须>前所有段最高值,情绪陡升而非平推。`;
+    }
+    // 结尾段(最后一段)用安静细节收尾
+    if (i === segments.length - 1 && segments.length >= 3) {
+      segPrompt += `\n【结尾段要求】用安静细节收尾,不写大段抒情,留余韵而非总结升华。`;
+    }
+
+    segPrompt += `\n\n写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
