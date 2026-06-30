@@ -15,7 +15,11 @@ const fail = (res: Response, code: string, message: string, status = 400) =>
   res.status(status).json({ ok: false, error: { code, message } });
 
 router.post('/', async (req: Request, res: Response) => {
-  const { projectId, message, providerId, model, webSearch } = req.body || {};
+  // 第二十六轮 P2 修复(daemon_create 丢失字数配置): 原 req.body 只解构 5 个字段,
+  //   daemon_create 调 createContinueTask 时漏传 chapterWordBudget/Min/Max,
+  //   用户在 Generate 页配置的每章字数上下限走 chat 派发时全部丢失,daemon 回落 infer。
+  //   现补齐 3 个字段并透传。
+  const { projectId, message, providerId, model, webSearch, chapterWordBudget, chapterWordMin, chapterWordMax } = req.body || {};
   if (!message) return fail(res, 'INVALID', '消息内容必填');
   if (!projectId) return fail(res, 'INVALID', '项目 ID 必填');
 
@@ -60,8 +64,8 @@ router.post('/', async (req: Request, res: Response) => {
   if (isDaemonCreate) {
     try {
       // BUG-4 修复：派发守护任务时透传用户选择的 model/providerId
-      // 原代码：createContinueTask(projectId, finalWebSearch) → 丢失 model 和 providerId，回落到 default provider
-      const result = createContinueTask(projectId, finalWebSearch, model, providerId);
+      // 第二十六轮 P2 修复: 同时透传 chapterWordBudget/Min/Max,与 /generate 路由一致
+      const result = createContinueTask(projectId, finalWebSearch, model, providerId, chapterWordBudget, chapterWordMin, chapterWordMax);
       if (result) daemonTaskId = result.task.id;
       else daemonError = '项目不存在或已有生成任务在进行中';
     } catch (e) {
@@ -93,7 +97,10 @@ router.post('/', async (req: Request, res: Response) => {
         acc = '已为你打开守护进程面板，可查看任务进度、暂停/恢复/重试。';
       }
       res.write(`event:chunk\ndata:${JSON.stringify({ delta: acc })}\n\n`);
-      messageRepo.create({ projectId, role: 'assistant', content: acc });
+      // 第二十六轮 P2 修复: 助手消息保存包 try/catch,DB 异常不阻断 SSE done,
+      //   避免用户看到 chunk 内容但刷新后丢失(至少本次能看到生成结果)
+      try { messageRepo.create({ projectId, role: 'assistant', content: acc }); }
+      catch (e) { console.warn('[chat] 助手消息保存失败:', (e as Error).message); }
       res.write(`event:done\ndata:${JSON.stringify({ messageId: assistantId, content: acc })}\n\n`);
       res.end();
       return;
@@ -135,13 +142,19 @@ router.post('/', async (req: Request, res: Response) => {
 
     if (cancelled) {
       // 客户端已断开，仍保存已生成部分（避免 token 浪费 + 数据丢失）
-      if (acc.trim()) messageRepo.create({ projectId, role: 'assistant', content: acc });
+      // 第二十六轮 P2 修复: 包 try/catch,DB 异常不阻断 res.end
+      if (acc.trim()) {
+        try { messageRepo.create({ projectId, role: 'assistant', content: acc }); }
+        catch (e) { console.warn('[chat] 断开后助手消息保存失败:', (e as Error).message); }
+      }
       try { res.end(); } catch { /* 已断开 */ }
       return;
     }
 
     // 保存助手消息
-    messageRepo.create({ projectId, role: 'assistant', content: acc });
+    // 第二十六轮 P2 修复: 包 try/catch,DB 异常仅 warn 不阻断后续章节写入与 done 事件
+    try { messageRepo.create({ projectId, role: 'assistant', content: acc }); }
+    catch (e) { console.warn('[chat] 助手消息保存失败:', (e as Error).message); }
 
     // 若意图是续写/精修且存在当前章节，写入章节
     if ((intent === 'write' || intent === 'refine') && req.body.chapterId) {

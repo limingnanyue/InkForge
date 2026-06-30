@@ -77,7 +77,10 @@ export default function Generate() {
   // 原 bug：daemon.runTask 始终用 default provider 旗舰模型，前端所选模型被忽略
   const { providers, currentModel, currentProviderId, setCurrentModel, defaultProviderId, loadProviders } = useApp();
 
-  useEffect(() => { loadProviders(); }, [loadProviders]);
+  // 第二十六轮 P2 修复: loadProviders 未 catch,后端 500/网络抖动时无反馈,模型下拉常驻占位
+  //   现: 与 Studio.tsx 一致加 catch + toast(注:此处 toast 在组件外,用 console.warn 兜底,
+  //   实际 toast 在 render 后通过 useToast 提供,此处仅防 unhandledRejection)
+  useEffect(() => { loadProviders().catch(e => console.warn('[Generate] loadProviders 失败:', (e as Error).message)); }, [loadProviders]);
 
   // 兜底：若 store.currentModel 仍空，用默认 provider 旗舰模型补一次（与 Studio 一致）
   useEffect(() => {

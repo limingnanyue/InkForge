@@ -68,6 +68,14 @@ export function EmptyState({ icon, title, desc, action }: { icon?: ReactNode; ti
 export function Modal({ open, onClose, title, children, className }: { open: boolean; onClose: () => void; title?: string; children: ReactNode; className?: string }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const prevFocusRef = useRef<HTMLElement | null>(null);
+  // 第二十六轮 P1 修复(弹窗内 input 失焦 BUG): onClose 用 ref 持有,useEffect 依赖收敛到 [open]。
+  //   原: deps=[open,onClose],ProjectDetail 三处 Modal 的 onClose 全是 inline 箭头函数,
+  //   父组件每次 re-render(如 input 每输一个字符触发 setState)都换新 onClose 引用 →
+  //   effect cleanup 把焦点还原到 Modal 打开前的按钮 → effect 主体又把焦点移到 Modal 第一个
+  //   可聚焦元素(SegmentedControl 按钮) → 用户输入第二个字符时焦点已不在 input,实质不可用。
+  //   现: ref 持有最新 onClose,deps 只留 [open],open 不变时 effect 不重跑,焦点稳定。
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!open) return;
     // 记录关闭后要还原焦点的元素
@@ -76,7 +84,7 @@ export function Modal({ open, onClose, title, children, className }: { open: boo
     const focusable = rootRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
     focusable?.[0]?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { onClose(); return; }
+      if (e.key === 'Escape') { onCloseRef.current(); return; }
       if (e.key !== 'Tab') return;
       const items = Array.from(rootRef.current?.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])') ?? []);
       if (items.length === 0) return;
@@ -90,7 +98,7 @@ export function Modal({ open, onClose, title, children, className }: { open: boo
       document.removeEventListener('keydown', onKey);
       prevFocusRef.current?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
   if (!open) return null;
   // 第二十二轮修复(M): Modal 矮屏可滚 - 原 items-center 在矮屏会裁切按钮点不到
   //   现: items-start sm:items-center + overflow-y-auto + max-h-[90vh]

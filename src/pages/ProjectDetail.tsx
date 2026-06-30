@@ -41,6 +41,11 @@ export default function ProjectDetail() {
   const [snapshotCount, setSnapshotCount] = useState(0);
   const [webSearch, setWebSearch] = useState(project?.webSearchEnabled ?? false);
   const saveRef = useRef<number | null>(null);
+  // 第二十六轮 P2 修复(SSE 重订阅丢事件): selectedRef 持有最新 selected,
+  //   让 flushPendingSave 不依赖 selected → SSE effect deps 收敛到 [id],
+  //   切章节不再重建 EventSource 订阅,避免重连窗口内 task:done 事件丢失。
+  const selectedRef = useRef<ChapterNode | null>(null);
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
   const { toast, node } = useToast();
   // 第二十三轮: 新增 'cover' Tab,封面生成功能从 brief 移植为独立 Tab
   const [tab, setTab] = useState<'chapters' | 'brief' | 'outline' | 'state' | 'cover'>('chapters');
@@ -60,23 +65,33 @@ export default function ProjectDetail() {
   // → 若用户在 Generate 页选了 2000 字但项目历史章节是 2500 字,续写会用 2500 字 → 字数不一致
   const [continueOpen, setContinueOpen] = useState(false);
   const [continueBudget, setContinueBudget] = useState<number>(2500);
+  // 第二十六轮 P2 修复: 续写弹窗 min/max 输入框,默认 budget*0.8/1.2,用户可自定义
+  //   原: continueWriting 只透传 continueBudget,续写字数区间回落 budget*0.8/1.2,
+  //       与一键生成时用户配置的上下限不一致。现补 min/max 输入框并透传。
+  const [continueMin, setContinueMin] = useState<number>(2000);
+  const [continueMax, setContinueMax] = useState<number>(3000);
   // 切项目时从已完成章节平均字数推断默认 chapterWordBudget
+  // 第二十六轮 P2 修复: 弹窗打开期间不重算,避免覆盖用户滑块/输入框调整
   useEffect(() => {
-    if (!project) return;
+    if (!project || continueOpen) return;
     const isShort = project.type === 'short';
     const defaultBudget = isShort ? 5000 : 2500;
     const allChapters = flatten(tree);
     const doneChapters = allChapters.filter(c => c.content && c.wordCount > 100);
+    let budget: number;
     if (doneChapters.length === 0) {
-      setContinueBudget(defaultBudget);
-      return;
+      budget = defaultBudget;
+    } else {
+      const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
+      const min = isShort ? 2000 : 1500;
+      const max = isShort ? 12000 : 10000;
+      budget = Math.max(min, Math.min(max, Math.round(avg)));
     }
-    const avg = doneChapters.reduce((s, c) => s + (c.wordCount || 0), 0) / doneChapters.length;
-    // M5 修复(第十一轮): clamp 范围与 Generate 页 + 续写 Modal slider 一致: book 1500-10000, short 2000-12000
-    const min = isShort ? 2000 : 1500;
-    const max = isShort ? 12000 : 10000;
-    setContinueBudget(Math.max(min, Math.min(max, Math.round(avg))));
-  }, [project, tree]);
+    setContinueBudget(budget);
+    // 联动默认 min/max = budget*0.8/1.2(与 Generate 页一致)
+    setContinueMin(Math.round(budget * 0.8));
+    setContinueMax(Math.round(budget * 1.2));
+  }, [project, tree, continueOpen]);
 
   // BUG1 修复：缓存 flatten 结果，避免 countAll(tree) 与移动端下拉在每次 render 多次全树遍历
   const flatTree = useMemo(() => flatten(tree), [tree]);
@@ -102,8 +117,9 @@ export default function ProjectDetail() {
     if (!project) return;
     setContinueBusy(true);
     try {
-      await api.generate.continue(project.id, undefined, currentModel || undefined, currentProviderId || undefined, continueBudget);
-      toast(`已派发续写任务到守护进程（每章约 ${continueBudget} 字）`);
+      // 第二十六轮 P2 修复: 透传 chapterWordMin/Max,与一键生成一致,避免回落 budget*0.8/1.2
+      await api.generate.continue(project.id, undefined, currentModel || undefined, currentProviderId || undefined, continueBudget, continueMin, continueMax);
+      toast(`已派发续写任务到守护进程（每章 ${continueMin}-${continueMax} 字）`);
       setContinueOpen(false);
       navigate('/daemon');
     } catch (e) { toast((e as Error).message, 'err'); }
@@ -130,7 +146,14 @@ export default function ProjectDetail() {
       setProject(p); setCurrentProject(p); setTree(chs); setAgentState(s);
       // F2 修复：记录"上次保存的标题"，用于 onBlurTitle 判断是否真的改动
       lastSavedTitleRef.current = p.title;
-      setSelected(prev => prev ?? flatten(chs)[0] ?? null);
+      // 第二十六轮 P2 修复(task:done 后 selected 不刷新): 原用 prev ?? flatten(chs)[0],
+      //   已选章节时保留旧引用 → AI 生成完当前章节后编辑器仍是旧正文,需手动重选才看到新内容。
+      //   现: 若 prev 在新 tree 中存在,用新 tree 对应 node 替换,刷新 content;否则取首个。
+      setSelected(prev => {
+        if (!prev) return flatten(chs)[0] ?? null;
+        const updated = flatten(chs).find(c => c.id === prev.id);
+        return updated ?? prev;
+      });
       setSnapshotCount(countSnapshots(chs));
     } catch (e) {
       // F5 修复：项目不存在（404）时 toast 一闪即过 + 永久 spinner。
@@ -186,19 +209,23 @@ export default function ProjectDetail() {
   // 第二十六轮 P0 修复(数据丢失): task:done 触发 load() 前也调用此函数强制落库防抖未保存 patch,
   //   否则 SSE 刷新会用服务端旧 tree 覆盖本地编辑输入
   const flushPendingSave = useCallback(() => {
-    if (!saveRef.current || !selected) return;
+    // 第二十六轮 P2 修复: 读 selectedRef.current 而非闭包 selected,
+    //   使本回调依赖收敛到 [toast],SSE effect 依赖收敛到 [id],
+    //   避免切章节时 selected 变化触发 SSE 重订阅丢 task:done 事件。
+    const sel = selectedRef.current;
+    if (!saveRef.current || !sel) return;
     window.clearTimeout(saveRef.current);
-    const sid = selected.id;
+    const sid = sel.id;
     // 取 selected 的当前 content/outline/title 作为 patch
     const patch: Partial<Chapter> = {
-      title: selected.title, outline: selected.outline, content: selected.content,
+      title: sel.title, outline: sel.outline, content: sel.content,
     };
     saveRef.current = null;
     // 异步保存,不等返回(切 Tab 不阻塞)
     api.chapters.update(sid, patch).then(() => {
       setTree(prev => mutateNode(prev, sid, n => Object.assign(n, patch)));
     }).catch(e => toast((e as Error).message, 'err'));
-  }, [selected, toast]);
+  }, [toast]);
 
   // SSE：任务完成/失败时刷新章节
   // 第二十六轮 P0 修复(数据丢失): task:done 触发 load() 会拉取服务端旧 tree 覆盖本地 state,
@@ -214,7 +241,13 @@ export default function ProjectDetail() {
       else if (e.type === 'task:failed') { toast(e.message || '任务失败', 'err'); if (id) loadTasks(id); }
     });
     return off;
-  }, [id, load, loadTasks, toast, flushPendingSave]);
+    // 第二十六轮 P2 修复(SSE 重订阅): deps 收敛到 [id]。
+    //   flushPendingSave 现依赖 [toast](useToast 的 toast 是 useState setter 包裹,稳定引用);
+    //   loadTasks 是 zustand action,稳定;load 依赖 [id, setCurrentProject, toast, navigate]。
+    //   收敛后切章节(selected 变化)不再重建 EventSource,避免重连窗口丢 task:done。
+    //   eslint-disable-next-line 仅为消除对 load/loadTasks/flushPendingSave/toast 变化的提示。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id]);
   // BUG-5 修复：组件卸载时清理防抖定时器，避免编辑后立刻返回作品库时 800ms 定时器
   // 仍触发 api.chapters.update（对已删除章节 404，对仍存在章节写脏值）
   useEffect(() => () => { if (saveRef.current) window.clearTimeout(saveRef.current); }, []);
@@ -1465,6 +1498,50 @@ export default function ProjectDetail() {
                   />
                   <span className="shrink-0 text-[10px] text-paper-mute">字</span>
                 </div>
+              </div>
+              {/* 第二十六轮 P2 修复: 每章字数上下限自定义输入,与一键生成一致,透传到 daemon */}
+              <div className="rounded-md border p-2.5" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
+                <div className="mb-1.5 flex items-center justify-between">
+                  <span className="text-[10px] uppercase tracking-wider text-paper-mute">每章字数浮动范围</span>
+                  <span className="text-[10px] text-paper-mute">默认 = 预算 ×0.8 / ×1.2</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex flex-1 items-center gap-1">
+                    <label className="shrink-0 text-[10px] text-paper-mute">下限</label>
+                    <input
+                      type="number"
+                      min={Math.round(min * 0.5)}
+                      max={continueBudget}
+                      step={step}
+                      className="input px-2 py-1 text-xs"
+                      value={continueMin}
+                      onChange={e => {
+                        const v = Number(e.target.value);
+                        if (!isNaN(v)) setContinueMin(Math.min(continueBudget, Math.max(Math.round(min * 0.5), v)));
+                      }}
+                    />
+                  </div>
+                  <span className="shrink-0 text-[10px] text-paper-mute">—</span>
+                  <div className="flex flex-1 items-center gap-1">
+                    <label className="shrink-0 text-[10px] text-paper-mute">上限</label>
+                    <input
+                      type="number"
+                      min={continueBudget}
+                      max={Math.round(max * 1.5)}
+                      step={step}
+                      className="input px-2 py-1 text-xs"
+                      value={continueMax}
+                      onChange={e => {
+                        const v = Number(e.target.value);
+                        if (!isNaN(v)) setContinueMax(Math.max(continueBudget, Math.min(Math.round(max * 1.5), v)));
+                      }}
+                    />
+                  </div>
+                  <span className="shrink-0 text-[10px] text-paper-mute">字</span>
+                </div>
+                <p className="mt-1.5 text-[10px] text-paper-mute">
+                  续写生成时,每章字数将在 <span className="font-mono text-amber">{continueMin}</span>-<span className="font-mono text-amber">{continueMax}</span> 区间内浮动,超上限 15% 触发质检重写压缩
+                </p>
               </div>
               {/* 联动预览 */}
               <div className="flex items-center gap-2 rounded-md border p-2.5 text-xs" style={{ borderColor: 'var(--ink-500)', background: 'var(--ink-900)' }}>

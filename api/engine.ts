@@ -689,10 +689,11 @@ export async function checkChapterQuality(opts: {
   let topicScore = 1.0;  // 默认通过（LLM 调用失败时不阻断生成）
   // 第二十五轮: 模型退化硬失败标志(末尾截断 / tier1 工程词泄漏) → 强制 needRewrite
   let degenerationHardFail = false;
-  // 第二十六轮修复(字数门非强制后的安全网): 规则式退化检测(末尾截断/工程词)移到 minHard 门之外,
-  //   无论字数是否达标都执行。字数门已按用户要求改为非强制(仅警告不重写),若短文本仍跳过退化检测,
-  //   maxTokens 截断/工程词泄漏的废稿会带 issue 但 needRewrite=false 直接通过 → 质量门形同虚设。
-  //   退化检测属"模型故障信号"而非"字数边界",保留强制重写符合用户"上下限非强制但废稿要拦"的意图。
+  // 第二十六轮修复(字数门改用用户自定义上下限后的安全网): 规则式退化检测(末尾截断/工程词)移到
+  //   minHard 门之外,无论字数是否达标都执行。字数门按用户配置上下限做硬判定(超容差触发重写),
+  //   但若短文本(未触字数门硬失败)仍跳过退化检测,maxTokens 截断/工程词泄漏的废稿会带 issue 却
+  //   needRewrite=false 直接通过 → 质量门形同虚设。退化检测属"模型故障信号"而非"字数边界",
+  //   保留独立强制重写确保废稿被拦下重写。
   let degenerationIssue = '';
   {
     const trimmed = content.trimEnd();

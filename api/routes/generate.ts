@@ -152,15 +152,25 @@ router.post('/', (req: Request, res: Response) => {
 // 规则: min/max 可选,但若传则必须满足 min <= budget <= max 且各自在 [budgetMin*0.5, budgetMax*1.5] 内
 // 返回错误消息字符串(校验失败)或 null(校验通过)
 function validateWordRange(min: unknown, max: unknown, budget: number, budgetMin: number, budgetMax: number): string | null {
+  // 第二十六轮 P2 修复(容差不闭合): 原允许 min 低到 budgetMin*0.5、max 高到 budgetMax*1.5,
+  //   与 engine.ts 字数门容差(chapterWordMin*0.7 / chapterWordMax*1.15)不协调——
+  //   极端配置(如 min=750 book)会让 engine 的 minHard=525,LLM 输出 530 字也能通过质量门,
+  //   但相对 budget=2500 差 80%,章节质量极差却放行。
+  //   现: 收紧到 min >= budget*0.7 / max <= budget*1.5(与 engine 容差形成闭合区间),
+  //   用户配置的上下限不能脱离 budget 太远。
   const loBound = Math.round(budgetMin * 0.5);
   const hiBound = Math.round(budgetMax * 1.5);
   if (min != null) {
     if (typeof min !== 'number' || min < loBound) return `每章字数下限不能小于 ${loBound}`;
     if (min > budget) return `每章字数下限(${min})不能大于预算(${budget})`;
+    // 容差下限:不能低于 budget 的 70%(与 engine.ts minHard = chapterWordMin*0.7 协调)
+    if (min < Math.round(budget * 0.7)) return `每章字数下限(${min})不能小于预算(${budget})的 70%`;
   }
   if (max != null) {
     if (typeof max !== 'number' || max > hiBound) return `每章字数上限不能大于 ${hiBound}`;
     if (max < budget) return `每章字数上限(${max})不能小于预算(${budget})`;
+    // 容差上限:不能高于 budget 的 1.5 倍(与 engine.ts hardMax = chapterWordMax*1.15 协调)
+    if (max > Math.round(budget * 1.5)) return `每章字数上限(${max})不能大于预算(${budget})的 1.5 倍`;
   }
   if (min != null && max != null && min > max) return `每章字数下限(${min})不能大于上限(${max})`;
   return null;
