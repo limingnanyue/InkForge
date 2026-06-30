@@ -108,7 +108,10 @@ export function Modal({ open, onClose, title, children, className }: { open: boo
         {title && (
           // 第二十六轮 P1 修复: Modal 标题改 sticky,长表单滚动时标题与关闭按钮常驻顶部
           //   原: 标题随内容滚走,用户滚到底想关闭得回滚
-          <div className="sticky top-0 z-10 flex items-center justify-between px-6 py-4 -mx-0 mb-4 border-b" style={{ background: 'var(--ink-800)', borderColor: 'var(--ink-500)' }}>
+          // 第二十六轮 P3 修复(视觉断层 + no-op): 原 background 用纯 var(--ink-800),
+          //   panel-elevated 是 ink-700→ink-800 渐变,滚动时标题区与渐变顶端有色阶差。
+          //   -mx-0 是 no-op(负零=0)。现背景改用渐变顶端色 ink-700 与 panel 顶部一致,删 -mx-0。
+          <div className="sticky top-0 z-10 flex items-center justify-between px-6 py-4 mb-4 border-b" style={{ background: 'var(--ink-700)', borderColor: 'var(--ink-500)' }}>
             <h2 className="font-display text-lg text-paper">{title}</h2>
             <button onClick={onClose} aria-label="关闭" className="text-paper-mute hover:text-paper transition-colors"><X size={18} /></button>
           </div>

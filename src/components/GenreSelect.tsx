@@ -9,7 +9,7 @@
  *   <GenreSelect value={form.genreId} label={form.genre}
  *     onChange={(genreId, label) => set({ genreId, genre: label })} />
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '@/api/client';
 import { Spinner } from '@/components/ui';
 import { cn } from '@/lib/utils';
@@ -50,7 +50,7 @@ export default function GenreSelect({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [customMode, setCustomMode] = useState(false);
   const [customInput, setCustomInput] = useState('');
-  const reloadRef = useRef<(() => void) | null>(null);
+  // (第二十六轮清理: 删 reloadRef 死代码,全文件无读取,H-03 重试按钮直接调 loadGenres())
 
   const loadGenres = async () => {
     setLoading(true);
@@ -65,7 +65,6 @@ export default function GenreSelect({
       setLoadError((e as Error).message || '加载题材库失败');
     } finally { setLoading(false); }
   };
-  reloadRef.current = loadGenres;
 
   useEffect(() => { loadGenres(); }, []);
 

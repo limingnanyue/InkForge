@@ -149,8 +149,11 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
       const imp = f.importance === 'high' ? '【主线】' : (f.importance === 'low' ? '【支线】' : '');
       const age = curIdx - f.plantedAt;
       const overdue = age > (f.importance === 'high' ? FORESHADOW_EXPIRY_HIGH : FORESHADOW_EXPIRY_NORMAL) - 3 ? '【已埋N章·优先回收】' : '';
+      // 第二十六轮升级(伏笔状态机): expectedRecycleAt === 当前章 → 标【本章必须回收】硬提醒。
+      //   原: 只有预计回收章的括号提示,LLM 不知"到章了"。现硬标红,LLM 必须本章兑现。
+      const dueNow = typeof f.expectedRecycleAt === 'number' && f.expectedRecycleAt === curIdx ? '【本章必须回收·到期】' : '';
       const expect = typeof f.expectedRecycleAt === 'number' ? `（预计第${f.expectedRecycleAt + 1}章回收）` : '';
-      return `${i + 1}. 第${f.plantedAt + 1}章埋设 ${imp}${overdue}：${f.desc}${expect}`;
+      return `${i + 1}. 第${f.plantedAt + 1}章埋设 ${imp}${overdue}${dueNow}：${f.desc}${expect}`;
     }).join('\n')}`);
   }
   // M2 修复(第十五轮): expired 伏笔限最近 10 条,防长篇后期 prompt 被撑爆
@@ -361,6 +364,15 @@ export function buildChapterAnchor(
 
   // H2 修复(第十二轮): 注入本卷核心冲突 + 情绪弧线,防每章不知卷主线而跑题
   // 原: buildChapterAnchor 只注入本章定位 + 上一章结尾,LLM 看不到当前卷要解决什么主线冲突
+  // 第二十六轮升级(长篇防跑偏): 注入【全书核心锚点】(state.idea 提炼),
+  //   200+ 章中段 LLM 容易写独立单元脱离全书主线。每章硬注入核心创意作为主线锚点,
+  //   提醒 LLM 本章不得彻底解决核心冲突(除非末章),只能推进/转折。
+  const _projState = stateRepo.get(projectId);
+  const ideaAnchor = _projState?.idea
+    ? `\n【全书核心锚点】${_projState.idea.slice(0, 200)}${_projState.idea.length > 200 ? '…' : ''}
+· 本章不得彻底解决全书核心冲突,只能推进或转折（除非是第 ${totalChapters} 章大结局）
+· 所有支线最终须回归核心主线,不得写脱离核心锚点的独立单元`
+    : '';
   // 现: 通过 volumeOutlines 反查当前章所属卷,注入【本卷主线】段
   // M3 修复(第十四轮): 加 keyForeshadows 注入,LLM 知本卷重点伏笔可考虑回收
   const volKfs = volumeCtx?.keyForeshadows?.length
@@ -377,7 +389,7 @@ export function buildChapterAnchor(
   return `【当前位置锚点】
 正在创作：第 ${currentIdx + 1} / ${totalChapters} 章《${chapterTitle}》
 本章大纲：${chapterOutline}
-${positioningBlock}${volumeBlock}
+${positioningBlock}${volumeBlock}${ideaAnchor}
 
 【上一章结尾 300 字】（必须自然承接此情境，不得重复）
 ${prevTail}
@@ -730,8 +742,11 @@ export async function checkChapterQuality(opts: {
     // H1 修复(第十四轮): 跑题门增第 5 维「伏笔回收度」,relationship 章未回收扣分
     // H2 修复(第十五轮): 增第 6 维「AI 味检测」,正则预筛禁用词/翻转句/总结升华
     // H3 修复(第十五轮): 增第 7 维「卷主线推进度」,注入 volumeCtx 校验是否推进卷核心冲突
+    // 第二十六轮性能优化: 原 3 次独立 stateRepo.get(L734/L783/L796)合并为 1 次,
+    //   2000 章省 4000 次 SQLite 查询。
+    const _state = stateRepo.get(projectId);
     // 待回收伏笔列表(供 LLM 判断本章是否回收)
-    const pendingFs = (stateRepo.get(projectId)?.foreshadowing || [])
+    const pendingFs = (_state?.foreshadowing || [])
       .filter(f => f.status === 'planted')
       .slice(0, 15)
       .map(f => `- ${f.desc}（第${f.plantedAt + 1}章埋设${f.importance === 'high' ? '·主线' : ''}）`)
@@ -780,7 +795,7 @@ export async function checkChapterQuality(opts: {
     //   (不强制重写,因可能是有意为之的连续高潮;仅提示作者差异化)
     let emotionClusterIssue = '';
     if (coreEmotion) {
-      const recentSummaries = (stateRepo.get(projectId)?.chapterSummaries || [])
+      const recentSummaries = (_state?.chapterSummaries || [])
         .filter(s => s.idx < chapterIdx && s.coreEmotion)
         .sort((a, b) => b.idx - a.idx)
         .slice(0, 2);
@@ -790,10 +805,25 @@ export async function checkChapterQuality(opts: {
       }
     }
 
+    // 第二十六轮升级(节奏门规则式检测): oh-story 节奏门要求章末 200 字含悬念元素。
+    //   原: 节奏只靠字数进度间接判断,LLM 质检软判定。现加规则式硬检测:
+    //   章末 200 字若无钩子信号词(？/！/省略号/悬念词),加 advisory issue(不重写,仅提示)。
+    //   覆盖 buildChapterAnchor L404 "章末 200 字必须包含悬念元素" 的约束,质检回检。
+    let hookIssue = '';
+    if (actualLen > 500) {
+      const tail200 = content.slice(-200);
+      const hookSignals = ['？', '！', '...', '……', '然而', '可是', '不料', '突然', '只见', '下一', '未完', '究竟', '难道', '谁知', '倒底', '到底'];
+      const hasHook = hookSignals.some(s => tail200.includes(s));
+      if (!hasHook) {
+        issues.push(`节奏门 advisory（不重写）：章末 200 字未检测到悬念元素（钩子/未解问题/新威胁信号词），建议结尾加悬念钩子提升追读`);
+        hookIssue = `\n【章末钩子缺失】章末 200 字无悬念信号词,请重写时在结尾加钩子(疑问/反转/新威胁/未解问题)提升追读留存。`;
+      }
+    }
+
     // H3 修复(第十五轮): 卷主线推进度(第 7 维),注入 volumeCtx.premise
     // 原: prompt 写"本章须推进本卷核心冲突",但质量门不校验 → LLM 可写高分章节但完全脱离卷主线
     // 现: 反查当前章所属卷,注入 premise + emotionArc,LLM 判断本章是否推进卷核心冲突
-    const curVol = stateRepo.get(projectId)?.volumeOutlines?.find(v => chapterIdx >= v.chapterRange[0] && chapterIdx <= v.chapterRange[1]);
+    const curVol = _state?.volumeOutlines?.find(v => chapterIdx >= v.chapterRange[0] && chapterIdx <= v.chapterRange[1]);
     const volMainLineBlock = curVol
       ? `\n【本卷核心冲突】第${curVol.idx + 1}卷《${curVol.title}》: ${curVol.premise}（情绪弧线: ${curVol.emotionArc}）`
       : '';
@@ -807,7 +837,7 @@ export async function checkChapterQuality(opts: {
 【章节定位】${positioning || '未指定'}
 【核心情绪】${coreEmotion || '未指定'}
 【本章大纲】
-${outline}${recycleBlock}${volMainLineBlock}${aiTasteBlock}${degenerationIssue}${emotionClusterIssue}
+${outline}${recycleBlock}${volMainLineBlock}${aiTasteBlock}${degenerationIssue}${emotionClusterIssue}${hookIssue}
 
 【正文片段】（前 1500 字）
 ${content.slice(0, 1500)}
@@ -950,8 +980,12 @@ export async function compactVolumeSummary(
     .slice(0, 10)
     .join('\n');
   // 本卷涉及的角色(从 characterState 全量,无法精确按卷过滤)
+  // 第二十六轮修复(远期卷摘要角色取错段): 原 slice(0, 8) 取头部=最久未出场角色,
+  //   characterState 经 splice+push 重排后数组末尾才是最近活跃角色(L178-179 注释已说明)。
+  //   喂 LLM 最久未出场角色的状态生成"卷级角色弧线"对当前卷毫无指导意义。
+  //   现改 slice(-8) 取最近活跃角色,与 buildDynamicContext 的 slice(-15) 一致。
   const volChars = (state.characterState || [])
-    .slice(0, 8)
+    .slice(-8)
     .map(c => `- ${c.name}：${c.location} / ${c.mood} / ${c.relationships}`)
     .join('\n');
 

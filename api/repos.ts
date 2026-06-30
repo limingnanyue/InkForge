@@ -341,8 +341,13 @@ export const providerRepo = {
     return this.get(id);
   },
   setDefault(id: string): void {
-    db.prepare('UPDATE provider SET is_default=0').run();
-    db.prepare('UPDATE provider SET is_default=1 WHERE id=?').run(id);
+    // 第二十六轮修复(非事务中间态): 原两步 SQL 未包事务,进程崩溃在两步之间会留下
+    //   "全部 provider 无默认"中间态。getDefault 虽回落到 list()[0] 兜底,但行为悄然变化。
+    //   现包 db.transaction,与 taskRepo.claimNext 同款模式,确保原子性。
+    db.transaction(() => {
+      db.prepare('UPDATE provider SET is_default=0').run();
+      db.prepare('UPDATE provider SET is_default=1 WHERE id=?').run(id);
+    })();
   },
   delete(id: string): void {
     // H4 修复：保留历史用量记录但置 NULL provider_id（与 projectRepo.delete 处理 token_usage 一致）

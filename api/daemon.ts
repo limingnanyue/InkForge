@@ -346,6 +346,9 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     // M6 修复(第十四轮): scan 阶段改用 SKILL_PROMPTS.scan 完整 prompt
     // 原: inline system "分析题材市场,输出切入点与人设方向,200字内" → 输出浅,缺题材空白/差异化分析
     // 现: 复用 SKILL_PROMPTS.scan(3-5 切入点+人设方向+题材空白+差异化机会),maxTokens 提到 1024 给足空间
+    // 第二十六轮优化(国产模型截断): 原硬编码 1024,国产模型 1 字≈1.5 token,1024 token 仅能输出
+    //   ~680 字,scan 目标 800 字必然截断。其他阶段都按 tokenCharRatio 放大,唯独 scan 漏了。
+    //   现统一按 tokenCharRatio 放大,确保 scan 洞察完整不被截断,下游 setup/outline 质量提升。
     const { text: scanResult } = await complete({
       providerId, model, webSearch,
       projectId,
@@ -354,7 +357,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
         { role: 'system', content: SKILL_PROMPTS.scan },
         { role: 'user', content: `题材：${cfg.config.genre}\n创意：${cfg.idea}\n请输出 3-5 个可行切入点与人设方向,并识别题材空白与差异化机会(800字内)。` },
       ],
-      temperature: 0.7, maxTokens: 1024,
+      temperature: 0.7, maxTokens: Math.round(1024 * tokenCharRatio(providerId)),
     });
     stateRepo.update(projectId, { idea: cfg.idea + '\n\n【扫榜洞察】\n' + scanResult });
     scanInsight = scanResult;  // 局部变量 hold，下方 setup 阶段直接用

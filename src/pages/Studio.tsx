@@ -173,7 +173,7 @@ export default function Studio() {
         setStreamText('');
       }
     }
-  }, [input, streaming, currentProject, currentModel, currentProviderId, webSearch, toast, navigate, setCurrentModel]);
+  }, [input, streaming, currentProject, currentModel, currentProviderId, webSearch, toast, navigate]);
 
   const toggleWebSearch = async () => {
     if (!currentProject) return;

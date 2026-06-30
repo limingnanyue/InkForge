@@ -216,12 +216,8 @@ export interface ChatCompletionRequest {
 // 一键生成
 export type GenerateKind = 'book' | 'short';
 
-// 题材分组（参考主流网文平台分类）
-export interface GenreGroup {
-  id: string;
-  label: string;
-  items: string[];
-}
+// 题材分组定义在 shared/genres.ts(与 BUILTIN_GENRES 同源),此处不再重复定义。
+// (第二十六轮清理: 原 GenreGroup 死代码,字段 shape 与 genres.ts 的 GenreGroup 冲突,无任何 import)
 
 export interface GenerateConfig {
   genre: string;        // 具体题材，如"都市修真"（向后兼容：既可存 label 也可存 id）
