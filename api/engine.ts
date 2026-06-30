@@ -1234,18 +1234,71 @@ export interface ParsedOutlineItem {
   coreEmotion?: string;
 }
 export function parseOutline(json: string): ParsedOutlineItem[] {
+  // 第二十六轮修复(大纲解析失败重试3次放弃): 原 parseOutline 失败时静默返回 [],
+  //   daemon.ts:435 拿到空数组抛"大纲解析失败",重试时解析同一个已持久化的 outline 字符串
+  //   → 必然 3 次都失败(内容不变结果不变)。增强解析兼容性 + 失败时打诊断日志。
+  //   常见 LLM 输出格式问题:
+  //   1. 数组被包在对象里: {"volumes":[...]} 或 {"chapters":[...]} 或 {"outline":[...]}
+  //      原 /\[[\s\S]*\]/ 贪婪匹配可能拿到非章节数组(如 volumes 数组,元素无 title 字段)
+  //   2. 字段名变体: chapterTitle/name/章名/章节名 而非 title → filter 全部丢弃
+  //   3. ```json 代码块包裹 + 末尾多余说明文字
+  //   4. maxTokens 截断未闭合 ] (原有兜底,保留)
+  const diag = { rawLen: json.length, head: json.slice(0, 200), reason: '' };
   try {
     // 1. 正常路径：完整 [...] 数组
     const match = json.match(/\[[\s\S]*\]/);
     if (match) {
-      const arr = JSON.parse(match[0]);
-      if (Array.isArray(arr)) return parseOutlineArray(arr);
+      try {
+        const arr = JSON.parse(match[0]);
+        if (Array.isArray(arr)) {
+          const items = parseOutlineArray(arr);
+          if (items.length > 0) return items;
+          // 数组 parse 成功但 filter 全空 → 可能字段名不匹配,尝试宽松映射
+          const loose = parseOutlineArrayLoose(arr);
+          if (loose.length > 0) {
+            console.warn(`[parseOutline] 严格字段校验全空,宽松映射恢复 ${loose.length} 项(原 ${arr.length} 项)。原文头部: ${diag.head}`);
+            return loose;
+          }
+          diag.reason = `数组 parse 成功但 title 字段全空(arr.length=${arr.length})`;
+        } else {
+          diag.reason = '匹配到 [...] 但 JSON.parse 结果非数组';
+        }
+      } catch (e1) {
+        diag.reason = `匹配到 [...] 但 JSON.parse 失败: ${(e1 as Error).message}`;
+      }
+    } else {
+      diag.reason = '未匹配到 [...] 数组';
+    }
+
+    // 1.5 兼容:数组被包在对象里。找含 title/chapterTitle 字段最多的数组(递归一层)
+    //    覆盖 {"volumes":[{"chapters":[...]}]} / {"chapters":[...]} 等
+    if (diag.reason.includes('title') || diag.reason.includes('非数组') || diag.reason.includes('未匹配')) {
+      try {
+        const obj = JSON.parse(json.trim().replace(/^```json\s*/i, '').replace(/\s*```$/i, ''));
+        const nested = findChapterArrayInObject(obj);
+        if (nested && nested.length > 0) {
+          const items = parseOutlineArray(nested);
+          if (items.length > 0) {
+            console.warn(`[parseOutline] 顶层是对象,从嵌套数组恢复 ${items.length} 项。原文头部: ${diag.head}`);
+            return items;
+          }
+          const loose = parseOutlineArrayLoose(nested);
+          if (loose.length > 0) {
+            console.warn(`[parseOutline] 嵌套数组+宽松映射恢复 ${loose.length} 项。原文头部: ${diag.head}`);
+            return loose;
+          }
+        }
+      } catch { /* 不是对象,继续兜底 */ }
     }
 
     // 2. 截断兜底：LLM 输出被 maxTokens 截断没闭合 ] 时，从首个 [ 起尝试 parse
-    //    用「从后向前找对象边界」策略，避免裸 lastIndexOf('}') 在字符串值含 } 时误判
+    //    用「从后向前找对象边界」策略，避免裸 lastOfDay('}') 在字符串值含 } 时误判
     const start = json.indexOf('[');
-    if (start < 0) return [];
+    if (start < 0) {
+      if (!diag.reason) diag.reason = '未找到 [ 起始符';
+      console.warn(`[parseOutline] 解析失败(${diag.reason})。原文长度=${diag.rawLen} 头部=${diag.head}`);
+      return [];
+    }
     const tail = json.slice(start);
     // 从后向前依次尝试「在倒数第 N 个 } 后补 ]」直到 JSON.parse 成功
     // 每个 } 必须后跟空白或 , 或字符串结束（避免命中字符串值内部的 }）
@@ -1262,15 +1315,55 @@ export function parseOutline(json: string): ParsedOutlineItem[] {
       const repaired = tail.slice(0, pos + 1) + ']';
       try {
         const arr = JSON.parse(repaired);
-        if (Array.isArray(arr) && arr.length > 0) return parseOutlineArray(arr);
+        if (Array.isArray(arr) && arr.length > 0) {
+          const items = parseOutlineArray(arr);
+          if (items.length > 0) return items;
+          const loose = parseOutlineArrayLoose(arr);
+          if (loose.length > 0) {
+            console.warn(`[parseOutline] 截断兜底+宽松映射恢复 ${loose.length} 项。原文头部: ${diag.head}`);
+            return loose;
+          }
+        }
       } catch {
         // 继续尝试更早的边界
       }
     }
+    if (!diag.reason) diag.reason = '截断兜底也未能 parse 出非空数组';
+    console.warn(`[parseOutline] 全部解析路径失败(${diag.reason})。原文长度=${diag.rawLen} 头部=${diag.head}`);
     return [];
-  } catch {
+  } catch (e) {
+    console.warn(`[parseOutline] 顶层异常: ${(e as Error).message}。原文长度=${diag.rawLen} 头部=${diag.head}`);
     return [];
   }
+}
+
+// 第二十六轮修复: 在对象里递归找"看起来像章节数组"的数组(含 title/chapterTitle 字段的对象居多)
+//   覆盖 {"volumes":[{"chapters":[...]}]} / {"data":{"chapters":[...]}} 等
+function findChapterArrayInObject(obj: unknown, depth = 0): unknown[] | null {
+  if (!obj || typeof obj !== 'object' || depth > 3) return null;
+  if (Array.isArray(obj)) {
+    // 检查数组元素是否像章节(至少 1/3 元素含 title/chapterTitle 字段)
+    if (obj.length > 0) {
+      const chapterLike = obj.filter(x => x && typeof x === 'object' && (
+        typeof (x as any).title === 'string' ||
+        typeof (x as any).chapterTitle === 'string' ||
+        typeof (x as any).name === 'string'
+      )).length;
+      if (chapterLike >= Math.max(1, Math.ceil(obj.length / 3))) return obj;
+    }
+    return null;
+  }
+  // 对象:递归每个数组类型字段
+  for (const v of Object.values(obj as Record<string, unknown>)) {
+    if (Array.isArray(v)) {
+      const found = findChapterArrayInObject(v, depth + 1);
+      if (found) return found;
+    } else if (v && typeof v === 'object') {
+      const found = findChapterArrayInObject(v, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 // 从已 parse 的数组提取 ParsedOutlineItem（提取公共逻辑，给截断兜底分支复用）
@@ -1292,6 +1385,41 @@ function parseOutlineArray(arr: unknown[]): ParsedOutlineItem[] {
       }
       return item;
     });
+}
+
+// 第二十六轮修复(parseOutline 宽松映射): 严格字段校验全空时回退到此函数。
+//   兼容 LLM 输出字段名变体:
+//   title: title / chapterTitle / name / chapterName / 章名 / 章节名 / 章节标题
+//   outline: outline / summary / desc / description / 大纲 / 摘要 / 内容
+//   hook: hook / 章末钩子 / cliffhanger
+//   positioning: positioning / 定位 / chapterType / type
+//   coreEmotion: coreEmotion / emotion / 情绪 / core_emotion
+function parseOutlineArrayLoose(arr: unknown[]): ParsedOutlineItem[] {
+  const validPositioning: ChapterPositioning[] = ['high-pressure', 'normal-progress', 'trial-error', 'relationship', 'low-pressure', 'info-organize'];
+  const pickStr = (x: any, keys: string[]): string => {
+    for (const k of keys) {
+      const v = x?.[k];
+      if (typeof v === 'string' && v.trim()) return v;
+    }
+    return '';
+  };
+  return arr
+    .map(x => {
+      if (!x || typeof x !== 'object') return null;
+      const title = pickStr(x as any, ['title', 'chapterTitle', 'name', 'chapterName', '章名', '章节名', '章节标题', '章标题']);
+      if (!title) return null;  // 标题是必须的,没有则跳过
+      const outline = pickStr(x as any, ['outline', 'summary', 'desc', 'description', '大纲', '摘要', '内容', 'chapterOutline']);
+      const hook = pickStr(x as any, ['hook', '章末钩子', 'cliffhanger', '钩子']);
+      const item: ParsedOutlineItem = { title, outline, hook };
+      const posRaw = pickStr(x as any, ['positioning', '定位', 'chapterType', 'type']);
+      if (posRaw && validPositioning.includes(posRaw as ChapterPositioning)) {
+        item.positioning = posRaw as ChapterPositioning;
+      }
+      const emo = pickStr(x as any, ['coreEmotion', 'emotion', '情绪', 'core_emotion', '核心情绪']);
+      if (emo) item.coreEmotion = emo.slice(0, 20);
+      return item;
+    })
+    .filter((x): x is ParsedOutlineItem => x !== null);
 }
 
 // ============ oh-story 章节定位六类分布校验 ============

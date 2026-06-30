@@ -432,7 +432,17 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   }
 
   const chapters = parseOutline(outline);
-  if (chapters.length === 0) throw new Error('大纲解析失败，请重试');
+  // 第二十六轮修复(大纲解析失败重试3次放弃): parseOutline 失败时打诊断日志,
+  //   让用户在 task_log 能看到实际失败原因(原文长度/头部/是否含 [),而非只看到"大纲解析失败"
+  //   重试时解析同一个已持久化的 outline 字符串,若格式问题则必然 3 次都失败——
+  //   parseOutline 已增强兼容(嵌套对象/字段名变体/代码块),此处仅兜底诊断。
+  if (chapters.length === 0) {
+    const head = outline.slice(0, 300).replace(/\n/g, ' ');
+    const hasArray = outline.includes('[');
+    const hasJsonBlock = /```json/i.test(outline);
+    logTask(task.id, 'error', `大纲解析失败诊断: 长度=${outline.length} 含数组符号=${hasArray} 含代码块标记=${hasJsonBlock} 头部=${head}`);
+    throw new Error(`大纲解析失败（已增强兼容:嵌套对象/字段名变体/截断兜底仍失败,详见任务日志诊断信息）`);
+  }
 
   // H3 修复(第十三轮): 章节定位六类分布校验
   // oh-story 方法论核心:防止每章都像短篇、防止情绪扎堆
