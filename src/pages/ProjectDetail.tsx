@@ -384,7 +384,7 @@ export default function ProjectDetail() {
     const pid = coverImageProvider.split('::')[0];
     if (!providers.find(p => p.id === pid)) {
       setCoverImageProvider('');
-      toast('所选图像供应商已被删除,已切回系统默认', 'err');
+      toast('所选图像供应商已被删除,请在下方重新选择', 'err');
     }
   }, [providers, coverImageProvider, toast]);
   useEffect(() => {
@@ -1203,7 +1203,7 @@ export default function ProjectDetail() {
                         <span className="truncate text-paper-dim">
                           {coverImageProvider
                             ? `${providers.find(p => p.id === coverImageProvider.split('::')[0])?.name || '未知'} · ${coverImageProvider.split('::')[1] || ''}`
-                            : '系统默认（TRAE 文生图）'}
+                            : '未选择（需在下方配置）'}
                         </span>
                       </div>
                     </div>
@@ -1309,7 +1309,7 @@ export default function ProjectDetail() {
                     onChange={e => setCoverImageProvider(e.target.value)}
                     disabled={coverPreviewBusy}
                   >
-                    <option value="">系统默认（TRAE 文生图）</option>
+                    <option value="">— 请选择图像生成模型 —</option>
                     {(() => {
                       const IMAGE_RE = /(image|dall-?e|sd3|sdxl|stable-?diffusion|flux|seedream|cogview|kolors|midjourney|imagen)/i;
                       const COMPATIBLE: ProviderKind[] = ['openai', 'kkai', 'custom', 'kilo'];
@@ -1326,7 +1326,8 @@ export default function ProjectDetail() {
                     })()}
                   </select>
                   <p className="mt-1 text-[10px] text-paper-mute">
-                    切换到自配供应商（OpenAI / KKAPI / 自定义 / Kilo）后,将走该供应商的 <code className="font-mono">/images/generations</code> 接口。
+                    仅 OpenAI / KKAPI / 自定义 / Kilo 类型的供应商可选（DeepSeek / 智谱 / 通义等国产供应商不提供图像生成接口）。
+                    所选模型需为图像模型（含 image / dall-e / sdxl / flux 等关键词），否则供应商不返回图片。
                     需在「模型中心」配置 baseUrl 与 API Key。
                   </p>
                 </div>

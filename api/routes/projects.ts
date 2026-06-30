@@ -333,7 +333,14 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
     const textRendered = supportsTextRendering(model);
 
     // 调 OpenAI 兼容 /images/generations
-    const ep = provider.baseUrl.replace(/\/+$/, '') + '/images/generations';
+    // 第二十五轮修复(封面生成失败根因之一): baseUrl 拼接需与 chat 端点一致地处理 /v1 缺失
+    //   OpenAI 官方端点: /v1/chat/completions 与 /v1/images/generations 都在 /v1 下
+    //   llm.ts 拼 chat 用 `${baseUrl}/chat/completions`,若 baseUrl 含 /v1 则正确,不含则 404
+    //   本路由同样: baseUrl 含 /v1 则拼 /v1/images/generations(正确);不含则补 /v1
+    //   (中转网关若用非标路径,用户应配完整 baseUrl 含版本段)
+    const baseRaw = provider.baseUrl.replace(/\/+$/, '');
+    const needsV1 = !/\/v\d+(?=\/|$)/i.test(baseRaw);  // 不含 /v1 /v2 等版本段时补 /v1
+    const ep = baseRaw + (needsV1 ? '/v1' : '') + '/images/generations';
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (provider.kind !== 'ollama' && provider.kind !== 'kilo') {
       headers['Authorization'] = `Bearer ${provider.apiKey}`;
@@ -368,8 +375,10 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
+      // 第二十五轮修复: 错误信息截断扩到 800 字,原 300 字常把真正的报错原因(model not found /
+      //   insufficient_quota / invalid size 等)截断,用户只看到 502 + 半句,无法排查
       return fail(res, 'UPSTREAM_ERROR',
-        `${provider.name} · ${model} 图片生成失败（${upstream.status}）${errText ? ': ' + errText.slice(0, 300) : ''}`,
+        `${provider.name} · ${model} 图片生成失败（${upstream.status}）${errText ? ': ' + errText.slice(0, 800) : ''}`,
         502);
     }
     const json = await upstream.json() as { data?: Array<{ b64_json?: string; url?: string }> };
