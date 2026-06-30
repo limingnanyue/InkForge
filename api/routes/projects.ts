@@ -340,11 +340,19 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
     }
     // oh-story 备注: gpt-image-2 始终返回 base64,请求体不要带 response_format(旧 DALL-E 参数,gpt-image 系列不支持)
     // 故对 gpt-image 系列不传 response_format,其他模型仍传 b64_json
+    // 第二十五轮修复(封面生成失败): 不同图像模型支持的 size 不同,硬编码 1024x1536 会让 DALL·E 3 直接 400
+    //   - dall-e-3 仅支持 1024x1024 / 1024x1792 / 1792x1024,竖版封面取 1024x1792
+    //   - gpt-image-1/2 支持 1024x1536(2:3 竖版)
+    //   - 其他(SD/FLUX 网关)默认 1024x1536,网关自行适配
+    const sizeMap = (m: string): string => {
+      if (/dall-?e-?3/i.test(m)) return '1024x1792';
+      return '1024x1536';
+    };
     const reqBody: Record<string, unknown> = {
       model,
       prompt: prompt.trim(),
       n: 1,
-      size: '1024x1536',  // oh-story 默认 2:3 竖版比例
+      size: sizeMap(model),
     };
     if (!textRendered) {
       // 非 gpt-image 系列(如 dall-e-3)显式要 b64_json

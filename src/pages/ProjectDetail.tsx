@@ -533,12 +533,13 @@ export default function ProjectDetail() {
         imageDataUrl = data.image;
         textRendered = !!data.textRendered;
       } else {
-        // 路径 B: TRAE 系统默认端点（兜底，不支持中文文字渲染）
-        const url = `https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt=${encodeURIComponent(enPrompt)}&image_size=portrait_4_3`;
-        const resp = await fetch(url, { signal: ac.signal });
-        if (!resp.ok) throw new Error(`图片生成失败（${resp.status}）`);
-        const blob = await resp.blob();
-        objectUrl = URL.createObjectURL(blob);
+        // 第二十五轮修复(封面生成失败根因): 原"路径 B"直接从浏览器 fetch
+        //   https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image —— 该端点是 TRAE IDE
+        //   内部鉴权端点,部署态浏览器访问会被 CORS 拦截或返回鉴权错误,导致"生成预览图失败:
+        //   Failed to fetch / 图片加载失败"。这不是可用兜底,而是误导性失败源。
+        //   改为给用户可操作的明确提示:去模型设置配置支持图像生成的供应商(gpt-image-2/dall-e-3 等)
+        //   并在下方"图源"下拉里选中 provider::model,而非默默走必然失败的兜底。
+        throw new Error('未选择图像生成供应商。请先在「设置·模型」中配置支持图像生成的供应商（如 OpenAI 的 gpt-image-1/2、dall-e-3），再在上方「图源」下拉选中该 provider::model');
       }
 
       const titledAuthor = coverAuthor.trim() || '';

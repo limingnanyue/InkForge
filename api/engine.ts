@@ -181,6 +181,18 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
     const recentChars = state.characterState.slice(-15);
     const omitted = state.characterState.length - recentChars.length;
     sections.push(`【角色当前状态${omitted > 0 ? `（最近 ${recentChars.length} 个,省略 ${omitted} 个更早角色）` : ''}】\n${recentChars.map(c => `· ${c.name}：位置「${c.location}」/ 状态「${c.mood}」/ 关系「${c.relationships}」`).join('\n')}`);
+    // 第二十五轮优化(记忆错乱,参考 oh-story 热度四态 + inkos 角色矩阵):
+    //   characterState 经 splice+push 重排,数组头部=久未出场、尾部=最近活跃。
+    //   长篇后期角色 30+,被 slice(-15) 省略的头部角色长期不在 prompt → LLM 遗忘其存在
+    //   → 出现"已登场角色被当新角色介绍""配角消失后再不出现"等记忆错乱。
+    //   补「久未出场」预警:列出头部最多 5 个角色名,提示 LLM 本章可考虑让其一出场回顾,
+    //   既防遗忘又不撑爆 token(仅名字,无状态详情)。
+    if (omitted > 0) {
+      const forgotten = state.characterState.slice(0, Math.min(5, omitted)).map(c => c.name).filter(Boolean);
+      if (forgotten.length > 0) {
+        sections.push(`【久未出场角色 · 防遗忘】${forgotten.join('、')}（已超过 15 章未在最近活跃列表;若本章剧情涉及,可让其出场回顾,避免读者遗忘）`);
+      }
+    }
   }
 
   // —— 三层摘要归档（oh-story）：防上下文爆炸 ——
@@ -647,6 +659,8 @@ export async function checkChapterQuality(opts: {
   // LLM 返回 JSON：{ score: 0-1, reason: string }
   // score >= 0.6 视为达标，< 0.6 → needRewrite
   let topicScore = 1.0;  // 默认通过（LLM 调用失败时不阻断生成）
+  // 第二十五轮: 模型退化硬失败标志(末尾截断 / tier1 工程词泄漏) → 强制 needRewrite
+  let degenerationHardFail = false;
   if (actualLen >= minHard) {
     // H1 修复(第十四轮): 跑题门增第 5 维「伏笔回收度」,relationship 章未回收扣分
     // H2 修复(第十五轮): 增第 6 维「AI 味检测」,正则预筛禁用词/翻转句/总结升华
@@ -669,11 +683,16 @@ export async function checkChapterQuality(opts: {
     //   B 翻转句式(不是 A 而是 B / 并非 A,而是 B / 这便是 X)
     //   C 总结升华(本章.../至此.../就这样.../从此.../就这样,故事.../这便是...的全部)
     //   D 排比三连(三句相同句式排比)
+    // 第二十五轮新增 Gate G(oh-story v0.6.18 解释腔/上帝感/安排感):
+    //   · "之所以…是因为" 因果解释腔(替读者下结论)
+    //   · "殊不知" / "多年以后" / "他不知道的是" 上帝视角剧透
+    //   · "与其说…不如说" 翻转句跨句变体(B 门翻转句的软变体)
     // 注入到 prompt 让 LLM 二次确认,综合分按 7 维平均
     const AI_TASTE_PATTERNS = [
       /仿佛/g, /宛如/g, /犹如/g, /似乎/g, /不禁/g, /不由得/g, /淡淡的/g, /缓缓的/g,
-      /不是.{0,30}而是/g, /并非.{0,30}而是/g, /这便是.{0,10}/g,
+      /不是.{0,30}而是/g, /并非.{0,30}而是/g, /这便是.{0,10}/g, /与其说.{0,30}不如说/g,
       /本章[^。]*。/g, /至此[^。]*。/g, /就这样[^。]*。/g, /从此[^。]*。/g,
+      /之所以.{0,30}是因为/g, /殊不知/g, /多年以后/g, /(他|她)不知道的是/g,
     ];
     let aiTasteHits = 0;
     const hitPatterns: string[] = [];
@@ -689,6 +708,53 @@ export async function checkChapterQuality(opts: {
     const aiTasteBlock = aiTasteHits > 4
       ? `\n【已检测到 AI 味命中 ${aiTasteHits} 处】命中模式: ${hitPatterns.slice(0, 5).join(' / ') || '无'}\n请重点检查是否仍有上述禁用模式未修改。`
       : '';
+
+    // 第二十五轮新增(模型退化检测,参考 oh-story v0.6.19 check-degeneration):
+    //   弱模型/截断场景模型自己发现不了,只能靠规则兜。两类 blocking 信号触发 needRewrite:
+    //   1. 末尾截断: 正文末尾无收束标点(。！？…」』)且字数 < 预算 70% → 疑似 maxTokens 用尽被截断
+    //   2. 工程词泄漏: 正文(首行标题除外)出现"细纲/情节点/卷纲/功能标签/任务描述"等写作元词
+    //      → 模型把指令/大纲原文吐进正文,破坏沉浸感(oh-story tier1 blocking)
+    //   另 tier2 advisory(本章/下一章/读者/伏笔)只加 issue 不强制重写,因角色真在读"第X章"可豁免
+    let degenerationIssue = '';
+    const trimmed = content.trimEnd();
+    const tailChar = trimmed.slice(-1);
+    const hasClosingPunct = /[。！？…」』"']/.test(tailChar);
+    if (!hasClosingPunct && actualLen < wordBudget * 0.7) {
+      issues.push(`疑似末尾截断：正文末尾无收束标点且字数 ${actualLen} < 预算 ${wordBudget} 的 70%,可能 maxTokens 用尽被截断`);
+      degenerationIssue = `\n【疑似末尾截断】正文末尾无收束标点且字数不足,请补全章节结尾（自然收束于一个完整场景/钩子,不要为凑字数注水）。`;
+      degenerationHardFail = true;
+    }
+    // 工程词检测:去掉首行(可能是章节标题,标题含"第X章"属正常)
+    const bodyLines = content.split('\n');
+    const bodyForCheck = bodyLines.length > 1 ? bodyLines.slice(1).join('\n') : content;
+    const TIER1_WORDS = ['细纲', '情节点', '卷纲', '功能标签', '任务描述', '字数预算', '章节定位'];
+    const TIER2_WORDS = ['本章', '下一章', '前一章', '上一章'];
+    const tier1Hits = TIER1_WORDS.filter(w => bodyForCheck.includes(w));
+    const tier2Hits = TIER2_WORDS.filter(w => bodyForCheck.includes(w));
+    if (tier1Hits.length > 0) {
+      issues.push(`工程词泄漏正文（tier1 blocking）：${tier1Hits.join('、')} 出现在正文,模型把大纲/指令原文吐入正文`);
+      degenerationIssue += `\n【工程词泄漏】正文出现写作元词: ${tier1Hits.join('、')},请删除这些词及其所在句,用实际叙事替换。`;
+      degenerationHardFail = true;
+    } else if (tier2Hits.length > 0) {
+      // tier2 advisory:角色真在读"第X章"可豁免,仅提示不重写
+      issues.push(`工程词疑似泄漏（tier2 advisory,不重写）：${tier2Hits.join('、')} 出现在正文,请人工确认是否角色在故事内讨论章节`);
+    }
+
+    // 第二十五轮新增(情绪母题扎堆检测,参考 oh-story v0.6.20「禁情绪母题扎堆」底线):
+    //   相邻 3 章同情绪母题高位运行是比"每章像短篇"更隐蔽的疲劳源。
+    //   检查当前章 coreEmotion 与前 2 章摘要的 coreEmotion 是否同母题 → 命中加 advisory issue
+    //   (不强制重写,因可能是有意为之的连续高潮;仅提示作者差异化)
+    let emotionClusterIssue = '';
+    if (coreEmotion) {
+      const recentSummaries = (stateRepo.get(projectId)?.chapterSummaries || [])
+        .filter(s => s.idx < chapterIdx && s.coreEmotion)
+        .sort((a, b) => b.idx - a.idx)
+        .slice(0, 2);
+      if (recentSummaries.length === 2 && recentSummaries.every(s => s.coreEmotion === coreEmotion)) {
+        issues.push(`情绪母题扎堆（advisory,不重写）：本章与前 2 章 coreEmotion 均为「${coreEmotion}」,连续 3 章同情绪母题易致疲劳,建议下章换情绪/钩子方式差异化`);
+        emotionClusterIssue = `\n【情绪母题扎堆】本章与前 2 章均为「${coreEmotion}」,如非有意为之的连续高潮,请在重写时换情绪/钩子方式差异化。`;
+      }
+    }
 
     // H3 修复(第十五轮): 卷主线推进度(第 7 维),注入 volumeCtx.premise
     // 原: prompt 写"本章须推进本卷核心冲突",但质量门不校验 → LLM 可写高分章节但完全脱离卷主线
@@ -707,7 +773,7 @@ export async function checkChapterQuality(opts: {
 【章节定位】${positioning || '未指定'}
 【核心情绪】${coreEmotion || '未指定'}
 【本章大纲】
-${outline}${recycleBlock}${volMainLineBlock}${aiTasteBlock}
+${outline}${recycleBlock}${volMainLineBlock}${aiTasteBlock}${degenerationIssue}${emotionClusterIssue}
 
 【正文片段】（前 1500 字）
 ${content.slice(0, 1500)}
@@ -757,7 +823,8 @@ ${content.slice(0, 1500)}
   // —— 综合判定 ——
   const wordHardFail = actualLen < minHard;
   const topicHardFail = topicScore < 0.6;
-  const needRewrite = wordHardFail || topicHardFail;
+  // 第二十五轮: 模型退化(末尾截断 / tier1 工程词泄漏)也触发重写
+  const needRewrite = wordHardFail || topicHardFail || degenerationHardFail;
   const score = Math.min(actualLen / wordBudget, 1) * 0.5 + topicScore * 0.5;
 
   return {
@@ -770,7 +837,11 @@ ${content.slice(0, 1500)}
 
 // ============ 大纲生成（成书/成短篇核心）============
 // oh-story 三层结构：全书大纲 → 卷纲（长篇 >20 章时）→ 细纲（每章定位 + 字数预算）
-// 章节定位六类分布：高压 18% / 普通 45% / 试错 8% / 关系 8% / 低压 10% / 信息 5%（剩余补普通）
+// 章节定位六类分布（oh-story v0.6.20 升级: 区间占比而非硬配额,以下取区间中点作为基线）
+//   高压 15-20%(取 18) / 普通 40-50%(取 45) / 试错 5-10%(取 8) / 关系 5-10%(取 8)
+//   低压 ≤10%(取 10) / 信息 ≤5%(取 5),剩余补普通推进章
+// 注:这是均衡/长书基线,非硬配额。番茄短平快/男频事业线高压可到 30%+、呼吸章压到 5%;
+//   女频/世情/追妻关系/低压可更多。checkChapterQuality 另做「相邻情绪母题扎堆」运行时校验
 function computePositioningDistribution(chapterCount: number): Record<ChapterPositioning, number> {
   const dist: Record<ChapterPositioning, number> = {
     'high-pressure': Math.round(chapterCount * 0.18),

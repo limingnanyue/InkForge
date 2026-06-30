@@ -833,7 +833,14 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       : [];
     // 短篇质量门：生成 → 质检 → 不达标重写一次（与 book 流水线一致，wordBudget=5000）
     // 第二十三轮修复: prompt 提取为 let,重写时把质检 issues 拼进去(与 book 流水线一致)
-    let segPrompt = `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
+    // 第二十五轮优化(短篇叙事姿态,参考 oh-story v0.6.21 short-craft + inkos short-fiction):
+    //   长篇走"深度限知此刻感知、不剧透预告、不替读者总结升华";短篇相反——
+    //   受虐段直白宣泄、反击段冷静审判,允许主角主观审判句/火葬场前瞻预告/剧透勾子。
+    //   只删中立无情绪的作者讲解,不删带主角偏色的审判/预告。
+    //   短篇段约 800+ 字/节,情绪直给 + 体感焊接,不要写成梗概。
+    let segPrompt = `【短篇叙事姿态】本段属短篇,默认第一人称在场（除非大纲显式第三人称）。允许主角主观审判句、火葬场前瞻预告、剧透勾子;受虐段直白宣泄,反击段冷静审判。只删中立无情绪的作者讲解,保留带主角偏色的审判/预告。情绪直给 + 体感焊接,不要写成梗概。
+
+写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
