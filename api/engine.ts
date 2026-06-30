@@ -646,22 +646,35 @@ export async function checkChapterQuality(opts: {
   coreEmotion?: string;
   content: string;           // 生成的正文
   wordBudget: number;         // 字数预算
+  // 第二十六轮新增: 用户配置的上下限(若有),字数门按此做硬判定而非 wordBudget*1.5
+  chapterWordMin?: number;
+  chapterWordMax?: number;
 }): Promise<ChapterQualityResult> {
-  const { projectId, model, providerId, chapterIdx, chapterTitle, outline, positioning, coreEmotion, content, wordBudget } = opts;
+  const { projectId, model, providerId, chapterIdx, chapterTitle, outline, positioning, coreEmotion, content, wordBudget, chapterWordMin, chapterWordMax } = opts;
   const issues: string[] = [];
   const actualLen = content.length;
 
   // —— Gate 1：字数门 ——
-  // 字数严重不足（< 预算 60%）→ needRewrite
-  // 字数轻微不足（60%-90%）→ 警告但不重写（LLM 可能情节点写完就收束）
-  // 字数超标（> 预算 1.5×）→ 警告但不重写（不致命，且重写不一定能短下来）
-  const minHard = Math.round(wordBudget * 0.6);
+  // 第二十六轮修复(字数超标 BUG): 原字数门只用 wordBudget*1.5 判"超标轻微不重写",
+  //   完全忽略用户配置的 chapterWordMax。用户设上限 3000、预算 2500,生成 4416 字
+  //   → 1.5×2500=3750,4416>3750 但只判"轻微不重写",用户设定形同虚设。
+  //   现: 若用户提供 chapterWordMax,超 chapterWordMax*1.15(15%容差)→ needRewrite 强制重写;
+  //       超 chapterWordMax 但 ≤1.15×→ 警告但保留(容差内)。无 chapterWordMax 回落原逻辑。
+  const minHard = chapterWordMin ? Math.round(chapterWordMin * 0.7) : Math.round(wordBudget * 0.6);
+  const hardMax = chapterWordMax ? Math.round(chapterWordMax * 1.15) : Math.round(wordBudget * 1.5);
   if (actualLen < minHard) {
-    issues.push(`字数严重不足：${actualLen} 字 < 预算 ${wordBudget} 字的 60%（${minHard} 字）`);
-  } else if (actualLen < wordBudget * 0.9) {
+    issues.push(`字数严重不足：${actualLen} 字 < ${chapterWordMin ? `配置下限 ${chapterWordMin} 字的 70%` : `预算 ${wordBudget} 字的 60%`}（${minHard} 字）`);
+  } else if (chapterWordMin && actualLen < chapterWordMin) {
+    issues.push(`字数偏少：${actualLen} 字 < 配置下限 ${chapterWordMin} 字（轻微，不重写）`);
+  } else if (!chapterWordMin && actualLen < wordBudget * 0.9) {
     issues.push(`字数偏少：${actualLen} 字 < 预算 ${wordBudget} 字的 90%（轻微，不重写）`);
-  } else if (actualLen > wordBudget * 1.5) {
-    issues.push(`字数超标：${actualLen} 字 > 预算 ${wordBudget} 字的 1.5 倍（轻微，不重写）`);
+  } else if (actualLen > hardMax) {
+    // 超 hardMax → needRewrite 强制重写(不再是"轻微不重写")
+    issues.push(`字数严重超标：${actualLen} 字 > ${chapterWordMax ? `配置上限 ${chapterWordMax} 字的 1.15 倍` : `预算 ${wordBudget} 字的 1.5 倍`}（${hardMax} 字），需重写压缩`);
+  } else if (chapterWordMax && actualLen > chapterWordMax) {
+    issues.push(`字数轻微超标：${actualLen} 字 > 配置上限 ${chapterWordMax} 字（15% 容差内，保留）`);
+  } else if (!chapterWordMax && actualLen > wordBudget * 1.2) {
+    issues.push(`字数超标：${actualLen} 字 > 预算 ${wordBudget} 字的 1.2 倍（轻微，不重写）`);
   }
 
   // —— Gate 2：跑题门（调 LLM 判断）——
@@ -831,7 +844,8 @@ ${content.slice(0, 1500)}
   }
 
   // —— 综合判定 ——
-  const wordHardFail = actualLen < minHard;
+  // 第二十六轮: wordHardFail 同时覆盖"严重不足"和"严重超标"(超 hardMax)
+  const wordHardFail = actualLen < minHard || actualLen > hardMax;
   const topicHardFail = topicScore < 0.6;
   // 第二十五轮: 模型退化(末尾截断 / tier1 工程词泄漏)也触发重写
   const needRewrite = wordHardFail || topicHardFail || degenerationHardFail;

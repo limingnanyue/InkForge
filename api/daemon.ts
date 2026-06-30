@@ -543,24 +543,30 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。剧情推进到位即可结束，不得为凑字数注水。`;
     // 黄金三章硬约束(参考 oh-story + inkos):第1章 800 字内触发主线冲突、前 300 字最后一句必反转;
     //   第2章"做出来"金手指而非"说出来";第3章锁定可量化短期目标;场景≤2、有名冲突人物≤2
+    // 第二十六轮优化(节奏慢 BUG): 加字数进度里程碑硬约束,防前 1500 字未完成核心情节点
     if (i === 0) {
       prompt = `【黄金第一章 · 追读生死线】
 · 前 300 字(手机第一屏)最后一句必须是戏剧反转/信息炸弹,不得是环境/心理描写
 · 800 字内必须触发主线冲突(主角被欺压/遭遇突变/金手指觉醒),不得慢热铺垫
+· 字数进度里程碑:前 300 字必出反转钩子 → 800 字触发主线冲突 → 1500 字核心冲突已正面交锋 → 结尾留悬念
 · 场景≤2 个,有名冲突人物≤2 个,集中写透不散铺
 · 金手指/核心金手指若本章登场,必须用"做出来"(动作/事件)而非"说出来"(旁白介绍)
+· 禁止用大段环境描写/心理独白/设定解说凑字数,情节推进不得为字数让路
 
 ${prompt}`;
     } else if (i === 1) {
       prompt = `【黄金第二章】
 · 金手指/核心能力本章必须"做出来"(展示一次效果),禁止"说出来"(旁白解释设定)
+· 字数进度里程碑:前 500 字必须进入核心情节(承接上章冲突推进) → 1000 字金手指已展示一次 → 1500 字小爽点兑现 → 结尾留钩
 · 场景≤2 个,有名冲突人物≤2 个
 · 本章必须有 1 个小爽点兑现(让读者尝到甜头),不得纯铺垫
+· 禁止前 1500 字仍在铺垫未触核心情节(用户反馈节奏慢的根因)
 
 ${prompt}`;
     } else if (i === 2) {
       prompt = `【黄金第三章】
 · 本章必须锁定一个可量化的短期目标(如"三天内拿到 X""打败 Y""进入 Z 境界"),给读者明确期待
+· 字数进度里程碑:前 500 字承接上章 → 1000 字锁定短期目标 → 1500 字目标已开始行动 → 结尾留新钩
 · 场景≤2 个,有名冲突人物≤2 个
 
 ${prompt}`;
@@ -578,8 +584,11 @@ ${prompt}`;
     const wordBudget = Math.round(chapterWordBudget * positioningMult);
     // H4 修复：maxTokens 按国产模型 token/字 系数放大（1 字 ≈ 1.5-2 token），
     // 否则国产模型实际可输出字数 ≈ maxTokens / 1.5，章节被截断
-    // H3 修复(第十九轮): 取 wordBudget 与用户配置上限 chapterWordMax 的较大值,保证上限字数能写满
-    const chapterMaxTokens = Math.round(Math.max(wordBudget, chapterWordMax) * tokenCharRatio(providerId));
+    // 第二十六轮修复(字数超标 BUG): 原 Math.max(wordBudget, chapterWordMax) 给了上限字数满额空间,
+    //   模型倾向写满 maxTokens → 实际输出常超 chapterWordMax。现改用 chapterWordMax 为准(用户配置的硬上限),
+    //   不再与 wordBudget 取 max,并按 positioningMult 同步缩放(高压章给到上限,低压章压到上限×0.85)
+    const positioningWordMax = Math.round(chapterWordMax * positioningMult);
+    const chapterMaxTokens = Math.round(positioningWordMax * tokenCharRatio(providerId));
 
     // 章节质量门：生成 → 质检 → 不达标重写一次（避免死循环 + 浪费 token，最多 1 次重写）
     try {
@@ -594,7 +603,7 @@ ${prompt}`;
             projectId, model, providerId,
             chapterIdx: i, chapterTitle: ch.title, outline: ch.outline,
             positioning: ch.positioning, coreEmotion: ch.coreEmotion,
-            content, wordBudget,
+            content, wordBudget, chapterWordMin, chapterWordMax,
           });
           if (quality.ok) {
             if (quality.issues.length > 0) {
@@ -918,7 +927,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
             projectId, model, providerId,
             chapterIdx: i, chapterTitle: seg.title, outline: seg.outline,
             positioning: seg.positioning, coreEmotion: seg.coreEmotion,
-            content, wordBudget: chapterWordBudget,
+            content, wordBudget: chapterWordBudget, chapterWordMin, chapterWordMax,
           });
           if (quality.ok) {
             if (quality.issues.length > 0) {
@@ -1040,7 +1049,7 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
         const quality = await checkChapterQuality({
           projectId: chapter.projectId, model, providerId,
           chapterIdx: chapter.orderIdx, chapterTitle: chapter.title, outline: chapter.outline,
-          content, wordBudget: chapterWordBudget,
+          content, wordBudget: chapterWordBudget, chapterWordMin, chapterWordMax,
         });
         if (quality.ok) {
           if (quality.issues.length > 0) {
