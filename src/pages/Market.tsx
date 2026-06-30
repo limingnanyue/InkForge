@@ -52,6 +52,7 @@ export default function Market() {
     } finally { setLoadingHistory(false); }
   };
 
+  // M2 注:loadHistory 非 useCallback,deps 留空避免每次 render 重新触发
   useEffect(() => { loadHistory(); }, []);
 
   const submit = async () => {
@@ -193,15 +194,17 @@ export default function Market() {
                             {scan.webSearch && <Globe size={10} className="text-amber" />}
                           </p>
                         </div>
+                        {/* 第二十二轮修复(H7): 移动端常显 + 触摸目标加大到 ~28px
+                            原 bug: opacity-0 group-hover + 无 padding,触屏设备永远不可见且 ~12px 难点 */}
                         <span
                           role="button"
                           tabIndex={0}
                           onClick={(e) => deleteScan(scan.id, e)}
                           onKeyDown={(e) => { if (e.key === 'Enter') deleteScan(scan.id, e as any); }}
-                          className="opacity-0 group-hover:opacity-100 text-paper-mute hover:text-cinnabar transition-opacity"
+                          className="inline-flex items-center justify-center rounded p-1.5 opacity-100 text-paper-mute hover:text-cinnabar md:opacity-0 md:group-hover:opacity-100 transition-opacity"
                           aria-label="删除"
                         >
-                          <Trash2 size={12} />
+                          <Trash2 size={14} />
                         </span>
                       </button>
                     </li>

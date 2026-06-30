@@ -291,7 +291,7 @@ function ProviderCard({
               onClick={() => onPickModel(m)}
               title={active ? '当前使用中' : flagship ? '旗舰模型 · 点击切换为当前' : '点击切换为当前'}
               className={cn(
-                'inline-flex items-center gap-1 rounded px-2 py-0.5 font-mono text-[10px] transition-all',
+                'inline-flex items-center gap-1 rounded px-2.5 py-1.5 font-mono text-[11px] transition-all',
                 active
                   ? 'text-ink-900'
                   : flagship
@@ -338,7 +338,7 @@ function ProviderCard({
           <div className="mb-1 flex items-center gap-1.5">
             <span className="text-xs font-medium text-paper-dim">余额</span>
             <button type="button" onClick={fetchBalance} disabled={balanceLoading}
-              className="text-paper-mute hover:text-paper disabled:opacity-50">
+              className="p-1.5 text-paper-mute hover:text-paper disabled:opacity-50">
               <RefreshCw size={12} />
             </button>
           </div>
@@ -442,7 +442,8 @@ function AddProviderModal({ open, onClose, onAdded }: { open: boolean; onClose: 
     <Modal open={open} onClose={onClose} title="添加提供商">
       <div className="space-y-4">
         <Field label="名称"><input className="input" value={name} onChange={e => setName(e.target.value)} placeholder="如：我的 OpenAI" autoFocus /></Field>
-        <div className="grid grid-cols-2 gap-3">
+        {/* 第二十二轮修复(H14): grid-cols-1 sm:grid-cols-2 移动端单列降级 */}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="类型">
             <select className="input" value={kind} onChange={e => onKindChange(e.target.value as ProviderKind)}>
               <optgroup label="海外">

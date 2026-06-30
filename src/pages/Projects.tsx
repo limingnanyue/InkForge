@@ -108,8 +108,10 @@ export default function Projects() {
               style={{ animationDelay: `${i * 50}ms` }}
               onClick={() => enter(p)}
             >
-              {/* 悬停操作按钮 */}
-              <div className="absolute right-2 top-2 z-10 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+              {/* 第二十二轮修复(H6): 移动端无 hover,操作按钮常显;桌面端保持 hover 显示
+                  原 bug: opacity-0 group-hover:opacity-100,触屏设备 :hover 不触发,按钮永远不可见
+                  现: 移动端 opacity-100,桌面端 md:opacity-0 md:group-hover:opacity-100 */}
+              <div className="absolute right-2 top-2 z-10 flex gap-1 opacity-100 transition-opacity md:opacity-0 md:group-hover:opacity-100">
                 <button
                   className="flex h-7 w-7 items-center justify-center rounded-md bg-ink-900/80 text-paper-mute backdrop-blur hover:text-amber"
                   title="重命名"
@@ -136,7 +138,7 @@ export default function Projects() {
                   <span className={`badge ${TYPE_BADGE[p.type]} shrink-0`}>{TYPE_LABEL[p.type]}</span>
                 </div>
                 {p.genre && (
-                  <div className="flex items-center gap-1 text-[11px] text-amber-deep">
+                  <div className="flex items-center gap-1 text-[11px] text-amber">
                     <Tag size={10} /> {p.genre}
                   </div>
                 )}
@@ -226,7 +228,9 @@ function CreateModal({ open, onClose, onCreated }: { open: boolean; onClose: () 
         <Field label="标题">
           <input className="input" placeholder="如：风起观星台" value={title} onChange={e => setTitle(e.target.value)} autoFocus />
         </Field>
-        <div className="grid grid-cols-2 gap-3">
+        {/* 第二十二轮修复(H13): grid-cols-1 sm:grid-cols-2 移动端单列降级
+            原 bug: grid-cols-2 在 320-375px 窄屏两列各 ~150px,select 长选项 + number 挤压不可读 */}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="类型">
             <select className="input" value={type} onChange={e => setType(e.target.value as ProjectType)}>
               <option value="long">长篇</option>

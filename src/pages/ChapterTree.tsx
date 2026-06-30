@@ -91,8 +91,9 @@ function Row({ item, collapsed, setCollapsed, selectedId, onSelect }: {
       <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', STATUS_DOT[n.status])} />
       <span className="flex-1 truncate">{n.title}</span>
       {/* M4 修复(第十三轮): 章节树显示 oh-story 章节定位标签,作者可一眼看到节奏分布 */}
+      {/* 第二十二轮修复(H12): text-[9px] → text-[10px] + py-0.5 改善移动端可读性 */}
       {n.positioning && (
-        <span className={cn('badge px-1 py-0 text-[9px]', POSITIONING_LABEL[n.positioning][0])}>
+        <span className={cn('badge px-1 py-0.5 text-[10px]', POSITIONING_LABEL[n.positioning][0])}>
           {POSITIONING_LABEL[n.positioning][1]}
         </span>
       )}

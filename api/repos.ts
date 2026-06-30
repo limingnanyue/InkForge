@@ -283,6 +283,17 @@ export const taskRepo = {
     db.prepare("UPDATE task SET status='queued', updated_at=? WHERE id=?").run(now(), id);
     return this.get(id);
   },
+  // 第二十二轮修复(后端H3): 启动恢复 - 服务崩溃重启时把所有 running 状态任务批量回退为 queued
+  //   原 bug: startWorker 不主动扫描 running,完全依赖 claimNext 的 5min 心跳超时回收
+  //   → 重启后任务在 DB 中状态仍为 running 但无 worker 处理,前端误显示"运行中"5 分钟假死
+  //   → 多 worker 部署下,新 worker 等 5min 才能接手崩溃 worker 的任务
+  //   现: 启动时立即把所有 running 任务回退为 queued(重置 updated_at),让 worker 立即认领
+  resetStaleOnStartup(): number {
+    const result = db.prepare(
+      "UPDATE task SET status='queued', message='服务重启后重新排队', updated_at=? WHERE status='running'"
+    ).run(now());
+    return result.changes;
+  },
 };
 
 // ============ 任务日志 ============

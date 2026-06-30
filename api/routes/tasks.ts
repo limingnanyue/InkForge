@@ -95,14 +95,43 @@ router.get('/daemon/status', (_req: Request, res: Response) => {
 });
 
 // SSE 实时任务流（订阅事件总线）
+// 第二十二轮修复(后端H2): 改用全局单一 setInterval ping,避免每客户端连接都开一个 timer
+//   原 bug: 每客户端连接都 setInterval(() => res.write(':ping\n\n'), 15000)
+//   → N 客户端 = N 个 timer,Node event loop 上 timer 数线性膨胀,多用户共享时显著开销
+//   现: 用全局 Set<Response> 跟踪所有活跃连接,单一 15s setInterval 遍历推送 ping
+//        连接关闭时从 Set 删除,避免对已关闭 res.write 触发 ENOTFOUND/EPIPE
+const sseClients = new Set<Response>();
+const PING_INTERVAL_MS = 15000;
+let globalPingTimer: NodeJS.Timeout | null = null;
+function ensureGlobalPing(): void {
+  if (globalPingTimer) return;
+  globalPingTimer = setInterval(() => {
+    for (const res of sseClients) {
+      try { res.write(':ping\n\n'); } catch {
+        // 写失败(连接已断) → 从集合移除
+        sseClients.delete(res);
+      }
+    }
+    // 无客户端时清空 timer 避免泄漏
+    if (sseClients.size === 0 && globalPingTimer) {
+      clearInterval(globalPingTimer);
+      globalPingTimer = null;
+    }
+  }, PING_INTERVAL_MS);
+  // unref 让 timer 不阻止 Node 进程退出
+  if (typeof globalPingTimer.unref === 'function') globalPingTimer.unref();
+}
 router.get('/stream/events', (req: Request, res: Response) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.write(':connected\n\n');
+  sseClients.add(res);
+  ensureGlobalPing();
   const off = onStream(event => {
-    res.write(`data:${JSON.stringify(event)}\n\n`);
+    try { res.write(`data:${JSON.stringify(event)}\n\n`); } catch {
+      sseClients.delete(res);
+    }
   });
-  const keep = setInterval(() => res.write(':ping\n\n'), 15000);
-  req.on('close', () => { off(); clearInterval(keep); });
+  req.on('close', () => { off(); sseClients.delete(res); });
 });
 
 export default router;

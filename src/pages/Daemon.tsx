@@ -50,6 +50,11 @@ export default function Daemon() {
   const [status, setStatus] = useState<DaemonStatus | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const { toast, node } = useToast();
+  // 第二十二轮修复(前端H1): 顶层单一 streamEvents 监听所有 task:log,通过 liveLog prop 分发给 TaskRow
+  //   原 bug: TaskRow 每个展开行各自 streamEvents → N 展开行 = N+1 SSE 连接,浏览器限流后 SSE 失效
+  //   现: 顶层一个 EventSource 监听所有 task:log,把事件携带的 taskId+level+message 包装成 TaskLog
+  //        用 useState 触发 TaskRow 重渲染追加日志,避免每行新开连接
+  const [liveLog, setLiveLog] = useState<TaskLog | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -89,6 +94,17 @@ export default function Daemon() {
     refresh();
     const off = api.streamEvents((e: any) => {
       if (['task:progress', 'task:done', 'task:failed'].includes(e.type)) throttledRefresh();
+      // 第二十二轮修复(前端H1): 顶层统一监听 task:log,通过 liveLog prop 分发给 TaskRow
+      //   避免每行 TaskRow 各自 streamEvents 开 N+1 个 SSE 连接
+      if (e.type === 'task:log' && e.taskId) {
+        setLiveLog({
+          id: `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          taskId: e.taskId,
+          level: e.level || 'info',
+          message: e.message || '',
+          createdAt: Date.now(),
+        });
+      }
     });
     const poll = setInterval(refresh, 8000); // 兜底轮询
     return () => {
@@ -133,7 +149,8 @@ export default function Daemon() {
           {tasks.map((t, i) => (
             <TaskRow key={t.id} task={t} index={i} expanded={expanded === t.id}
               onToggle={() => setExpanded(prev => prev === t.id ? null : t.id)}
-              onAction={refresh} toast={toast} />
+              onAction={refresh} toast={toast}
+              liveLog={liveLog && liveLog.taskId === t.id ? liveLog : null} />
           ))}
         </div>
       )}
@@ -155,45 +172,34 @@ function StatCard({ label, value, color, index }: { label: string; value: number
   );
 }
 
-function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
+function TaskRow({ task, expanded, onToggle, onAction, index, toast, liveLog }: {
   task: Task; expanded: boolean; onToggle: () => void; onAction: () => void; index: number;
   toast: (msg: string, type?: 'ok' | 'err') => void;
+  // 第二十二轮修复(前端H1): liveLog 由顶层 Daemon 单一 streamEvents 分发,避免每行新建 EventSource
+  //   原 bug: TaskRow 每个展开行各自 api.streamEvents((e) => {...}) → N 展开行 = N+1 个 SSE 连接
+  //   → 浏览器 EventSource 同源限额(默认 6 条),N>5 时新连接被限流,SSE 直接失效
+  //   → 后端 N+1 个 listener + N+1 个 setInterval ping,显著开销
+  //   现: 顶层 Daemon 单一 streamEvents 监听所有 task:log,通过 liveLog prop 把对应 taskId 的日志推下来
+  liveLog: TaskLog | null;
 }) {
   const [logs, setLogs] = useState<TaskLog[] | null>(null);
   const [logLoading, setLogLoading] = useState(false);
-  // M3 修复(第十五轮): 任务日志实时滚动 - 监听 task:log SSE + 自动滚到底部
-  // 原: 仅 onExpand 时拉一次 logs,展开态新日志不自动追加,需手动折叠+展开
-  //   后端 logTask 已通过 SSE 推 task:log(daemon.ts:48-49),但前端 streamEvents 没监听
-  // 现: 监听 task:log,匹配当前 task.id 时把日志追加到 logs;用户在底部时自动滚到底
   const logEndRef = useRef<HTMLDivElement | null>(null);
   const userScrolledUpRef = useRef(false);
 
   const loadLogs = async () => {
-    // BUG-8 修复：去掉「if (logs) return」永久缓存，每次展开都重新拉取，
-    // 否则任务持续运行产生的新日志在折叠再展开后看到的仍是首次展开时的旧日志
     setLogLoading(true);
     try { setLogs(await api.tasks.logs(task.id)); }
     catch (e) { toast((e as Error).message, 'err'); }
     finally { setLogLoading(false); }
   };
 
-  // M3: 监听 task:log SSE 事件,展开态实时追加日志
+  // 第二十二轮修复(前端H1): 接收 liveLog prop,匹配当前 task.id 时追加到 logs
+  //   不再每行开 EventSource,统一由顶层 Daemon 的单一 streamEvents 分发
   useEffect(() => {
-    if (!expanded) return;
-    const off = api.streamEvents((e: any) => {
-      if (e.type === 'task:log' && e.taskId === task.id) {
-        const newLog: TaskLog = {
-          id: `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          taskId: task.id,
-          level: e.level || 'info',
-          message: e.message || '',
-          createdAt: Date.now(),
-        };
-        setLogs(prev => prev ? [...prev, newLog] : [newLog]);
-      }
-    });
-    return off;
-  }, [expanded, task.id]);
+    if (!expanded || !liveLog) return;
+    setLogs(prev => prev ? [...prev, liveLog] : [liveLog]);
+  }, [liveLog, expanded]);
 
   // M3: 新日志时,若用户在底部则自动滚到底
   useEffect(() => {
@@ -263,7 +269,9 @@ function TaskRow({ task, expanded, onToggle, onAction, index, toast }: {
           {task.message && <p className="mt-1 truncate text-xs text-paper-mute">{task.message}</p>}
           <div className="mt-2 max-w-md"><ProgressBar value={task.progress} /></div>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5">
+        {/* 第二十二轮修复(H4): flex-wrap + justify-end 防移动端溢出
+            原 bug: shrink-0 强制不缩,4 按钮在 375px 屏放不下,内容区被压到极窄 */}
+        <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
           {task.status === 'running' && <button className="btn-ghost py-1.5 text-xs" onClick={() => act('pause')}><Pause size={12} /> 暂停</button>}
           {task.status === 'paused' && <button className="btn-ghost py-1.5 text-xs" onClick={() => act('resume')}><Play size={12} /> 恢复</button>}
           {(task.status === 'paused' || task.status === 'failed') && <button className="btn-ghost py-1.5 text-xs" onClick={onContinue}><FastForward size={12} /> 继续</button>}

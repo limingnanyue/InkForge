@@ -1166,8 +1166,12 @@ export default function ProjectDetail() {
               {/* 伏笔追踪表 */}
               <div className="panel-elevated p-5">
                 <h3 className="mb-3 font-display text-base text-paper">伏笔追踪表</h3>
+                {/* 第二十二轮修复(H5): 外层 overflow-x-auto 包裹 7 列表格
+                    原 bug: w-full table 在 320px 屏每列 ~45px,"预计回收"等表头换行成多行,描述列撑破容器
+                    现: 外层 overflow-x-auto,表格 min-w-[640px] 让移动端仅此表格横向滚动 */}
                 {agentState?.foreshadowing?.length ? (
-                  <table className="w-full text-sm">
+                  <div className="overflow-x-auto">
+                  <table className="w-full min-w-[640px] text-sm">
                     <thead>
                       <tr className="border-b text-left text-[11px] uppercase tracking-wider text-paper-mute" style={{ borderColor: 'var(--ink-500)' }}>
                         <th className="py-2 pr-2">序号</th>
@@ -1200,6 +1204,7 @@ export default function ProjectDetail() {
                       })}
                     </tbody>
                   </table>
+                  </div>
                 ) : <p className="text-xs text-paper-mute">暂无伏笔记录</p>}
               </div>
 
@@ -1335,10 +1340,11 @@ export default function ProjectDetail() {
                                 title={`目标 ${(targetRatio * 100).toFixed(0)}%`}
                               />
                             </div>
-                            <span className={cn('text-[9px] leading-tight text-center', deviate ? 'text-cinnabar font-medium' : 'text-paper-mute')}>
+                            {/* 第二十二轮修复(H11): text-[9px] 提到 text-[10px] sm:text-[11px],paper-mute 提到 paper-dim */}
+                            <span className={cn('text-[10px] sm:text-[11px] leading-tight text-center', deviate ? 'text-cinnabar font-medium' : 'text-paper-dim')}>
                               {POSITIONING_LABEL[k][1]}
                             </span>
-                            <span className={cn('text-[9px] font-mono', deviate ? 'text-cinnabar' : 'text-paper-dim')}>
+                            <span className={cn('text-[10px] sm:text-[11px] font-mono', deviate ? 'text-cinnabar' : 'text-paper-dim')}>
                               {actual}/{total}
                             </span>
                           </div>
@@ -1415,7 +1421,7 @@ export default function ProjectDetail() {
                   onChange={v => setContinueBudget(v as number)}
                 />
                 {!matchedPreset && (
-                  <p className="mt-1.5 text-[10px] text-amber-deep">
+                  <p className="mt-1.5 text-[10px] text-amber">
                     · 自定义值 {continueBudget} 字（不在预设档，将在 {min}-{max} 范围内生效）
                   </p>
                 )}

@@ -31,8 +31,20 @@ export function exportProject(req: { projectId: string; format: ExportFormat; ch
     default: content = toTxt(project, chapters); break;
   }
 
-  fs.writeFileSync(filePath, content, 'utf-8');
-  exportRepo.create({ projectId: req.projectId, format: req.format, chapterRange: req.chapterRange || '', filePath });
+  // 第二十二轮修复(M后端): writeFileSync 失败时清理磁盘残留文件
+  //   原 bug: writeFileSync 不在 try/catch/finally 中,磁盘满/权限/路径过长时:
+  //   - 部分写入场景会残留半截文件
+  //   - exportRepo.create 不会执行(DB 一致),但磁盘累积残留
+  //   现: 失败时主动 unlink 已部分写入的文件,避免 EXPORT_DIR 累积垃圾
+  try {
+    fs.writeFileSync(filePath, content, 'utf-8');
+    exportRepo.create({ projectId: req.projectId, format: req.format, chapterRange: req.chapterRange || '', filePath });
+  } catch (e) {
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch { /* 忽略二次清理失败 */ }
+    throw e;
+  }
   return { filePath, fileName };
 }
 

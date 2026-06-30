@@ -44,6 +44,7 @@ export default function Genres() {
     finally { setLoading(false); }
   };
 
+  // M2 注:load 非 useCallback,deps 留空避免每次 render 重新触发
   useEffect(() => { load(); }, []);
 
   const filtered = useMemo(() => {

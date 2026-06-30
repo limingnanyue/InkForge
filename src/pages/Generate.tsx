@@ -224,7 +224,7 @@ function Step1({ onPick }: { onPick: (k: GenerateKind) => void }) {
             </div>
             <h3 className="font-display text-2xl text-paper group-hover:text-amber">{p.label}</h3>
             <p className="text-xs text-paper-mute">{p.desc}</p>
-            <p className="font-mono text-[11px] text-amber-deep">≤ {(p.cap / 10000).toFixed(0)} 万字</p>
+            <p className="font-mono text-[11px] text-amber">≤ {(p.cap / 10000).toFixed(0)} 万字</p>
           </button>
         );
       })}
@@ -316,7 +316,7 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
           />
           {/* 自定义提示：当前值不在预设档时显式标识 */}
           {!matchedPreset && (
-            <p className="mt-1.5 text-[10px] text-amber-deep">
+            <p className="mt-1.5 text-[10px] text-amber">
               · 自定义值 {form.chapterWordBudget} 字（不在预设档，将在 {preset.budgetMin}-{preset.budgetMax} 范围内生效）
             </p>
           )}

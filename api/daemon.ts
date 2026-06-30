@@ -90,6 +90,17 @@ let running = false;
 export function startWorker(): void {
   if (running) return;
   running = true;
+  // 第二十二轮修复(后端H3): 启动恢复 - 立即把所有 running 状态任务批量回退为 queued
+  //   原 bug: startWorker 不主动扫描 running,完全依赖 claimNext 的 5min 心跳超时回收
+  //   → 服务崩溃重启后任务在 DB 中状态仍为 running 但无 worker 处理,前端误显示"运行中"5 分钟假死
+  //   → 多 worker 部署下,新 worker 等 5min 才能接手崩溃 worker 的任务
+  //   现: 启动时立即把所有 running 任务回退为 queued,让 worker 立即认领,无需等 5min
+  try {
+    const recovered = taskRepo.resetStaleOnStartup();
+    if (recovered > 0) console.log(`[daemon] 启动恢复: ${recovered} 个 running 任务已回退为 queued`);
+  } catch (e) {
+    console.error('[daemon] 启动恢复失败:', (e as Error).message);
+  }
   // D2 修复：loop() 是 async 但 startWorker 同步调用，需 .catch 防 unhandledRejection 杀进程
   loop().catch(err => {
     console.error('[daemon] loop 顶层异常退出，5s 后自愈重启:', err);

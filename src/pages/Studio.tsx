@@ -7,7 +7,10 @@ import { useNavigate } from 'react-router-dom';
 import { Send, Sparkles, Plus, ChevronRight, Brain, Activity, MessageSquare, Cpu, Globe, Server, Tag, TrendingUp } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
-import BlurText from '@/components/BlurText';
+// 第二十二轮修复(react-bits 集成): Welcome 区用 SplitText/Particles/ShinyButton 替代 BlurText
+import SplitText from '@/components/SplitText';
+import Particles from '@/components/Particles';
+import ShinyButton from '@/components/ShinyButton';
 import { Spinner, EmptyState, ProgressRing, fmtWords, useToast, Tabs } from '@/components/ui';
 import type { ChatMessage, AgentState, Task } from '@shared/types';
 import { cn } from '@/lib/utils';
@@ -23,6 +26,8 @@ export default function Studio() {
   const [state, setState] = useState<AgentState | null>(null);
   const [webSearch, setWebSearch] = useState(false);
   const [rightTab, setRightTab] = useState<'state' | 'tasks'>('state');
+  // 第二十二轮修复(H1): 移动端视图切换 chat/state/tasks,默认 chat
+  const [mobileView, setMobileView] = useState<'chat' | 'state' | 'tasks'>('chat');
   const scrollRef = useRef<HTMLDivElement>(null);
   // BUG-7 修复：保存 chat.stream handle，unmount 时 cancel
   // 否则切换项目/路由后旧流仍在后台消费 LLM token（烧钱），setStreamText 等更新到已卸载组件触发 React 警告
@@ -35,7 +40,12 @@ export default function Studio() {
   const navigate = useNavigate();
   const { toast, node } = useToast();
 
-  useEffect(() => { loadProjects(); loadProviders(); }, [loadProjects, loadProviders]);
+  // 第二十二轮修复(M1): loadProjects/loadProviders fire-and-forget 无 catch
+  //   原 bug: 后端 500 或网络抖动时 Promise rejection 静默吞掉,UI 无错误提示
+  //   现: Promise.all 统一 catch + toast 提示
+  useEffect(() => {
+    void Promise.all([loadProjects(), loadProviders()]).catch(e => toast(`初始化失败：${(e as Error).message}`, 'err'));
+  }, [loadProjects, loadProviders, toast]);
 
   // unmount cleanup：cancel 未完成的流 + clear 延时 navigate
   useEffect(() => {
@@ -164,11 +174,13 @@ export default function Studio() {
 
   return (
     <div className="flex h-full flex-col">
-      {/* 顶栏 */}
-      <header className="flex shrink-0 items-center justify-between border-b px-4 py-3" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
-        <div className="flex items-center gap-3">
+      {/* 顶栏 - 第二十二轮修复(H2): flex-wrap + min-w-0 防移动端横向溢出
+          原 bug: header flex 无 flex-wrap,375px 屏左组(~440px)+右组(~200px)≈640px 必溢出
+          现: flex-wrap 让超长内容自动换行,左组 flex-1 min-w-0 让 select 占满剩余空间 */}
+      <header className="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b px-4 py-3" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
+        <div className="flex flex-wrap items-center gap-2 flex-1 min-w-0">
           <select
-            className="input max-w-[220px] py-1.5"
+            className="input min-w-0 flex-1 py-1.5 sm:flex-none sm:max-w-[220px]"
             value={currentProject?.id || ''}
             onChange={e => {
               const p = projects.find(x => x.id === e.target.value);
@@ -231,7 +243,24 @@ export default function Studio() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* 对话区 */}
-        <section className="flex flex-1 flex-col overflow-hidden">
+        <section className={cn('flex flex-1 flex-col overflow-hidden', mobileView !== 'chat' && 'hidden lg:flex')}>
+          {/* 第二十二轮修复(H1): 移动端顶栏 SegmentedControl 切换 对话/状态/任务 三视图
+              原 bug: 右侧面板 hidden lg:flex,移动端完全无法访问智能体状态与任务进度
+              现: 移动端用 SegmentedControl 切换,桌面端仍保持 aside 左右双栏 */}
+          <div className="flex shrink-0 items-center gap-1 border-b px-3 py-2 lg:hidden" style={{ borderColor: 'var(--ink-600)' }}>
+            <button
+              className={cn('flex-1 rounded px-2 py-1 text-xs', mobileView === 'chat' ? 'bg-amber text-ink-900' : 'text-paper-mute')}
+              onClick={() => setMobileView('chat')}
+            >对话</button>
+            <button
+              className={cn('flex-1 rounded px-2 py-1 text-xs', mobileView === 'state' ? 'bg-amber text-ink-900' : 'text-paper-mute')}
+              onClick={() => setMobileView('state')}
+            >状态</button>
+            <button
+              className={cn('flex-1 rounded px-2 py-1 text-xs', mobileView === 'tasks' ? 'bg-amber text-ink-900' : 'text-paper-mute')}
+              onClick={() => setMobileView('tasks')}
+            >任务</button>
+          </div>
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-6 md:px-8">
             <div className="mx-auto max-w-3xl">
               {!currentProject ? (
@@ -279,8 +308,11 @@ export default function Studio() {
           </div>
         </section>
 
-        {/* 右侧面板 */}
-        <aside className="hidden w-80 shrink-0 flex-col border-l lg:flex" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
+        {/* 右侧面板 - 第二十二轮修复(H1): 桌面端常驻 + 移动端按 mobileView 切换显示 */}
+        <aside
+          className={cn('w-full shrink-0 flex-col border-l lg:flex lg:w-80', (mobileView === 'state' || mobileView === 'tasks') ? 'flex' : 'hidden lg:flex')}
+          style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}
+        >
           <Tabs tabs={[{ id: 'state', label: '智能体状态' }, { id: 'tasks', label: '任务进度' }]} active={rightTab} onChange={setRightTab as any} />
           <div className="flex-1 overflow-y-auto p-4">
             {rightTab === 'state' ? (
@@ -298,23 +330,29 @@ export default function Studio() {
 
 function Welcome({ onCreate }: { onCreate: () => void }) {
   return (
-    <div className="flex h-full flex-col items-center justify-center text-center">
-      <BlurText text="墨铸工坊" as="h1" className="font-display text-5xl gradient-text" delay={100} stagger={40} />
-      <p className="mt-4 max-w-md text-sm leading-relaxed text-paper-mute animate-fade-up" style={{ animationDelay: '0.5s' }}>
-        融合「扫榜→拆文→创作→精修」方法论与智能体状态分层，<br />
-        一个对话驱动从灵感到成书的全程。
-      </p>
-      <div className="mt-8 flex gap-3 animate-fade-up" style={{ animationDelay: '0.7s' }}>
-        <a href="/projects" className="btn-ghost"><Plus size={16} /> 新建项目</a>
-        <a href="/generate" className="btn-primary"><Sparkles size={16} /> 一键成书</a>
-      </div>
-      <div className="mt-10 grid grid-cols-3 gap-4 text-xs text-paper-mute animate-fade-in" style={{ animationDelay: '0.9s' }}>
-        {[['500 万字', '长篇成书'], ['二十万字', '短篇速成'], ['守护进程', '断点续传']].map(([a, b]) => (
-          <div key={a} className="rounded-md border p-3" style={{ borderColor: 'var(--ink-500)' }}>
-            <div className="font-display text-lg text-amber">{a}</div>
-            <div className="mt-1">{b}</div>
-          </div>
-        ))}
+    // 第二十二轮修复(react-bits 集成): 加 Particles 背景粒子 + SplitText 标题 + ShinyButton CTA
+    <div className="relative flex h-full flex-col items-center justify-center overflow-hidden text-center">
+      <Particles quantity={50} color="var(--amber)" className="absolute inset-0 opacity-40" />
+      <div className="relative z-10">
+        <SplitText text="墨铸工坊" as="h1" className="font-display text-5xl gradient-text" delay={60} />
+        <p className="mx-auto mt-4 max-w-md text-sm leading-relaxed text-paper-mute animate-fade-up" style={{ animationDelay: '0.5s' }}>
+          融合「扫榜→拆文→创作→精修」方法论与智能体状态分层，<br />
+          一个对话驱动从灵感到成书的全程。
+        </p>
+        <div className="mt-8 flex flex-wrap justify-center gap-3 animate-fade-up" style={{ animationDelay: '0.7s' }}>
+          <a href="/projects" className="btn-ghost"><Plus size={16} /> 新建项目</a>
+          <ShinyButton>
+            <a href="/generate" className="flex items-center gap-1.5"><Sparkles size={16} /> 一键成书</a>
+          </ShinyButton>
+        </div>
+        <div className="mx-auto mt-10 grid max-w-md grid-cols-1 gap-4 text-xs text-paper-mute animate-fade-in sm:grid-cols-3" style={{ animationDelay: '0.9s' }}>
+          {[['500 万字', '长篇成书'], ['二十万字', '短篇速成'], ['守护进程', '断点续传']].map(([a, b]) => (
+            <div key={a} className="rounded-md border p-3" style={{ borderColor: 'var(--ink-500)' }}>
+              <div className="font-display text-lg text-amber">{a}</div>
+              <div className="mt-1">{b}</div>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -416,7 +454,7 @@ function TaskRow({ task, toast }: { task: Task; toast: (msg: string, type?: 'ok'
         <div className="flex items-center gap-1.5">
           {task.status === 'failed' && (
             <button
-              className="rounded px-1.5 py-0.5 text-[10px] text-amber hover:bg-ink-600"
+              className="rounded px-2 py-1 text-[11px] text-amber hover:bg-ink-600"
               onClick={onRetry}
               disabled={retrying}
               title="从 checkpoint 继续"

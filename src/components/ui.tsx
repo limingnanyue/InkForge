@@ -92,9 +92,11 @@ export function Modal({ open, onClose, title, children, className }: { open: boo
     };
   }, [open, onClose]);
   if (!open) return null;
+  // 第二十二轮修复(M): Modal 矮屏可滚 - 原 items-center 在矮屏会裁切按钮点不到
+  //   现: items-start sm:items-center + overflow-y-auto + max-h-[90vh]
   return (
-    <div ref={rootRef} className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(8,6,4,0.7)', backdropFilter: 'blur(4px)' }} role="dialog" aria-modal="true" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className={cn('panel-elevated w-full max-w-lg animate-pop-in p-6 shadow-2xl', className)} onClick={e => e.stopPropagation()}>
+    <div ref={rootRef} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4 sm:items-center" style={{ background: 'rgba(8,6,4,0.7)', backdropFilter: 'blur(4px)' }} role="dialog" aria-modal="true" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className={cn('panel-elevated w-full max-w-lg max-h-[90vh] overflow-y-auto animate-pop-in p-6 shadow-2xl my-auto', className)} onClick={e => e.stopPropagation()}>
         {title && (
           <div className="mb-4 flex items-center justify-between">
             <h2 className="font-display text-lg text-paper">{title}</h2>
@@ -150,11 +152,12 @@ export function Switch({ checked, onChange, disabled, label, desc }: {
 }) {
   return (
     <div className="flex items-start gap-3">
+      {/* 第二十二轮修复(M): Switch h-5 w-9 → h-6 w-11,thumb h-4 w-4 → h-5 w-5,达 24px 触摸目标 */}
       <button type="button" role="switch" aria-checked={checked} disabled={disabled}
-        className={cn('relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-40',
+        className={cn('relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40',
           checked ? 'bg-amber' : 'bg-ink-500')}
         onClick={() => !disabled && onChange(!checked)}>
-        <span className={cn('absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-paper transition-transform', checked && 'translate-x-4')} />
+        <span className={cn('absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-paper transition-transform', checked && 'translate-x-5')} />
       </button>
       {(label || desc) && (
         <div className="flex-1">
@@ -173,7 +176,8 @@ export function Field({ label, hint, required, children }: { label: string; hint
       <span className="mb-1.5 flex items-center gap-1 text-xs font-medium text-paper-mute">
         {label}
         {required && <span className="text-cinnabar">*</span>}
-        {hint && <span className="text-[10px] text-paper-mute/70">· {hint}</span>}
+        {/* 第二十二轮修复(M): text-paper-mute/70 对比度 ~3.3:1 未达 AA,改为 text-paper-mute */}
+        {hint && <span className="text-[10px] text-paper-mute">· {hint}</span>}
       </span>
       {children}
     </label>
