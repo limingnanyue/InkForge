@@ -655,11 +655,17 @@ export async function checkChapterQuality(opts: {
   const actualLen = content.length;
 
   // —— Gate 1：字数门 ——
-  // 第二十六轮修复(字数超标 BUG): 原字数门只用 wordBudget*1.5 判"超标轻微不重写",
-  //   完全忽略用户配置的 chapterWordMax。用户设上限 3000、预算 2500,生成 4416 字
-  //   → 1.5×2500=3750,4416>3750 但只判"轻微不重写",用户设定形同虚设。
-  //   现: 若用户提供 chapterWordMax,超 chapterWordMax*1.15(15%容差)→ needRewrite 强制重写;
-  //       超 chapterWordMax 但 ≤1.15×→ 警告但保留(容差内)。无 chapterWordMax 回落原逻辑。
+  // 第二十六轮修复(字数超标 BUG + 用户自定义上下限):
+  //   用户诉求: ① 上下限由用户在一键生成(Generate 页)时自定义,不再用 wordBudget*1.5 这种与用户配置无关的
+  //      硬性默认值; ② 生成中该检测还是得检测,超限(超用户配置上下限的容差)仍触发重写。
+  //   原 bug: 字数门只用 wordBudget*1.5 判"超标轻微不重写",完全忽略用户配置的 chapterWordMax。
+  //      用户设上限 3000、预算 2500,生成 4416 字 → 1.5×2500=3750,4416>3750 但只判"轻微不重写",
+  //      用户自定义设定形同虚设。
+  //   现: 字数门按用户配置的上下限做硬判定——
+  //      · actualLen < chapterWordMin*0.7(或 wordBudget*0.6)→ 严重不足,needRewrite
+  //      · actualLen > chapterWordMax*1.15(或 wordBudget*1.5)→ 严重超标,needRewrite 重写压缩
+  //      · 介于 chapterWordMax 与 chapterWordMax*1.15 之间 → 容差内,警告保留(不重写)
+  //      无 chapterWordMin/Max 时回落 wordBudget 比例(向后兼容单章/老任务)。
   const minHard = chapterWordMin ? Math.round(chapterWordMin * 0.7) : Math.round(wordBudget * 0.6);
   const hardMax = chapterWordMax ? Math.round(chapterWordMax * 1.15) : Math.round(wordBudget * 1.5);
   if (actualLen < minHard) {
@@ -669,7 +675,6 @@ export async function checkChapterQuality(opts: {
   } else if (!chapterWordMin && actualLen < wordBudget * 0.9) {
     issues.push(`字数偏少：${actualLen} 字 < 预算 ${wordBudget} 字的 90%（轻微，不重写）`);
   } else if (actualLen > hardMax) {
-    // 超 hardMax → needRewrite 强制重写(不再是"轻微不重写")
     issues.push(`字数严重超标：${actualLen} 字 > ${chapterWordMax ? `配置上限 ${chapterWordMax} 字的 1.15 倍` : `预算 ${wordBudget} 字的 1.5 倍`}（${hardMax} 字），需重写压缩`);
   } else if (chapterWordMax && actualLen > chapterWordMax) {
     issues.push(`字数轻微超标：${actualLen} 字 > 配置上限 ${chapterWordMax} 字（15% 容差内，保留）`);
@@ -678,12 +683,42 @@ export async function checkChapterQuality(opts: {
   }
 
   // —— Gate 2：跑题门（调 LLM 判断）——
-  // 仅当字数门通过（>= 60%）才跑跑题门，避免短文本被误判
+  // 仅当字数达到 minHard 才跑 LLM 跑题门，避免短文本被误判
   // LLM 返回 JSON：{ score: 0-1, reason: string }
   // score >= 0.6 视为达标，< 0.6 → needRewrite
   let topicScore = 1.0;  // 默认通过（LLM 调用失败时不阻断生成）
   // 第二十五轮: 模型退化硬失败标志(末尾截断 / tier1 工程词泄漏) → 强制 needRewrite
   let degenerationHardFail = false;
+  // 第二十六轮修复(字数门非强制后的安全网): 规则式退化检测(末尾截断/工程词)移到 minHard 门之外,
+  //   无论字数是否达标都执行。字数门已按用户要求改为非强制(仅警告不重写),若短文本仍跳过退化检测,
+  //   maxTokens 截断/工程词泄漏的废稿会带 issue 但 needRewrite=false 直接通过 → 质量门形同虚设。
+  //   退化检测属"模型故障信号"而非"字数边界",保留强制重写符合用户"上下限非强制但废稿要拦"的意图。
+  let degenerationIssue = '';
+  {
+    const trimmed = content.trimEnd();
+    const tailChar = trimmed.slice(-1);
+    const hasClosingPunct = /[。！？…」』"']/.test(tailChar);
+    if (!hasClosingPunct && actualLen < wordBudget * 0.7) {
+      issues.push(`疑似末尾截断：正文末尾无收束标点且字数 ${actualLen} < 预算 ${wordBudget} 的 70%,可能 maxTokens 用尽被截断`);
+      degenerationIssue = `\n【疑似末尾截断】正文末尾无收束标点且字数不足,请补全章节结尾（自然收束于一个完整场景/钩子,不要为凑字数注水）。`;
+      degenerationHardFail = true;
+    }
+    // 工程词检测:去掉首行(可能是章节标题,标题含"第X章"属正常)
+    const bodyLines = content.split('\n');
+    const bodyForCheck = bodyLines.length > 1 ? bodyLines.slice(1).join('\n') : content;
+    const TIER1_WORDS = ['细纲', '情节点', '卷纲', '功能标签', '任务描述', '字数预算', '章节定位'];
+    const TIER2_WORDS = ['本章', '下一章', '前一章', '上一章'];
+    const tier1Hits = TIER1_WORDS.filter(w => bodyForCheck.includes(w));
+    const tier2Hits = TIER2_WORDS.filter(w => bodyForCheck.includes(w));
+    if (tier1Hits.length > 0) {
+      issues.push(`工程词泄漏正文（tier1 blocking）：${tier1Hits.join('、')} 出现在正文,模型把大纲/指令原文吐入正文`);
+      degenerationIssue += `\n【工程词泄漏】正文出现写作元词: ${tier1Hits.join('、')},请删除这些词及其所在句,用实际叙事替换。`;
+      degenerationHardFail = true;
+    } else if (tier2Hits.length > 0) {
+      // tier2 advisory:角色真在读"第X章"可豁免,仅提示不重写
+      issues.push(`工程词疑似泄漏（tier2 advisory,不重写）：${tier2Hits.join('、')} 出现在正文,请人工确认是否角色在故事内讨论章节`);
+    }
+  }
   if (actualLen >= minHard) {
     // H1 修复(第十四轮): 跑题门增第 5 维「伏笔回收度」,relationship 章未回收扣分
     // H2 修复(第十五轮): 增第 6 维「AI 味检测」,正则预筛禁用词/翻转句/总结升华
@@ -731,37 +766,6 @@ export async function checkChapterQuality(opts: {
     const aiTasteBlock = aiTasteHits > 4
       ? `\n【已检测到 AI 味命中 ${aiTasteHits} 处】命中模式: ${hitPatterns.slice(0, 5).join(' / ') || '无'}\n请重点检查是否仍有上述禁用模式未修改。`
       : '';
-
-    // 第二十五轮新增(模型退化检测,参考 oh-story v0.6.19 check-degeneration):
-    //   弱模型/截断场景模型自己发现不了,只能靠规则兜。两类 blocking 信号触发 needRewrite:
-    //   1. 末尾截断: 正文末尾无收束标点(。！？…」』)且字数 < 预算 70% → 疑似 maxTokens 用尽被截断
-    //   2. 工程词泄漏: 正文(首行标题除外)出现"细纲/情节点/卷纲/功能标签/任务描述"等写作元词
-    //      → 模型把指令/大纲原文吐进正文,破坏沉浸感(oh-story tier1 blocking)
-    //   另 tier2 advisory(本章/下一章/读者/伏笔)只加 issue 不强制重写,因角色真在读"第X章"可豁免
-    let degenerationIssue = '';
-    const trimmed = content.trimEnd();
-    const tailChar = trimmed.slice(-1);
-    const hasClosingPunct = /[。！？…」』"']/.test(tailChar);
-    if (!hasClosingPunct && actualLen < wordBudget * 0.7) {
-      issues.push(`疑似末尾截断：正文末尾无收束标点且字数 ${actualLen} < 预算 ${wordBudget} 的 70%,可能 maxTokens 用尽被截断`);
-      degenerationIssue = `\n【疑似末尾截断】正文末尾无收束标点且字数不足,请补全章节结尾（自然收束于一个完整场景/钩子,不要为凑字数注水）。`;
-      degenerationHardFail = true;
-    }
-    // 工程词检测:去掉首行(可能是章节标题,标题含"第X章"属正常)
-    const bodyLines = content.split('\n');
-    const bodyForCheck = bodyLines.length > 1 ? bodyLines.slice(1).join('\n') : content;
-    const TIER1_WORDS = ['细纲', '情节点', '卷纲', '功能标签', '任务描述', '字数预算', '章节定位'];
-    const TIER2_WORDS = ['本章', '下一章', '前一章', '上一章'];
-    const tier1Hits = TIER1_WORDS.filter(w => bodyForCheck.includes(w));
-    const tier2Hits = TIER2_WORDS.filter(w => bodyForCheck.includes(w));
-    if (tier1Hits.length > 0) {
-      issues.push(`工程词泄漏正文（tier1 blocking）：${tier1Hits.join('、')} 出现在正文,模型把大纲/指令原文吐入正文`);
-      degenerationIssue += `\n【工程词泄漏】正文出现写作元词: ${tier1Hits.join('、')},请删除这些词及其所在句,用实际叙事替换。`;
-      degenerationHardFail = true;
-    } else if (tier2Hits.length > 0) {
-      // tier2 advisory:角色真在读"第X章"可豁免,仅提示不重写
-      issues.push(`工程词疑似泄漏（tier2 advisory,不重写）：${tier2Hits.join('、')} 出现在正文,请人工确认是否角色在故事内讨论章节`);
-    }
 
     // 第二十五轮新增(情绪母题扎堆检测,参考 oh-story v0.6.20「禁情绪母题扎堆」底线):
     //   相邻 3 章同情绪母题高位运行是比"每章像短篇"更隐蔽的疲劳源。
@@ -844,7 +848,8 @@ ${content.slice(0, 1500)}
   }
 
   // —— 综合判定 ——
-  // 第二十六轮: wordHardFail 同时覆盖"严重不足"和"严重超标"(超 hardMax)
+  // 第二十六轮: wordHardFail 按用户配置的上下限容差判定,覆盖"严重不足"和"严重超标"。
+  //   字数门是生成中质量门的核心一环,该检测还是得检测(超容差触发重写压缩/补全)。
   const wordHardFail = actualLen < minHard || actualLen > hardMax;
   const topicHardFail = topicScore < 0.6;
   // 第二十五轮: 模型退化(末尾截断 / tier1 工程词泄漏)也触发重写

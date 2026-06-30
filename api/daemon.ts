@@ -540,7 +540,8 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 
 请写本章正文${positioningHint}。章末钩子：${ch.hook}
 
-要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。剧情推进到位即可结束，不得为凑字数注水。`;
+要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。剧情推进到位即可结束，不得为凑字数注水。
+【字数要求】每章字数区间 ${chapterWordMin}-${chapterWordMax} 字（${cfg.chapterWordMin ? '用户自定义' : '默认预算×0.8/1.2'}），请控制在此区间内；超上限 15% 将触发质检重写压缩，情节/节奏到位优先于死守字数上限但不得注水。`;
     // 黄金三章硬约束(参考 oh-story + inkos):第1章 800 字内触发主线冲突、前 300 字最后一句必反转;
     //   第2章"做出来"金手指而非"说出来";第3章锁定可量化短期目标;场景≤2、有名冲突人物≤2
     // 第二十六轮优化(节奏慢 BUG): 加字数进度里程碑硬约束,防前 1500 字未完成核心情节点
@@ -909,7 +910,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       segPrompt += `\n【结尾段要求】用安静细节收尾,不写大段抒情,留余韵而非总结升华。`;
     }
 
-    segPrompt += `\n\n写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
+    segPrompt += `\n\n写段落《${seg.title}》，约 ${chapterWordBudget} 字（区间 ${chapterWordMin}-${chapterWordMax} 字，超上限 15% 触发重写压缩）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
@@ -1033,7 +1034,7 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   // 与 runBookPipeline / runShortPipeline 行为一致
   // 单章质量门：与流水线一致，不达标重写一次（wordBudget=chapterWordBudget）
   // 第二十三轮修复: prompt 提取为 let,重写时把质检 issues 拼进去
-  let chPrompt = cfg.prompt || `写第《${chapter.title}》正文，约 ${chapterWordMin}-${chapterWordMax} 字。大纲：${chapter.outline}`;
+  let chPrompt = cfg.prompt || `写第《${chapter.title}》正文，约 ${chapterWordMin}-${chapterWordMax} 字（超上限 15% 触发重写压缩）。大纲：${chapter.outline}`;
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       content = '';
