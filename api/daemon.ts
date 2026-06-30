@@ -531,7 +531,10 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     const positioningHint = ch.positioning
       ? `（本章为${ch.positioning}，按【本章定位】的字数预算与情绪强度写作）`
       : '';
-    const prompt = `${anchor}
+    // 第二十三轮修复(剧情混乱 BUG): const → let,重写时把质检 issues 拼进去
+    //   原: 重写 prompt 与首次相同,LLM 不知第一次哪里不达标 → 重写效果与首次基本相同(仅靠 LLM 随机性)
+    //   现: attempt === 0 重写前把 quality.issues 拼到 prompt,LLM 知道要修正什么(字数/人设/伏笔/跑题等)
+    let prompt = `${anchor}
 
 请写本章正文${positioningHint}。章末钩子：${ch.hook}
 
@@ -576,6 +579,13 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
           // 不达标：attempt === 0 时重写一次，attempt === 1 时保留最后结果
           if (attempt === 0) {
             logTask(task.id, 'warn', `第 ${i + 1} 章质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+            // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
+            prompt = `${prompt}
+
+【首次质检不达标,请针对以下问题修正重写】
+${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
+
+请基于上述问题调整写法,确保本次重写能通过质检。`;
             continue;  // 重写一次
           }
           // 重写后仍不达标：保留最后一次结果，标记 warn，不阻断流程
@@ -822,6 +832,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       ? [{ role: 'assistant' as const, content: segPrev.content.slice(0, 4000) }]
       : [];
     // 短篇质量门：生成 → 质检 → 不达标重写一次（与 book 流水线一致，wordBudget=5000）
+    // 第二十三轮修复: prompt 提取为 let,重写时把质检 issues 拼进去(与 book 流水线一致)
+    let segPrompt = `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         content = '';
@@ -830,7 +842,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
         // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.9/1.1
         // wordBudget 保持字数语义不变，用于质量门判定
         const segMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: `写段落《${seg.title}》，约 ${chapterWordBudget} 字（${chapterWordMin}-${chapterWordMax} 字）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
+        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: segPrompt, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
           content += chunk;
         }
         // 质量门检测（字数门 + 跑题门）
@@ -849,6 +861,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
           }
           if (attempt === 0) {
             logTask(task.id, 'warn', `第 ${i + 1} 段质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+            // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
+            segPrompt = `${segPrompt}\n\n【首次质检不达标,请针对以下问题修正重写】\n${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}`;
             continue;
           }
           logTask(task.id, 'warn', `第 ${i + 1} 段重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
@@ -942,6 +956,8 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   // D1 修复：流失败时回滚 status='failed'，避免 chapter 永远卡 'generating' 显示「生成中」
   // 与 runBookPipeline / runShortPipeline 行为一致
   // 单章质量门：与流水线一致，不达标重写一次（wordBudget=chapterWordBudget）
+  // 第二十三轮修复: prompt 提取为 let,重写时把质检 issues 拼进去
+  let chPrompt = cfg.prompt || `写第《${chapter.title}》正文，约 ${chapterWordMin}-${chapterWordMax} 字。大纲：${chapter.outline}`;
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       content = '';
@@ -950,7 +966,7 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
       // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.8/1.2
       // wordBudget 保持字数语义不变，用于质量门判定
       const chMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: cfg.prompt || `写第《${chapter.title}》正文，约 ${chapterWordMin}-${chapterWordMax} 字。大纲：${chapter.outline}`, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch }))) {
+      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: chPrompt, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch }))) {
         content += chunk;
       }
       try {
@@ -967,6 +983,8 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
         }
         if (attempt === 0) {
           logTask(task.id, 'warn', `《${chapter.title}》质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+          // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
+          chPrompt = `${chPrompt}\n\n【首次质检不达标,请针对以下问题修正重写】\n${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}`;
           continue;
         }
         logTask(task.id, 'warn', `《${chapter.title}》重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);

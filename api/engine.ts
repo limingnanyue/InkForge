@@ -1406,6 +1406,10 @@ ${pendingList || '（无）'}
 
     // 3. 角色状态：按角色名 merge（不整体覆盖，避免 LLM 漏角色导致状态丢失）
     // LLM 给出的是「本章出现角色」的当前快照，未出现的角色保留旧状态
+    // 第二十三轮修复(记忆错乱 BUG): 原 characterState[idx] = nu 原地覆盖,角色位置不变
+    //   → 主角第1章建立后在数组头部,中间出场 15+ 配角后,buildDynamicContext slice(-15) 永远取不到主角
+    //   → 长篇后期主角人设从上下文消失,LLM 可能写出与主角人设矛盾的行为(位置/关系/情绪漂移)
+    //   现: 本章出现角色移到数组末尾(标记最近活跃),slice(-15) 优先保留最近出场角色含主角
     let characterState = [...curCharacters];
     if (Array.isArray(parsed.characterState)) {
       const updated = parsed.characterState.filter((c: any) => c?.name).map((c: any) => ({
@@ -1416,9 +1420,17 @@ ${pendingList || '（无）'}
       }));
       for (const nu of updated) {
         const idx = characterState.findIndex(c => c.name === nu.name);
-        if (idx >= 0) characterState[idx] = nu;
-        else characterState.push(nu);
+        if (idx >= 0) {
+          characterState.splice(idx, 1); // 移除旧位置
+          characterState.push(nu);        // 追加到末尾(最近活跃)
+        } else {
+          characterState.push(nu);
+        }
       }
+      // 防御:characterState 超过 50 个时裁剪保留末尾 50 个(主角必在最近活跃区)
+      // 原: 永不裁剪,200 章累积 80+ 角色 → stateRepo JSON 序列化变慢,但注入已裁剪
+      // 现: 50 上限足够覆盖长篇所有活跃角色,超出的多为一次性龙套
+      if (characterState.length > 50) characterState = characterState.slice(-50);
     }
 
     // 4. 卷级大纲 keyForeshadows 填充（oh-story：把本章新埋/回收的伏笔 desc 归入对应卷的伏笔集群）
