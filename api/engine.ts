@@ -384,6 +384,12 @@ ${prevTail}
 
 约束：严格承接上一章结尾的情境/对话/动作，不得让角色做出与人设矛盾的行为；按【本章定位】的情绪强度与字数预算写作；${volumeCtx ? '推进【本卷主线】的核心冲突,不得跑题；' : ''}伏笔已在上方列出，本章可考虑回收其中之一（过期伏笔不可再埋）。
 
+【本章大纲忠实度硬约束】（最高优先级，高于其他所有约束）
+· 严格按上方【本章大纲】推进本章剧情，大纲列出的情节点必须全部落地，不得跳过、不得替换、不得偏离
+· 不得擅自新增大纲未提及的重大事件/人物/能力/场景；可在细节处丰富，但主线节点必须按大纲写
+· 当本章大纲与其他约束（承接/伏笔/节奏）出现张力时，优先遵循本章大纲，其他约束作为辅助而非替代
+· 禁止用"承接需要/伏笔回收/节奏调整"为由绕过大纲已定的剧情走向
+
 【伏笔硬对应规则】（参考 inkos hook 账本 + oh-story 伏笔状态机）
 · 若本章回收伏笔,必须在正文写出≥60 字的可定位兑现段(具体动作/物件/对话),内心提及("他想起借条还在抽屉")不算兑现,必须写出真实场景
 · "揭1埋1"硬底线:每回收 1 个伏笔,本章应新埋或推进至少 1 个伏笔,避免埋设耗尽后剧情悬空
@@ -1039,6 +1045,7 @@ ${distLine}
 
 要求：
 - 输出 JSON 数组，每个元素：{"title":"章节标题","outline":"本章大纲(50-100字)","hook":"章末钩子","positioning":"high-pressure|normal-progress|trial-error|relationship|low-pressure|info-organize","coreEmotion":"本章核心情绪(爽感释放/震撼/痛快/怅然/燃/治愈/期待/心动等)"}
+- 【内容忠实度约束】（最高优先级）：章细必须严格依据【核心创意】【主要角色】【世界观设定】展开，不得擅自新增角色/能力体系/世界观规则/主线支线；若方法论约束（黄金三章/矛盾网/positioning 配额）与用户创意冲突，以用户创意为准，方法论仅作参考
 - 节奏紧凑，每章都有推进与爽点
 - 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
 - positioning 分布严格符合上方约束
@@ -1140,6 +1147,7 @@ ${distLine}
 
 要求：
 - 输出 JSON 数组，每个元素：{"title":"章节标题","outline":"本章大纲(50-100字)","hook":"章末钩子","positioning":"high-pressure|normal-progress|trial-error|relationship|low-pressure|info-organize","coreEmotion":"本章核心情绪(爽感释放/震撼/痛快/怅然/燃/治愈/期待/心动等)"}
+- 【内容忠实度约束】（最高优先级）：章细必须严格依据【核心创意】【主要角色】【世界观设定】展开，不得擅自新增角色/能力体系/世界观规则/主线支线；若方法论约束（黄金三章/矛盾网/positioning 配额）与用户创意冲突，以用户创意为准，方法论仅作参考
 - 节奏紧凑，每章都有推进与爽点
 - 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
 - positioning 分布严格符合上方约束
@@ -1163,6 +1171,15 @@ ${distLine}
       searchQuery: webSearch ? `${config.genre} ${idea.slice(0, 30)} 大纲 套路` : undefined,
       wallTimeoutMs: outlineWallTimeout,
     });
+    // 第二十六轮修复(滑动窗口 JSON.parse 失败): 原返回 match[0](LLM 原始子串)，
+    //   state.outline 可能含尾随逗号/代码块标记/额外字段 → buildContextPrompt 的
+    //   JSON.parse(state.outline)(L84)失败降级到前 4000 字截断 → 章节生成时
+    //   滑动窗口失效,LLM 看不到±5邻章大纲,跨章一致性差,间接放大章细偏离。
+    //   现与分卷分支一致,走 parseOutline 标准化后 JSON.stringify,确保 state.outline
+    //   始终是严格合法 JSON,滑动窗口稳定生效。parseOutline 已增强兼容(嵌套/字段变体)。
+    const parsed = parseOutline(acc);
+    if (parsed.length > 0) return JSON.stringify(parsed);
+    // 兜底: parseOutline 全失败时仍返回原始子串(至少 daemon.ts 会再 parse 一次+诊断)
     const match = acc.match(/\[[\s\S]*\]/);
     return match ? match[0] : acc;
   }

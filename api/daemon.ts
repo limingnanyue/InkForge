@@ -550,7 +550,7 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
 
 请写本章正文${positioningHint}。章末钩子：${ch.hook}
 
-要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。剧情推进到位即可结束，不得为凑字数注水。
+要求：直接输出正文，不要标题，不要解释。严格承接上一章结尾，保持人设一致。严格遵循本章大纲（章细忠实度最高优先级，不得跳过/替换/偏离大纲已定的情节点，可丰富细节但主线节点必须按大纲写）。剧情推进到位即可结束，不得为凑字数注水。
 【字数要求】每章字数区间 ${chapterWordMin}-${chapterWordMax} 字（${cfg.chapterWordMin ? '用户自定义' : '默认预算×0.8/1.2'}），请控制在此区间内；超上限 15% 将触发质检重写压缩，情节/节奏到位优先于死守字数上限但不得注水。`;
     // 黄金三章硬约束(参考 oh-story + inkos):第1章 800 字内触发主线冲突、前 300 字最后一句必反转;
     //   第2章"做出来"金手指而非"说出来";第3章锁定可量化短期目标;场景≤2、有名冲突人物≤2
@@ -626,12 +626,13 @@ ${prompt}`;
           if (attempt === 0) {
             logTask(task.id, 'warn', `第 ${i + 1} 章质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
             // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
+            // 第二十六轮修复(章细偏离): 重写 prompt 仍须强调遵循本章大纲,避免重写也偏离
             prompt = `${prompt}
 
 【首次质检不达标,请针对以下问题修正重写】
 ${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
 
-请基于上述问题调整写法,确保本次重写能通过质检。`;
+请基于上述问题调整写法,确保本次重写能通过质检。重写时仍须严格遵循本章大纲(章细忠实度最高优先级),不得因修正问题而偏离大纲已定的情节点。`;
             continue;  // 重写一次
           }
           // 重写后仍不达标：保留最后一次结果，标记 warn，不阻断流程
@@ -1053,7 +1054,7 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
       // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.8/1.2
       // wordBudget 保持字数语义不变，用于质量门判定
       const chMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
-      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: chPrompt, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch }))) {
+      for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'write', model, providerId, userPrompt: chPrompt, chapterContext: chapter.outline, maxTokens: chMaxTokens, webSearch, currentChapterIdx: chapter.orderIdx }))) {
         content += chunk;
       }
       try {
