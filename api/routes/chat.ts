@@ -26,7 +26,13 @@ router.post('/', async (req: Request, res: Response) => {
   const useModel = model || provider?.models[0] || 'gpt-4o-mini';
 
   // 保存用户消息
-  messageRepo.create({ projectId, role: 'user', content: message });
+  // 第二十六轮 P1 修复(BUG-P1-5): messageRepo.create 在 SSE writeHead 之前执行,DB 异常会抛
+  //   → 客户端 EventSource 未建立,前端会一直等待超时。现包 try/catch 返回 JSON 错误
+  try {
+    messageRepo.create({ projectId, role: 'user', content: message });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: { code: 'DB_ERROR', message: `保存消息失败：${(e as Error).message}` } });
+  }
 
   // 意图识别
   const intent = detectIntent(message);
@@ -63,11 +69,15 @@ router.post('/', async (req: Request, res: Response) => {
     }
   }
 
-  const navTarget = (isDaemonCreate || isDaemonView) ? '/daemon' : undefined;
+  // 第二十六轮 P1 修复(BUG-P1-4): daemon_create 失败(daemonError 非空)时不应 emit navigate,
+  //   否则前端 toast"已派发续写任务"并跳 /daemon,实际任务未创建,用户被误导。
+  //   现: 仅当 daemonTaskId 成功创建 或 daemon_view 意图 时才 navigate;daemon_create 失败不跳转
+  const navTarget = ((isDaemonCreate && daemonTaskId) || isDaemonView) ? '/daemon' : undefined;
   res.write(`event:meta\ndata:${JSON.stringify({
     messageId: assistantId, intent, webSearch: finalWebSearch,
     action: navTarget ? 'navigate' : undefined, target: navTarget,
     taskId: daemonTaskId,
+    daemonError,  // 第二十六轮: 暴露 daemonError 给前端,失败时不 toast 成功提示
   })}\n\n`);
 
   try {

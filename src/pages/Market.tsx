@@ -178,11 +178,16 @@ export default function Market() {
                 <ul className="space-y-1.5 max-h-80 overflow-y-auto">
                   {history.map(scan => (
                     <li key={scan.id}>
-                      <button
-                        type="button"
+                      {/* 第二十六轮 P0 修复(BUG-P0-2): 原外层 <button> 内嵌 <span role=button> 删除,
+                          HTML 规范禁止 button 嵌套 interactive,Chrome 会重构 DOM 导致 stopPropagation 失效,
+                          点击删除会同时触发外层 viewScan。改外层为 div role=button 保留键盘可达 */}
+                      <div
+                        role="button"
+                        tabIndex={0}
                         onClick={() => viewScan(scan)}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); viewScan(scan); } }}
                         className={cn(
-                          'group flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left transition-colors',
+                          'group flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left transition-colors cursor-pointer',
                           activeScanId === scan.id ? 'bg-amber/10' : 'hover:bg-ink-700/50'
                         )}
                         style={activeScanId === scan.id ? { background: 'rgba(212,165,52,0.1)' } : undefined}
@@ -196,17 +201,15 @@ export default function Market() {
                         </div>
                         {/* 第二十二轮修复(H7): 移动端常显 + 触摸目标加大到 ~28px
                             原 bug: opacity-0 group-hover + 无 padding,触屏设备永远不可见且 ~12px 难点 */}
-                        <span
-                          role="button"
-                          tabIndex={0}
+                        <button
+                          type="button"
                           onClick={(e) => deleteScan(scan.id, e)}
-                          onKeyDown={(e) => { if (e.key === 'Enter') deleteScan(scan.id, e as any); }}
                           className="inline-flex items-center justify-center rounded p-1.5 opacity-100 text-paper-mute hover:text-cinnabar md:opacity-0 md:group-hover:opacity-100 transition-opacity"
-                          aria-label="删除"
+                          aria-label="删除此扫榜记录"
                         >
                           <Trash2 size={14} />
-                        </span>
-                      </button>
+                        </button>
+                      </div>
                     </li>
                   ))}
                 </ul>

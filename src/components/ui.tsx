@@ -96,14 +96,18 @@ export function Modal({ open, onClose, title, children, className }: { open: boo
   //   现: items-start sm:items-center + overflow-y-auto + max-h-[90vh]
   return (
     <div ref={rootRef} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto p-4 sm:items-center" style={{ background: 'rgba(8,6,4,0.7)', backdropFilter: 'blur(4px)' }} role="dialog" aria-modal="true" onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className={cn('panel-elevated w-full max-w-lg max-h-[90vh] overflow-y-auto animate-pop-in p-6 shadow-2xl my-auto', className)} onClick={e => e.stopPropagation()}>
+      <div className={cn('panel-elevated w-full max-w-lg max-h-[90vh] overflow-y-auto animate-pop-in shadow-2xl my-auto pt-6', className)} onClick={e => e.stopPropagation()}>
         {title && (
-          <div className="mb-4 flex items-center justify-between">
+          // 第二十六轮 P1 修复: Modal 标题改 sticky,长表单滚动时标题与关闭按钮常驻顶部
+          //   原: 标题随内容滚走,用户滚到底想关闭得回滚
+          <div className="sticky top-0 z-10 flex items-center justify-between px-6 py-4 -mx-0 mb-4 border-b" style={{ background: 'var(--ink-800)', borderColor: 'var(--ink-500)' }}>
             <h2 className="font-display text-lg text-paper">{title}</h2>
             <button onClick={onClose} aria-label="关闭" className="text-paper-mute hover:text-paper transition-colors"><X size={18} /></button>
           </div>
         )}
-        {children}
+        <div className="px-6 pb-6">
+          {children}
+        </div>
       </div>
     </div>
   );

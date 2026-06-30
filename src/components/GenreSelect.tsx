@@ -13,7 +13,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/api/client';
 import { Spinner } from '@/components/ui';
 import { cn } from '@/lib/utils';
-import { groupGenres, type Genre, type GenreCategory } from '@shared/genres';
+import { groupGenres, hydrateApplicableTypes, filterByProjectType, type Genre, type GenreCategory, type ProjectType } from '@shared/genres';
 
 // H-03 修复(第二十轮): 题材库加载失败时显示"重试"按钮，而非静默吞错误后给空下拉
 // 静默会让用户误以为"项目无题材可填"，实际上只是接口挂了
@@ -37,10 +37,13 @@ export interface GenreSelectProps {
   /** 占位符 */
   placeholder?: string;
   className?: string;
+  /** 第二十六轮新增: 项目体裁过滤。传 'short' 时只显示全适用 + 短篇专属题材;
+   *  传 'long' 时隐藏短篇专属题材;不传则全量显示(向后兼容旧调用方) */
+  projectType?: ProjectType;
 }
 
 export default function GenreSelect({
-  value, label, onChange, allowCustom = true, placeholder = '— 选择题材 —', className,
+  value, label, onChange, allowCustom = true, placeholder = '— 选择题材 —', className, projectType,
 }: GenreSelectProps) {
   const [genres, setGenres] = useState<Genre[]>([]);
   const [loading, setLoading] = useState(true);
@@ -54,7 +57,8 @@ export default function GenreSelect({
     setLoadError(null);
     try {
       const list = await api.genres.list();
-      setGenres(list);
+      // 第二十六轮: DB 不存 applicableTypes,从 BUILTIN_GENRES 常量按 id 回填该字段
+      setGenres(hydrateApplicableTypes(list));
     } catch (e) {
       // H-03 修复(第二十轮): 原 catch 静默吞掉错误，组件复用于 Generate/ProjectDetail/Market 三处
       //   接口挂掉时用户看到空下拉且无提示，会以为"无题材可填"
@@ -66,25 +70,24 @@ export default function GenreSelect({
   useEffect(() => { loadGenres(); }, []);
 
   // 当前 label/value 跟题材库做匹配，决定是下拉态还是自定义输入态
+  // 注: 匹配用全量 genres(含短篇专属),即使 projectType=long 也允许已选短篇题材显示(不丢历史选择)
   useEffect(() => {
     if (label && !genres.some(g => g.label === label) && !value) {
-      // label 在库里不存在且无 id：自定义输入态
       setCustomMode(true);
       setCustomInput(label);
     } else if (value && !genres.some(g => g.id === value)) {
-      // value 不在库里（被删了？）：回退自定义模式
       setCustomMode(true);
       setCustomInput(label || '');
     } else if (label && genres.some(g => g.label === label) && (!value || customMode)) {
-      // label 命中库但 genreId 为空（旧项目升级场景）：自动回填 id 并切回下拉态
-      // value 命中但 customMode=true 时也一并重置回下拉态
       const matched = genres.find(g => g.label === label);
       if (matched && matched.id !== value) onChange(matched.id, matched.label);
       setCustomMode(false);
     }
   }, [label, value, genres, customMode, onChange]);
 
-  const groups = useMemo(() => groupGenres(genres), [genres]);
+  // 第二十六轮: 按 projectType 过滤下拉显示的题材(已选中的题材即使不在过滤范围也保留 selectedGenre 显示)
+  const visibleGenres = useMemo(() => filterByProjectType(genres, projectType), [genres, projectType]);
+  const groups = useMemo(() => groupGenres(visibleGenres), [visibleGenres]);
   const selectedGenre = useMemo(() => genres.find(g => g.id === value), [genres, value]);
 
   const handleSelect = (id: string) => {

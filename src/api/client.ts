@@ -67,7 +67,7 @@ export const api = {
   chat: {
     // SSE 流式对话：正确解析 event:/data: 事件块
     stream: (params: { projectId: string; message: string; providerId?: string; model?: string; chapterId?: string; webSearch?: boolean },
-      onChunk: (delta: string) => void, onMeta?: (m: { messageId: string; intent: string; webSearch?: boolean; action?: 'navigate'; target?: string; taskId?: string }) => void): { cancel: () => void; done: Promise<string> } => {
+      onChunk: (delta: string) => void, onMeta?: (m: { messageId: string; intent: string; webSearch?: boolean; action?: 'navigate'; target?: string; taskId?: string; daemonError?: string }) => void): { cancel: () => void; done: Promise<string> } => {
       const controller = new AbortController();
       let full = '';
       const done = (async () => {

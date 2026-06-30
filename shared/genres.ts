@@ -6,6 +6,9 @@
  */
 export type GenreCategory = 'male' | 'female' | 'common';
 
+// 项目类型(与 shared/types.ts ProjectType 保持一致,这里独立声明避免循环依赖)
+export type ProjectType = 'long' | 'short' | 'script';
+
 export interface Genre {
   id: string;            // 持久化 ID（slug 风格，如 'urban-fantasy'）
   label: string;         // 显示名（如"都市玄幻"）
@@ -13,6 +16,10 @@ export interface Genre {
   description?: string;  // 题材说明 / 写作要点
   emotionMap?: string;   // 核心情绪映射（供 LLM prompt 参考，如"爽感/逆袭/装逼打脸"）
   isBuiltin?: boolean;   // true=内置不可删除，false=用户自定义
+  // 第二十六轮新增: 适用体裁过滤。空数组或缺省=全适用(向后兼容旧 104 项内置题材)
+  // 仅"短篇专属"题材包(追妻火葬场/复仇打脸/总裁豪门/宅斗宫斗-短篇版)标注 ['short']
+  // 注意: 此字段不进 DB schema,前端从 BUILTIN_GENRES 常量映射补全,DB 只存基础字段
+  applicableTypes?: ProjectType[];
 }
 
 export interface GenreGroup {
@@ -165,6 +172,34 @@ export const BUILTIN_GENRES: Genre[] = [
   { id: 'urban-emotion', label: '都市情感', category: 'common', description: '都市情感生活', emotionMap: '情感/生活', isBuiltin: true },
   { id: 'family-saga', label: '家族史诗', category: 'common', description: '家族变迁', emotionMap: '家族/史诗', isBuiltin: true },
   { id: 'life-relief', label: '人生治愈', category: 'common', description: '治愈系生活', emotionMap: '治愈/温暖', isBuiltin: true },
+
+  // —— 短篇专属题材包（第二十六轮新增,参考 oh-story v0.6.21 + inkos short-fiction）
+  // 仅短篇项目适用,长篇不显示(避免与长篇同名题材混淆)。applicableTypes 字段不进 DB,
+  // 前端 GenreSelect 从 BUILTIN_GENRES 常量补全该字段后按 projectType 过滤
+  { id: 'short-wife-chasing', label: '追妻火葬场', category: 'female',
+    description: '短篇专属。前期虐女→女转身→男追悔→反转结局。一个核心反转撑全篇,前3句零环境。',
+    emotionMap: '虐恋/追妻/火葬场/后悔/反转', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-revenge-slap', label: '复仇打脸', category: 'female',
+    description: '短篇专属。受辱→布局→连环打脸→终极反转。每个打脸节点情绪递增,反转段陡升。',
+    emotionMap: '复仇/打脸/爽感/反转/递增', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-ceo-wealth', label: '总裁豪门(短篇)', category: 'female',
+    description: '短篇专属。误会→身份揭穿→打脸反杀→HE。与长篇豪门总裁区分,短篇重节奏不重铺世界观。',
+    emotionMap: '霸总/豪门/甜宠/打脸/反杀', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-palace-infight', label: '宅斗宫斗(短篇)', category: 'female',
+    description: '短篇专属。开局低位→连环智斗→终极翻盘。一个反派集中写透,不铺宫斗世界观。',
+    emotionMap: '宅斗/宫斗/智斗/逆袭/翻盘', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-sweet-pet', label: '甜宠日常(短篇)', category: 'female',
+    description: '短篇专属。相遇→误会→心动→告白。低冲突高甜度,每段一个糖点,反转=感情确认。',
+    emotionMap: '甜宠/心动/糖点/治愈', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-suspense-twist', label: '悬疑反转(短篇)', category: 'common',
+    description: '短篇专属。设局→线索→误导→反转揭示。一个核心诡计,反转段须>前所有段情绪峰值。',
+    emotionMap: '悬疑/反转/误导/揭示', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-warm-healing', label: '治愈暖文(短篇)', category: 'common',
+    description: '短篇专属。困境→相遇→陪伴→治愈。低冲突,情绪缓慢上升,结尾安静细节收尾。',
+    emotionMap: '治愈/温暖/陪伴/成长', isBuiltin: true, applicableTypes: ['short'] },
+  { id: 'short-thriller-fast', label: '快节奏惊悚(短篇)', category: 'common',
+    description: '短篇专属。开局即危机→连环升级→生死反转。场景≤2,时间压缩(24h/72h)。',
+    emotionMap: '惊悚/紧迫/危机/反转', isBuiltin: true, applicableTypes: ['short'] },
 ];
 
 // 把扁平题材列表按 category 分组（用于前端 select optgroup）
@@ -189,4 +224,18 @@ export function findGenreById(genres: Genre[], id: string): Genre | undefined {
 export function findGenreByLabel(genres: Genre[], label: string): Genre | undefined {
   const lower = label.trim().toLowerCase();
   return genres.find(g => g.label.toLowerCase() === lower);
+}
+
+// 第二十六轮新增: 把 BUILTIN_GENRES 的 applicableTypes 字段补全到 DB 返回的题材列表
+// DB 不存 applicableTypes,但前端需用它按 projectType 过滤。从 BUILTIN_GENRES 按 id 映射回填
+export function hydrateApplicableTypes(genres: Genre[]): Genre[] {
+  const map = new Map(BUILTIN_GENRES.filter(g => g.applicableTypes?.length).map(g => [g.id, g.applicableTypes!]));
+  return genres.map(g => map.has(g.id) ? { ...g, applicableTypes: map.get(g.id) } : g);
+}
+
+// 第二十六轮新增: 按 projectType 过滤题材
+// applicableTypes 为空/缺省 = 全适用(向后兼容旧 104 项);非空则需包含该 type
+export function filterByProjectType(genres: Genre[], type?: ProjectType): Genre[] {
+  if (!type) return genres;
+  return genres.filter(g => !g.applicableTypes?.length || g.applicableTypes.includes(type));
 }

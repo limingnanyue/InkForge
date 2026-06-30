@@ -104,9 +104,12 @@ export default function Projects() {
           {projects.map((p, i) => (
             <div
               key={p.id}
-              className="panel-elevated group relative flex cursor-pointer overflow-hidden text-left transition-all duration-200 hover:border-amber-deep animate-fade-up"
+              role="button"
+              tabIndex={0}
+              className="panel-elevated group relative flex cursor-pointer overflow-hidden text-left transition-all duration-200 hover:border-amber-deep focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber focus-visible:ring-offset-2 focus-visible:ring-offset-ink-900 animate-fade-up"
               style={{ animationDelay: `${i * 50}ms` }}
               onClick={() => enter(p)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); enter(p); } }}
             >
               {/* 第二十二轮修复(H6): 移动端无 hover,操作按钮常显;桌面端保持 hover 显示
                   原 bug: opacity-0 group-hover:opacity-100,触屏设备 :hover 不触发,按钮永远不可见

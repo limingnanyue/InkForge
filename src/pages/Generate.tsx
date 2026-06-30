@@ -279,6 +279,7 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
           <GenreSelect
             value={form.genreId}
             label={form.genre}
+            projectType={kind === 'book' ? 'long' : kind === 'short' ? 'short' : 'script'}
             onChange={(genreId, label) => {
               set('genreId', genreId);
               set('genre', label);

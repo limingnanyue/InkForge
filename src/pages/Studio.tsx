@@ -91,17 +91,32 @@ export default function Studio() {
   }, [currentProject]);
 
   // SSE 订阅任务进度
+  // 第二十六轮 P1 修复(BUG-P1-6/P2-4): 原 SSE 订阅 deps 含 currentProject,切项目时重建订阅
+  //   → 重连窗口内 task 事件丢失;且 onChunk 不校验 reqSeq,切项目后旧流仍在前端累加显示。
+  //   现: 用 ref 持有最新 currentProject 避免重建订阅;onChunk 加 reqSeq 校验防串号。
+  const currentProjectRef = useRef(currentProject);
+  useEffect(() => { currentProjectRef.current = currentProject; }, [currentProject]);
   useEffect(() => {
     const off = api.streamEvents((e) => {
       if (e.type === 'task:progress' || e.type === 'task:done' || e.type === 'task:failed') {
-        // 刷新任务列表
-        if (currentProject) loadTasks(currentProject.id);
+        // 刷新任务列表(从 ref 读最新项目,避免闭包陈旧)
+        const pid = currentProjectRef.current?.id;
+        if (pid) loadTasks(pid);
       }
     });
     return off;
-  }, [currentProject, loadTasks]);
+  }, [loadTasks]);
 
+  // 第二十六轮 P1 修复(BUG-P1-7): 流式输出无条件强制滚动到底,打断用户回看历史
+  //   现: 记录用户是否向上滚动,若在上滚则不强制拉回底部
+  const userScrolledUpRef = useRef(false);
+  const onScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    userScrolledUpRef.current = el.scrollHeight - el.scrollTop - el.clientHeight > 80;
+  }, []);
   useEffect(() => {
+    if (userScrolledUpRef.current) return;  // 用户在上滚,不打断
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, streamText]);
 
@@ -119,11 +134,17 @@ export default function Studio() {
     const handle = api.chat.stream(
       { projectId: currentProject.id, message: text, model: currentModel, providerId: currentProviderId || undefined, webSearch },
       (delta) => {
-        // 防御：组件已卸载则不更新状态（避免 React 警告）
-        if (mountedRef.current) setStreamText(s => s + delta);
+        // 防御：组件已卸载或项目已切换则不更新状态(避免串号覆盖 + React 警告)
+        if (mountedRef.current && reqSeq === loadSeqRef.current) setStreamText(s => s + delta);
       },
       (meta) => {
         // 守护进程意图：后端返回 navigate 动作，自动跳转
+        // 第二十六轮 P1 修复(BUG-P1-4): daemon_create 失败时后端不 emit navigate 且带 daemonError
+        //   此时不 toast 成功提示,只 toast 错误(后端 assistant 消息已说明原因)
+        if (meta.daemonError) {
+          toast(`派发守护进程任务失败：${meta.daemonError}`, 'err');
+          return;
+        }
         if (meta.action === 'navigate' && meta.target) {
           toast(meta.intent === 'daemon_create' ? '已派发续写任务，正在打开守护进程…' : '正在打开守护进程…');
           // 稍延后跳转，让引导文案先显示
@@ -209,19 +230,21 @@ export default function Studio() {
             <Tag size={13} /> 题材库
           </button>
         </div>
-        <div className="flex items-center gap-3">
+        {/* 第二十六轮 P0 修复(BUG-P0-4): 右侧组在 375px 屏必溢出,联网组+模型 select+徽章 ≈290px
+            与左组 flex-1 共存横向溢出。改 flex-wrap + 模型组换行,触摸目标对齐 ui.tsx Switch(h-6 w-11) */}
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <div className="flex items-center gap-1.5">
             <Globe size={14} className={cn('transition-colors', webSearch ? 'text-amber' : 'text-paper-mute')} />
-            <button type="button" role="switch" aria-checked={webSearch} disabled={!currentProject}
-              className={cn('relative h-5 w-9 rounded-full transition-colors', webSearch ? 'bg-amber' : 'bg-ink-500', !currentProject && 'opacity-50')}
+            <button type="button" role="switch" aria-label="联网搜索" aria-checked={webSearch} disabled={!currentProject}
+              className={cn('relative h-6 w-11 rounded-full transition-colors', webSearch ? 'bg-amber' : 'bg-ink-500', !currentProject && 'opacity-50')}
               onClick={toggleWebSearch}>
-              <span className={cn('absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-paper transition-transform', webSearch && 'translate-x-4')} />
+              <span className={cn('absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-paper transition-transform', webSearch && 'translate-x-5')} />
             </button>
             <span className="text-xs text-paper-mute">联网</span>
           </div>
-          <div className="flex items-center gap-1.5 text-xs text-paper-mute">
+          <div className="flex w-full items-center gap-1.5 text-xs text-paper-mute sm:w-auto">
             <Cpu size={14} />
-            <select className="input-compact px-2 py-1 text-xs" value={currentProviderId ? `${currentProviderId}::${currentModel}` : ''} onChange={e => {
+            <select className="input-compact min-w-0 flex-1 px-2 py-1 text-xs sm:flex-none" value={currentProviderId ? `${currentProviderId}::${currentModel}` : ''} onChange={e => {
               const sep = e.target.value.indexOf('::');
               if (sep > 0) {
                 const pid = e.target.value.slice(0, sep);
@@ -261,7 +284,7 @@ export default function Studio() {
               onClick={() => setMobileView('tasks')}
             >任务</button>
           </div>
-          <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-6 md:px-8">
+          <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-6 md:px-8">
             <div className="mx-auto max-w-3xl">
               {!currentProject ? (
                 <Welcome onCreate={() => loadProjects()} />
@@ -442,8 +465,10 @@ function TaskRow({ task, toast }: { task: Task; toast: (msg: string, type?: 'ok'
   const onRetry = async () => {
     setRetrying(true);
     try {
-      await api.tasks.resume(task.id);
-      toast('已重新排队');
+      // 第二十六轮 P1 修复(BUG-P1-1): 原 resume 不递增 retryCount,失败统计失真,且与 Daemon 页面行为不一致
+      //   现: 失败重试用 retry(保留 checkpoint 续传 + 递增 retryCount),与 Daemon.tsx 对齐
+      await api.tasks.retry(task.id);
+      toast('已重新排队（失败重试）');
     } catch (e) { toast((e as Error).message, 'err'); }
     finally { setRetrying(false); }
   };

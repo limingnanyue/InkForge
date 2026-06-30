@@ -165,16 +165,6 @@ export default function ProjectDetail() {
   // 联网搜索开关跟随项目配置
   useEffect(() => { setWebSearch(project?.webSearchEnabled ?? false); }, [project]);
 
-  // SSE：任务完成/失败时刷新章节
-  useEffect(() => {
-    const off = api.streamEvents((e: any) => {
-      if (e.type === 'task:progress') { if (id) loadTasks(id); }
-      else if (e.type === 'task:done') { if (id) loadTasks(id); load(); }
-      else if (e.type === 'task:failed') { toast(e.message || '任务失败', 'err'); if (id) loadTasks(id); }
-    });
-    return off;
-  }, [id, load, loadTasks, toast]);
-
   // 防抖保存
   const scheduleSave = (patch: Partial<Chapter>) => {
     if (!selected) return;
@@ -193,6 +183,8 @@ export default function ProjectDetail() {
   //   原 bug: 切走 chapters Tab 会卸载编辑器,800ms 内的输入未保存就丢失
   //   useEffect cleanup 用 setTimeout 0 推迟到下一 tick,React 已卸载组件无法 await
   //   解法: 暴露 flush 函数,setTab 前先同步调用
+  // 第二十六轮 P0 修复(数据丢失): task:done 触发 load() 前也调用此函数强制落库防抖未保存 patch,
+  //   否则 SSE 刷新会用服务端旧 tree 覆盖本地编辑输入
   const flushPendingSave = useCallback(() => {
     if (!saveRef.current || !selected) return;
     window.clearTimeout(saveRef.current);
@@ -207,6 +199,22 @@ export default function ProjectDetail() {
       setTree(prev => mutateNode(prev, sid, n => Object.assign(n, patch)));
     }).catch(e => toast((e as Error).message, 'err'));
   }, [selected, toast]);
+
+  // SSE：任务完成/失败时刷新章节
+  // 第二十六轮 P0 修复(数据丢失): task:done 触发 load() 会拉取服务端旧 tree 覆盖本地 state,
+  //   若用户正在编辑某章节且防抖 saveRef.current 仍有 pending timer(800ms 内输入未落库),
+  //   选中章节会被服务端旧版本覆盖 → 用户最近输入静默丢失,无任何提示。
+  //   现: task:done 收到时先 flushPendingSave() 强制落库未保存 patch,再 load()。
+  //   注: flushPendingSave 是同步 clear timer + 异步 fetch,load() 紧随其后可能拉到落库前快照,
+  //       但最坏情况 patch 仍在 fetch 队列里稍后落库,不会丢;且 fetch 失败 toast 不影响 load。
+  useEffect(() => {
+    const off = api.streamEvents((e: any) => {
+      if (e.type === 'task:progress') { if (id) loadTasks(id); }
+      else if (e.type === 'task:done') { flushPendingSave(); if (id) loadTasks(id); load(); }
+      else if (e.type === 'task:failed') { toast(e.message || '任务失败', 'err'); if (id) loadTasks(id); }
+    });
+    return off;
+  }, [id, load, loadTasks, toast, flushPendingSave]);
   // BUG-5 修复：组件卸载时清理防抖定时器，避免编辑后立刻返回作品库时 800ms 定时器
   // 仍触发 api.chapters.update（对已删除章节 404，对仍存在章节写脏值）
   useEffect(() => () => { if (saveRef.current) window.clearTimeout(saveRef.current); }, []);
@@ -626,10 +634,13 @@ export default function ProjectDetail() {
   };
 
   // 题材即时保存（GenreSelect onChange 即触发；只有变化时才写库）
+  // 第二十六轮 P1 修复(BUG-P1-2): 清空题材时 genreId 传 undefined 会被 JSON.stringify 剥离字段,
+  //   后端 patch 不含 genreId 键 → UPDATE 的 ?? 兜底回旧值 → DB 中 genre_id 仍是旧值,刷新后题材回归
+  //   现: 清空时显式传 null(后端白名单已支持 body.genreId === null)
   const onBlurGenre = async (genreId: string, label: string) => {
     if (!project) return;
-    const nextGenreId = genreId || undefined;
-    if (project.genre === label && (project.genreId || undefined) === nextGenreId) return;
+    const nextGenreId: string | null = genreId || null;
+    if (project.genre === label && (project.genreId || null) === nextGenreId) return;
     try {
       const updated = await api.projects.update(project.id, { genre: label, genreId: nextGenreId });
       setProject(updated);
@@ -823,6 +834,7 @@ export default function ProjectDetail() {
                       <GenreSelect
                         value={project.genreId}
                         label={project.genre}
+                        projectType={project.type}
                         onChange={(genreId, label) => onBlurGenre(genreId, label)}
                       />
                     </div>
@@ -1048,7 +1060,7 @@ export default function ProjectDetail() {
                   <h3 className="mb-3 font-display text-base text-paper">卷级大纲</h3>
                   <ul className="space-y-3">
                     {agentState.volumeOutlines.map((v, i) => (
-                      <li key={i} className="border-l-2 pl-3" style={{ borderColor: 'var(--cinnabar-500)' }}>
+                      <li key={i} className="border-l-2 pl-3" style={{ borderColor: 'var(--cinnabar)' }}>
                         <div className="mb-1 flex flex-wrap items-center gap-2">
                           <span className="text-sm font-medium text-paper">第 {v.idx + 1} 卷 《{v.title}》</span>
                           <span className="badge badge-mute">{v.emotionArc}</span>

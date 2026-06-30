@@ -324,7 +324,7 @@ export interface UsageStats {
 // SSE 流式事件
 export type StreamEvent =
   | { type: 'chat:chunk'; messageId: string; delta: string }
-  | { type: 'chat:done'; messageId: string }
+  | { type: 'chat:done'; messageId: string; content: string }
   | { type: 'task:progress'; taskId: string; progress: number; message: string }
   | { type: 'task:log'; taskId: string; level: string; message: string }
   | { type: 'task:done'; taskId: string }
