@@ -305,9 +305,12 @@ function inferChapterWordBudget(projectId: string, projectType?: ProjectType): n
 
 // H4 修复：maxTokens 按 provider kind 放大 token/字 系数
 // 国产模型 1 字 ≈ 1.5-2 token，若 maxTokens 直接等于 chapterWordBudget（字数），
-// 实际可输出字数 ≈ maxTokens / 1.5，章节会被截断（典型表现：结尾不完整/突兀截断）
+// 实际可输出字数 ≈ maxTokens / ratio，章节会被截断（典型表现：结尾不完整/突兀截断）
 // wordBudget（质量门用）保持字数语义不变，只放大 maxTokens 给模型留 token 空间
-// 国产（deepseek/qwen/glm/doubao/kimi/hunyuan/ernie）：1.5×
+// 风险2修复: CN_KINDS ratio 1.5→1.8(取中值偏上)。实测国产模型 1 字可达 2 token,
+//   原 1.5 时 3000 字需 6000 token 只给 4500 → 章节结尾截断;1.8 平衡截断风险与 token 成本
+//   (与 engine.ts 同名函数同步,两处必须一致)
+// 国产（deepseek/qwen/glm/doubao/kimi/hunyuan/ernie）：1.8×
 // OpenAI 系（openai/anthropic/gemini/kilo）：1.2×
 // ollama/custom/未知：1.5×（保守放大，宁多勿少）
 // B7 修复: 加模块级缓存,避免 2000 章循环内反复查 SQLite provider 表(累积 ~200ms 开销)
@@ -322,7 +325,7 @@ function tokenCharRatio(providerId?: string): number {
   if (provider) {
     const CN_KINDS: ProviderKind[] = ['deepseek', 'qwen', 'glm', 'doubao', 'kimi', 'hunyuan', 'ernie'];
     const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo'];
-    if (CN_KINDS.includes(provider.kind)) ratio = 1.5;
+    if (CN_KINDS.includes(provider.kind)) ratio = 1.8;
     else if (LIGHT_KINDS.includes(provider.kind)) ratio = 1.2;
     else ratio = 1.5;  // ollama/custom/kkai: 网关聚合按保守 1.5×(可能中转国产模型,宁多勿少)
   }
@@ -549,6 +552,9 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
       chapter = chapterRepo.create({ projectId, title: ch.title, outline: ch.outline, orderIdx: i, positioning: ch.positioning, coreEmotion: ch.coreEmotion });
       freshMap.set(i, chapter);  // 同步到 Map，后续循环可直接取
     }
+    // 风险1修复配套: 重启续写时跳过已 done 章节
+    // (失败章被跳过标记 failed 后,其后继章可能已 done;resume 从首个非 done 章开始,不应重做其后已 done 章覆盖正文)
+    if (chapter.content && chapter.status === 'done') continue;
 
     // 生成正文（注入位置锚点 + 防跑偏上下文 + 上一章 assistant 作为 history 提升缓存命中）
     // oh-story：按章节定位类型调整 maxTokens（高压章给更多空间，低压/信息章压缩防注水）
@@ -642,54 +648,83 @@ ${prompt}`;
     const chapterMaxTokens = Math.round(positioningWordMax * tokenCharRatio(providerId));
 
     // 章节质量门：生成 → 质检 → 不达标重写一次（避免死循环 + 浪费 token，最多 1 次重写）
-    try {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        content = '';
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch, currentChapterIdx: i }))) {
-          content += chunk;
-        }
-        // 质量门检测（字数门 + 跑题门 + memo 硬对账）
-        try {
-          const quality = await checkChapterQuality({
-            projectId, model, providerId,
-            chapterIdx: i, chapterTitle: ch.title, outline: ch.outline,
-            positioning: ch.positioning, coreEmotion: ch.coreEmotion,
-            content, wordBudget, chapterWordMin, chapterWordMax,
-            memo: chapterMemo || undefined,
-          });
-          if (quality.ok) {
-            if (quality.issues.length > 0) {
-              logTask(task.id, 'info', `第 ${i + 1} 章质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
-            }
-            break;  // 通过，跳出重写循环
+    // 风险3修复: wallTimeoutMs 按章节字数动态计算(每1000token给100秒,至少8分钟),
+    //   防国产慢模型流式输出超5分钟默认墙时被误杀触发 throw
+    const chapterWallTimeoutMs = Math.max(8 * 60 * 1000, chapterMaxTokens * 100);
+    // 风险1修复: 章节级 transient 错误重试。runSkill 抛错(网络/429/5xx/timeout)时重试本章最多3次,
+    //   仍失败则标记 failed 跳过本章继续下一章,不再 throw 中断整本书(原 throw e 会让任务永久停在十几章);
+    //   400/内容拒绝类错误(content_filter/safety)直接跳过不重试(重试也是同样错误)
+    // 重试层级: 内层 attempt(质检不达标重写) → 外层 chapterAttempt(runSkill抛错重试) → 跳过本章
+    let chapterGenerated = false;
+    for (let chapterAttempt = 0; chapterAttempt < 3 && !chapterGenerated; chapterAttempt++) {
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          content = '';
+          for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch, currentChapterIdx: i, wallTimeoutMs: chapterWallTimeoutMs }))) {
+            content += chunk;
           }
-          // 不达标：attempt === 0 时重写一次，attempt === 1 时保留最后结果
-          if (attempt === 0) {
-            logTask(task.id, 'warn', `第 ${i + 1} 章质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
-            // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
-            // 第二十六轮修复(章细偏离): 重写 prompt 仍须强调遵循本章大纲,避免重写也偏离
-            prompt = `${prompt}
+          // 质量门检测（字数门 + 跑题门 + memo 硬对账）
+          try {
+            const quality = await checkChapterQuality({
+              projectId, model, providerId,
+              chapterIdx: i, chapterTitle: ch.title, outline: ch.outline,
+              positioning: ch.positioning, coreEmotion: ch.coreEmotion,
+              content, wordBudget, chapterWordMin, chapterWordMax,
+              memo: chapterMemo || undefined,
+            });
+            if (quality.ok) {
+              if (quality.issues.length > 0) {
+                logTask(task.id, 'info', `第 ${i + 1} 章质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
+              }
+              break;  // 通过，跳出重写循环
+            }
+            // 不达标：attempt === 0 时重写一次，attempt === 1 时保留最后结果
+            if (attempt === 0) {
+              logTask(task.id, 'warn', `第 ${i + 1} 章质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+              // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
+              // 第二十六轮修复(章细偏离): 重写 prompt 仍须强调遵循本章大纲,避免重写也偏离
+              prompt = `${prompt}
 
 【首次质检不达标,请针对以下问题修正重写】
 ${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
 
 请基于上述问题调整写法,确保本次重写能通过质检。重写时仍须严格遵循本章大纲(章细忠实度最高优先级),不得因修正问题而偏离大纲已定的情节点。`;
-            continue;  // 重写一次
+              continue;  // 重写一次
+            }
+            // 重写后仍不达标：保留最后一次结果，标记 warn，不阻断流程
+            logTask(task.id, 'warn', `第 ${i + 1} 章重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
+            break;
+          } catch (e) {
+            // 质检异常：不阻断，用当前 content 继续
+            logTask(task.id, 'warn', `第 ${i + 1} 章质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
+            break;
           }
-          // 重写后仍不达标：保留最后一次结果，标记 warn，不阻断流程
-          logTask(task.id, 'warn', `第 ${i + 1} 章重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
-          break;
-        } catch (e) {
-          // 质检异常：不阻断，用当前 content 继续
-          logTask(task.id, 'warn', `第 ${i + 1} 章质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
+        }
+        chapterGenerated = true;
+      } catch (e) {
+        // runSkill 抛错(网络/429/5xx/timeout/400内容拒绝): 章节级处理,不冒泡中断整本书
+        const errMsg = (e as Error).message || String(e);
+        const isNonRetriable = /400|content_filter|safety/i.test(errMsg);
+        if (isNonRetriable) {
+          // 400/内容拒绝类错误:重试也是同样错误,直接跳过本章
+          try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
+          logTask(task.id, 'warn', `第 ${i + 1} 章生成被拒绝(疑似内容/参数错误),跳过继续：${errMsg.slice(0, 120)}`);
           break;
         }
+        // 429/5xx/timeout/网络错误:重试本章(共3次尝试)
+        if (chapterAttempt < 2) {
+          logTask(task.id, 'warn', `第 ${i + 1} 章生成失败(transient,第 ${chapterAttempt + 1}/3 次),重试中：${errMsg.slice(0, 120)}`);
+          continue;
+        }
+        // 重试3次仍失败:标记 failed,跳过本章继续下一章(不 throw,不中断整本书)
+        try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
+        logTask(task.id, 'warn', `第 ${i + 1} 章生成失败(重试 3 次仍失败),跳过继续：${errMsg.slice(0, 120)}`);
+        break;
       }
-    } catch (e) {
-      // 生成失败：回滚 chapter 状态，避免卡在 generating 永远显示"生成中"
-      // try/catch 包裹：状态回滚自身若失败（如 DB 约束）不应覆盖原始 LLM 异常
-      try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
-      throw e;
+    }
+    if (!chapterGenerated) {
+      // 本章跳过:不更新正文(已标记 failed),继续下一章
+      continue;
     }
     chapterRepo.update(chapter.id, { content, status: 'done' });
     // 同步把刚生成的正文写回 freshMap，让下一章的 prevHistory 能取到本章正文
@@ -768,6 +803,32 @@ ${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
       } catch (e) {
         logTask(task.id, 'warn', `第 ${i + 1} 章后卷级审稿失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
       }
+      // 风险4修复: 每10章额外生成 mainlineProgress（全书主线进度），写入 state.mainlineProgress
+      //   原: buildChapterAnchor 仅注入 idea 前200字，200章长篇中后段主线演进信息缺失 → 主线遗忘/崩塌
+      //   现: 每10章审稿时让 LLM 增量更新全书主线进度（已达成里程碑+未解核心冲突+关键转折点，200字内）
+      //   独立 try/catch: 与审稿互不影响,失败仅 warn 不阻断
+      try {
+        const curState4Main = stateRepo.get(projectId);
+        const recentForMain = chapterRepo.listByProject(projectId)
+          .filter(c => c.content && c.status === 'done')
+          .slice(-5);
+        if (recentForMain.length >= 3) {
+          const mainInput = recentForMain.map(c => `第${c.orderIdx + 1}章《${c.title}》:\n${c.content.slice(0, 500)}`).join('\n\n');
+          const prevMain = curState4Main?.mainlineProgress ? `\n\n【上一版主线进度（在此基础上增量更新,勿丢失未解核心冲突）】\n${curState4Main.mainlineProgress}` : '';
+          const { text: mainText } = await complete({
+            providerId, model, projectId,
+            messages: [{ role: 'user', content: `请基于以下最近 ${recentForMain.length} 章剧情,输出全书主线进度（200字内）,须包含:① 已达成里程碑 ② 未解核心冲突 ③ 关键转折点。这是长篇防跑偏锚点,后续每章生成都会参考。${prevMain}\n\n【最近章节】\n${mainInput}` }],
+            systemStable: '你是资深网文剧情架构师,擅长提炼全书主线进度,防止长篇中后段主线遗忘。',
+            temperature: 0.4, maxTokens: 400,
+          });
+          if (mainText && mainText.length > 20) {
+            stateRepo.update(projectId, { mainlineProgress: mainText.slice(0, 600) });
+            logTask(task.id, 'info', `第 ${i + 1} 章后全书主线进度更新完成,已写入 state.mainlineProgress`);
+          }
+        }
+      } catch (e) {
+        logTask(task.id, 'warn', `第 ${i + 1} 章后主线进度更新失败（不阻断）：${(e as Error).message.slice(0, 80)}`);
+      }
     }
   }
 
@@ -776,16 +837,26 @@ ${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
   // 原 bug1: 范围仅 slice(-3),200 章长篇 197 章未精修
   // 原 bug2: 不调 snapshot → 精修后原文永久丢失,无法回滚
   // 原 bug3: 无 try/catch → LLM 抛错让整个 200 章任务标记 failed 重做,巨大 token 浪费
-  // 现: 范围 min(N, max(5, N*0.1)); 每章先 snapshot; 整段 try/catch 失败仅 warn 不阻断
+  // 现: 范围 前30章黄金追读区 + 末尾20%(去重); 每章先 snapshot; 整段 try/catch 失败仅 warn 不阻断
   progress(task.id, 0.95, '精修去 AI 味…');
   const allChapters = chapterRepo.listByProject(projectId);
-  const refineCount = Math.min(allChapters.length, Math.max(5, Math.floor(allChapters.length * 0.1)));
-  const toRefine = allChapters.slice(-refineCount);
+  // 精修范围:前 30 章黄金追读区 + 末尾 20%,去重(原仅末 10%,200 章长篇前 180 章黄金追读区无精修)
+  const headCount = Math.min(30, allChapters.length);
+  const tailCount = Math.min(allChapters.length, Math.max(5, Math.floor(allChapters.length * 0.2)));
+  const headChapters = allChapters.slice(0, headCount);
+  const tailChapters = allChapters.slice(-tailCount);
+  // 合并去重(短篇时前 30 和末 20% 可能重叠)
+  const seen = new Set<string>();
+  const toRefine = [...headChapters, ...tailChapters].filter(ch => {
+    if (seen.has(ch.id)) return false;
+    seen.add(ch.id);
+    return true;
+  });
   try {
     for (const ch of toRefine) {
       if (!ch.content) continue;
       let refined = '';
-      const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
+      const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || chapterWordBudget) * 1.3) * tokenCharRatio(providerId));
       try {
         for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
           refined += chunk;
@@ -794,10 +865,10 @@ ${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
         logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 章精修失败（不阻断,保留原文）：${(e as Error).message.slice(0, 80)}`);
         continue;
       }
-      // 质量门:精修后字数不应 < 原文 70%(防 LLM 截断/缩写);否则保留原文
+      // 质量门:精修后字数不应 < 原文 60%(防 LLM 截断/缩写;阈值从 70% 下调到 60%,允许 Gate 严格执行删除类精修)
       const originalLen = ch.content.length;
-      if (refined.length < originalLen * 0.7) {
-        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 章精修后字数 ${refined.length} < 原文 ${originalLen} 的 70%,疑似截断/缩写,保留原文`);
+      if (refined.length < originalLen * 0.6) {
+        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 章精修后字数 ${refined.length} < 原文 ${originalLen} 的 60%,疑似截断/缩写,保留原文`);
         continue;
       }
       if (refined.length > 100) {
@@ -810,6 +881,12 @@ ${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}
   }
 
   projectRepo.updateWordCount(projectId);
+  // 风险4修复: 末尾章数校验。跳过的失败章不报警会导致用户以为全书完成但实际缺章,
+  //   这里统计实际 done 章数,缺章时 warn 提示可重试(失败章 status='failed',用户可单独重生成)
+  const doneCount = chapterRepo.listByProject(projectId).filter(c => c.status === 'done').length;
+  if (doneCount < chapters.length) {
+    logTask(task.id, 'warn', `本书生成完成但部分章节失败：实际完成 ${doneCount}/${chapters.length} 章，${chapters.length - doneCount} 章可重试`);
+  }
 }
 
 // ============ 一键成短篇流水线（二十万字）============
@@ -931,6 +1008,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
       chapter = chapterRepo.create({ projectId, title: seg.title, outline: seg.outline, orderIdx: i, positioning: seg.positioning, coreEmotion: seg.coreEmotion });
       existingShortMap.set(i, chapter);
     }
+    // 风险1修复配套: 重启续写时跳过已 done 段落
+    // (失败段被跳过标记 failed 后,其后继段可能已 done;resume 从首个非 done 段开始,不应重做其后已 done 段覆盖正文)
+    if (chapter.content && chapter.status === 'done') continue;
     chapterRepo.update(chapter.id, { status: 'generating' });
     let content = '';
     // chapter_memo 七段契约(inkos): 短篇虽无 buildChapterAnchor,仍生成 memo 作为硬契约。
@@ -974,50 +1054,79 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     }
 
     segPrompt += `\n\n写段落《${seg.title}》，约 ${chapterWordBudget} 字（区间 ${chapterWordMin}-${chapterWordMax} 字，超上限 15% 触发重写压缩）。大纲：${seg.outline}。直接输出正文，剧情推进到位即可，不得注水。`;
-    try {
-      for (let attempt = 0; attempt < 2; attempt++) {
-        content = '';
-        // 短篇段约 chapterWordBudget 字，maxTokens 按国产模型 token/字 系数放大（H4 防截断）
-        // B6 修复: prompt 上界是 chapterWordMax(用户配置),maxTokens 需匹配上界
-        // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.9/1.1
-        // wordBudget 保持字数语义不变，用于质量门判定
-        const segMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
-        for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: segPrompt, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
-          content += chunk;
-        }
-        // 质量门检测（字数门 + 跑题门 + memo 硬对账）
-        try {
-          const quality = await checkChapterQuality({
-            projectId, model, providerId,
-            chapterIdx: i, chapterTitle: seg.title, outline: seg.outline,
-            positioning: seg.positioning, coreEmotion: seg.coreEmotion,
-            content, wordBudget: chapterWordBudget, chapterWordMin, chapterWordMax,
-            memo: segMemo || undefined,
-          });
-          if (quality.ok) {
-            if (quality.issues.length > 0) {
-              logTask(task.id, 'info', `第 ${i + 1} 段质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
+    // 短篇段约 chapterWordBudget 字，maxTokens 按国产模型 token/字 系数放大（H4 防截断）
+    // B6 修复: prompt 上界是 chapterWordMax(用户配置),maxTokens 需匹配上界
+    // H3 修复(第十九轮): 用 chapterWordMin/Max 替代硬编码 budget*0.9/1.1
+    // wordBudget 保持字数语义不变，用于质量门判定
+    const segMaxTokens = Math.round(chapterWordMax * tokenCharRatio(providerId));
+    // 风险3修复: wallTimeoutMs 按段落字数动态计算(每1000token给100秒,至少8分钟),
+    //   防国产慢模型流式输出超5分钟默认墙时被误杀触发 throw
+    const segWallTimeoutMs = Math.max(8 * 60 * 1000, segMaxTokens * 100);
+    // 风险1修复: 段落级 transient 错误重试。runSkill 抛错(网络/429/5xx/timeout)时重试本段最多3次,
+    //   仍失败则标记 failed 跳过本段继续下一段,不再 throw 中断整篇(原 throw e 会让任务永久停在前几段);
+    //   400/内容拒绝类错误(content_filter/safety)直接跳过不重试(重试也是同样错误)
+    // 重试层级: 内层 attempt(质检不达标重写) → 外层 segAttempt(runSkill抛错重试) → 跳过本段
+    let segGenerated = false;
+    for (let segAttempt = 0; segAttempt < 3 && !segGenerated; segAttempt++) {
+      try {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          content = '';
+          for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: segPrompt, history: segPrevHistory, maxTokens: segMaxTokens, webSearch, wallTimeoutMs: segWallTimeoutMs }))) {
+            content += chunk;
+          }
+          // 质量门检测（字数门 + 跑题门 + memo 硬对账）
+          try {
+            const quality = await checkChapterQuality({
+              projectId, model, providerId,
+              chapterIdx: i, chapterTitle: seg.title, outline: seg.outline,
+              positioning: seg.positioning, coreEmotion: seg.coreEmotion,
+              content, wordBudget: chapterWordBudget, chapterWordMin, chapterWordMax,
+              memo: segMemo || undefined,
+            });
+            if (quality.ok) {
+              if (quality.issues.length > 0) {
+                logTask(task.id, 'info', `第 ${i + 1} 段质检通过（score ${quality.score.toFixed(2)}）：${quality.issues.join('；')}`);
+              }
+              break;
             }
+            if (attempt === 0) {
+              logTask(task.id, 'warn', `第 ${i + 1} 段质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
+              // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
+              segPrompt = `${segPrompt}\n\n【首次质检不达标,请针对以下问题修正重写】\n${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}`;
+              continue;
+            }
+            logTask(task.id, 'warn', `第 ${i + 1} 段重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
+            break;
+          } catch (e) {
+            logTask(task.id, 'warn', `第 ${i + 1} 段质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
             break;
           }
-          if (attempt === 0) {
-            logTask(task.id, 'warn', `第 ${i + 1} 段质检不达标（score ${quality.score.toFixed(2)}），重写一次：${quality.issues.join('；')}`);
-            // 第二十三轮修复: 把质检 issues 拼到 prompt,LLM 知道要修正什么
-            segPrompt = `${segPrompt}\n\n【首次质检不达标,请针对以下问题修正重写】\n${quality.issues.map((iss, idx) => `${idx + 1}. ${iss}`).join('\n')}`;
-            continue;
-          }
-          logTask(task.id, 'warn', `第 ${i + 1} 段重写后仍不达标（score ${quality.score.toFixed(2)}），保留当前结果：${quality.issues.join('；')}`);
-          break;
-        } catch (e) {
-          logTask(task.id, 'warn', `第 ${i + 1} 段质检异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
+        }
+        segGenerated = true;
+      } catch (e) {
+        // runSkill 抛错(网络/429/5xx/timeout/400内容拒绝): 段落级处理,不冒泡中断整篇
+        const errMsg = (e as Error).message || String(e);
+        const isNonRetriable = /400|content_filter|safety/i.test(errMsg);
+        if (isNonRetriable) {
+          // 400/内容拒绝类错误:重试也是同样错误,直接跳过本段
+          try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
+          logTask(task.id, 'warn', `第 ${i + 1} 段生成被拒绝(疑似内容/参数错误),跳过继续：${errMsg.slice(0, 120)}`);
           break;
         }
+        // 429/5xx/timeout/网络错误:重试本段(共3次尝试)
+        if (segAttempt < 2) {
+          logTask(task.id, 'warn', `第 ${i + 1} 段生成失败(transient,第 ${segAttempt + 1}/3 次),重试中：${errMsg.slice(0, 120)}`);
+          continue;
+        }
+        // 重试3次仍失败:标记 failed,跳过本段继续下一段(不 throw,不中断整篇)
+        try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
+        logTask(task.id, 'warn', `第 ${i + 1} 段生成失败(重试 3 次仍失败),跳过继续：${errMsg.slice(0, 120)}`);
+        break;
       }
-    } catch (e) {
-      // 生成失败：回滚段状态，避免卡在 generating
-      // try/catch 包裹：状态回滚自身若失败（如 DB 约束）不应覆盖原始 LLM 异常
-      try { chapterRepo.update(chapter.id, { status: 'failed' }); } catch (e) { console.warn('[chapter-status-rollback] 失败', (e as Error).message); }
-      throw e;
+    }
+    if (!segGenerated) {
+      // 本段跳过:不更新正文(已标记 failed),继续下一段
+      continue;
     }
     chapterRepo.update(chapter.id, { content, status: 'done' });
     // 同步把刚生成的正文写回 existingShortMap，让下一段的 segPrevHistory 能取到本段正文
@@ -1053,7 +1162,7 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     for (const ch of toRefineShort) {
       if (!ch.content) continue;
       let refined = '';
-      const refineMaxTokens = Math.round(Math.max(3000, (ch.wordCount || chapterWordBudget) * 1.1) * tokenCharRatio(providerId));
+      const refineMaxTokens = Math.round(Math.max(3000, (ch.wordCount || chapterWordBudget) * 1.3) * tokenCharRatio(providerId));
       try {
         for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'refine', model, providerId, userPrompt: `精修：\n${ch.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
           refined += chunk;
@@ -1063,8 +1172,8 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
         continue;
       }
       const originalLen = ch.content.length;
-      if (refined.length < originalLen * 0.7) {
-        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 段精修后字数 ${refined.length} < 原文 ${originalLen} 的 70%,保留原文`);
+      if (refined.length < originalLen * 0.6) {
+        logTask(task.id, 'warn', `第 ${ch.orderIdx + 1} 段精修后字数 ${refined.length} < 原文 ${originalLen} 的 60%,保留原文`);
         continue;
       }
       if (refined.length > 100) {
@@ -1076,6 +1185,12 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     logTask(task.id, 'warn', `短篇末尾精修异常（不阻断）：${(e as Error).message.slice(0, 100)}`);
   }
   projectRepo.updateWordCount(projectId);
+  // 风险4修复: 末尾段数校验。跳过的失败段不报警会让用户误以为整篇完成但实际缺段,
+  //   这里统计实际 done 段数,缺段时 warn 提示可重试(失败段 status='failed',用户可单独重生成)
+  const doneCount = chapterRepo.listByProject(projectId).filter(c => c.status === 'done').length;
+  if (doneCount < segments.length) {
+    logTask(task.id, 'warn', `本短篇生成完成但部分段落失败：实际完成 ${doneCount}/${segments.length} 段，${segments.length - doneCount} 段可重试`);
+  }
 }
 
 // ============ 单章生成 ============
@@ -1173,7 +1288,7 @@ async function runRefine(task: Task, model: string, providerId?: string): Promis
   // (2) webSearch:false 显式关闭联网（精修不应触发抓取）
   // (3) maxTokens 按原文字数动态计算（与 runBookPipeline/runShortPipeline 一致，防 4096 注水扩写）
   // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断
-  const refineMaxTokens = Math.round(Math.max(2000, (chapter.wordCount || 2500) * 1.1) * tokenCharRatio(providerId));
+  const refineMaxTokens = Math.round(Math.max(2000, (chapter.wordCount || 2500) * 1.3) * tokenCharRatio(providerId));
   for await (const chunk of withHeartbeat(task.id, runSkill({ projectId: chapter.projectId, skill: 'refine', model, providerId, userPrompt: `精修以下正文：\n${chapter.content}`, maxTokens: refineMaxTokens, webSearch: false }))) {
     refined += chunk;
   }
@@ -1233,9 +1348,9 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
     }
 
     let refined = '';
-    // 精修 maxTokens 按原文字数 × 1.1（与 runRefine 一致，防注水扩写）
+    // 精修 maxTokens 按原文字数 × 1.3（与 runRefine 一致，余量放宽防 Gate 删除类精修被截断）
     // H4 修复：再按国产模型 token/字 系数放大，否则精修结果会被截断
-    const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || ch.content.length) * 1.1) * tokenCharRatio(providerId));
+    const refineMaxTokens = Math.round(Math.max(2000, (ch.wordCount || ch.content.length) * 1.3) * tokenCharRatio(providerId));
     try {
       for await (const chunk of withHeartbeat(task.id, runSkill({
         projectId, skill: 'refine', model, providerId,
@@ -1257,6 +1372,9 @@ async function runRefineBook(task: Task, model: string, providerId?: string): Pr
     // 精修结果过短（< 100 字）视为失败，不覆盖原内容
     if (refined.length < 100) {
       logTask(task.id, 'warn', `第 ${i + 1} 章精修结果过短（${refined.length} 字），保留原文不覆盖`);
+    } else if (refined.length < ch.content.length * 0.6) {
+      // 字数门:精修后 < 原文 60% 视为截断/缩写,保留原文(阈值 60%,允许 Gate 严格执行删除类精修;原仅检查 <100 字)
+      logTask(task.id, 'warn', `第 ${i + 1} 章精修后字数 ${refined.length} < 原文 ${ch.content.length} 的 60%,疑似截断/缩写,保留原文不覆盖`);
     } else {
       // 精修前先存快照（与 runRefine 一致，保留精修前版本供回滚）
       chapterRepo.snapshot(ch.id);

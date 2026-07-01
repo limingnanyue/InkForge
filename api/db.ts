@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS agent_state (
   chapter_memos_json TEXT DEFAULT '[]',
   emotion_beats_json TEXT DEFAULT '[]',
   conflict_lines_json TEXT DEFAULT '[]',
+  -- 风险4修复: 全书主线进度（每10章审稿增量更新，替代 idea 前200字锚点，防长篇中后段主线遗忘）
+  mainline_progress TEXT DEFAULT '',
   updated_at INTEGER NOT NULL
 );
 
@@ -223,6 +225,8 @@ function migrateLegacySchema(): void {
   // 情感线节点 + 矛盾网三层状态机持久化（CP向作品情感节奏 + 防单元剧化）
   if (!stateCols.includes('emotion_beats_json')) db.exec("ALTER TABLE agent_state ADD COLUMN emotion_beats_json TEXT DEFAULT '[]'");
   if (!stateCols.includes('conflict_lines_json')) db.exec("ALTER TABLE agent_state ADD COLUMN conflict_lines_json TEXT DEFAULT '[]'");
+  // 风险4修复: 全书主线进度列（每10章审稿增量更新，防长篇中后段主线遗忘）
+  if (!stateCols.includes('mainline_progress')) db.exec("ALTER TABLE agent_state ADD COLUMN mainline_progress TEXT DEFAULT ''");
 
   // M5 修复(第十三轮): 旧库 chapter 表补 positioning/core_emotion 列,让 oh-story 章节定位六类持久化
   const chapterCols = (db.prepare("PRAGMA table_info(chapter)").all() as { name: string }[]).map(c => c.name);

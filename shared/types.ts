@@ -172,6 +172,9 @@ export interface AgentState {
   emotionBeats?: EmotionBeat[];       // 情感线节点追踪（CP向作品专用，防 CP 互动节奏失控）
   conflictLines?: ConflictLine[];     // 矛盾网三层追踪（防单元剧化，每解决一个矛盾必须激活另一个）
   outline?: string;  // 全书大纲（H1 修复第十二轮：原仅落 task.checkpoint，正文生成 prompt 看不到全书主线 → 长篇中段跑题/遗忘主线）
+  // 风险4修复: 全书主线进度（每10章审稿增量更新，防长篇中后段主线遗忘）
+  // 替代 idea 前200字锚点，包含已达成里程碑/未解核心冲突/关键转折点
+  mainlineProgress?: string;
   updatedAt: number;
 }
 

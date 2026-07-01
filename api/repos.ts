@@ -203,7 +203,7 @@ export const stateRepo = {
     db.prepare(
       `UPDATE agent_state SET idea=?, setting=?, characters=?, memory=?, review=?, revision=?, cover=?,
        foreshadowing_json=?, character_state_json=?, chapter_summaries_json=?, volume_outlines_json=?, chapter_memos_json=?,
-       emotion_beats_json=?, conflict_lines_json=?, outline=?, updated_at=? WHERE project_id=?`
+       emotion_beats_json=?, conflict_lines_json=?, outline=?, mainline_progress=?, updated_at=? WHERE project_id=?`
     ).run(
       merged.idea || '', merged.setting || '', merged.characters || '', merged.memory || '',
       merged.review || '', merged.revision || '', merged.cover || '',
@@ -211,6 +211,7 @@ export const stateRepo = {
       JSON.stringify(merged.volumeOutlines || []), JSON.stringify(merged.chapterMemos || []),
       JSON.stringify(merged.emotionBeats || []), JSON.stringify(merged.conflictLines || []),
       merged.outline || '',
+      merged.mainlineProgress || '',
       now(), projectId
     );
     return this.get(projectId);
@@ -652,6 +653,7 @@ function rowToState(r: any): AgentState {
     emotionBeats: parseJSONArr(r.emotion_beats_json),  // 情感线节点追踪: 重启后从 DB 恢复
     conflictLines: parseJSONArr(r.conflict_lines_json), // 矛盾网三层状态机: 重启后从 DB 恢复
     outline: r.outline || '',  // H1 修复(第十二轮): 全书大纲
+    mainlineProgress: r.mainline_progress || '',  // 风险4修复: 全书主线进度（每10章审稿增量更新）
     updatedAt: r.updated_at,
   };
 }
