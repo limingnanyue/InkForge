@@ -1456,7 +1456,16 @@ ${distLine}
       : '你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。';
     const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
     const { complete } = await import('./llm.js');
-    const outlineMaxTokens = Math.min(32000, Math.max(8192, chapterCount * 150));
+    // 第二十六轮修复(89章BUG 根因#1): 原 chapterCount * 150 估算偏低,实际每章 JSON
+    //   (title + outline 50-100字 + hook + positioning + coreEmotion + Σ契约密疏点注解 + JSON结构)
+    //   约 200-340 tokens/章。150 系数导致 120 章仅给 18000 tokens,LLM 在 ~89 章处被
+    //   max_tokens 截断,parseOutline 截断兜底救出 89 章后被单次分支静默接受(根因#2)。
+    //   现改 350 tokens/章(按实际上限 340 + 余量),120 章 → 42000 tokens(被 cap 到 32000),
+    //   按 ~250 tokens/章中位数算可完整输出 ~128 章 > 120,截断不再发生。
+    //   注: cap 32000 对 >150 章场景仍可能不足(200章需 50000+),此时校验#2 会抛错,
+    //   daemon 重试仍截断则 maxRetries 耗尽失败(不再静默少章),用户可改用更大 budget
+    //   降章数或接受分卷生成(>200 章自动走分卷分支,有单卷章数校验)。
+    const outlineMaxTokens = Math.min(32000, Math.max(8192, chapterCount * 350));
     // 200 章输出 ~30000 tokens，正常 2-5 分钟，给 12 分钟 wall timeout 避免误杀（远超 5 分钟默认）
     const outlineWallTimeout = chapterCount > 100 ? 12 * 60 * 1000 : 8 * 60 * 1000;
     const { text: acc } = await complete({
@@ -1472,7 +1481,18 @@ ${distLine}
     //   现与分卷分支一致,走 parseOutline 标准化后 JSON.stringify,确保 state.outline
     //   始终是严格合法 JSON,滑动窗口稳定生效。parseOutline 已增强兼容(嵌套/字段变体)。
     const parsed = parseOutline(acc);
-    if (parsed.length > 0) return JSON.stringify(parsed);
+    if (parsed.length > 0) {
+      // 第二十六轮修复(89章BUG 根因#2): 单次分支加章数校验,防 LLM 输出被 maxTokens
+      //   截断后 parseOutline 救出部分章节被静默接受(原只检查 length>0,89/120 也会通过)。
+      //   参照分卷分支 L1527-1529 的 throw 保护:低于期望章数 90% 视为截断,抛错让 daemon
+      //   重试(配合根因#1 提高系数,重试时 maxTokens 足够完整输出)。允许 10% 浮动避免
+      //   LLM 自然少输出 1-2 章时误触发重试。重试仍截断则 maxRetries 耗尽 → 任务 failed,
+      //   不再静默少章误导用户。
+      if (parsed.length < chapterCount * 0.9) {
+        throw new Error(`大纲章节数不足：${parsed.length}/${chapterCount}（LLM 输出可能被 maxTokens 截断，已提高 token 预算并重试）`);
+      }
+      return JSON.stringify(parsed);
+    }
     // 兜底: parseOutline 全失败时仍返回原始子串(至少 daemon.ts 会再 parse 一次+诊断)
     const match = acc.match(/\[[\s\S]*\]/);
     return match ? match[0] : acc;
