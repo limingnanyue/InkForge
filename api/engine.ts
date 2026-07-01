@@ -1354,8 +1354,12 @@ ${distLine}
     : '你是大纲架构师，遵循 oh-story-claudecode 长篇方法论。输出必须是合法 JSON 数组。';
   const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
   const { complete } = await import('./llm.js');
-  // 单卷最多 20 章，maxTokens 给 8192 足够（20 章 × 150 tokens = 3000，留余量）
-  const volMaxTokens = Math.min(16384, Math.max(4096, volChapterCount * 200));
+  // 第二十六轮修复(分卷大纲截断BUG,与单次分支89章BUG同源): 原 chapterCount * 200 + 下限 4096
+  //   偏低,单卷 20 章 × ~300 tokens/章(含Σ契约注解) = 6000 > 4096,LLM 截断 → parseOutline
+  //   救出 17-19 章 → L1547 章数校验 throw → 本地重试 2 次 maxTokens 不变仍截断 → daemon
+  //   重试耗尽 failed。现与单次分支(L1468)一致: 系数 350 + 下限 8192。
+  //   20 章 → max(8192, 7000) = 8192,留足余量,截断不再发生。
+  const volMaxTokens = Math.min(16384, Math.max(8192, volChapterCount * 350));
   // 单卷输出 ~3000 tokens，正常 30-90s，给 8 分钟 wall timeout 容忍长上下文处理
   const volWallTimeout = 8 * 60 * 1000;
 
@@ -2023,8 +2027,30 @@ ${pendingList || '（无）'}
       const windowSummaries = summaries.filter(s => s.idx >= windowStart && s.idx <= justFinishedIdx);
       characterState = characterState.map(c => {
         const name = c.name;
-        const appeared = name.length > 0 && chapterContent.includes(name);
-        const recentAppearCount = windowSummaries.filter(s => s.summary && s.summary.includes(name)).length;
+        // 第二十六轮修复(角色热度单字名误匹配): 原 chapterContent.includes(name) 对单字名
+        //   (如"林")会匹配"树林""竹林",双字名也可能匹配无关词,导致 appeared 永真、
+        //   recentAppearCount 飙升 → 该角色永久占据 core 层挤掉真活跃角色。
+        //   现: name.length>=2 用 includes(误匹配概率低,可接受);name.length<2(单字名)
+        //   改用称谓边界匹配(名字后跟说/道/看/笑/想/某/师父/师兄/师姐/老/小/公子/小姐等
+        //   常见称呼或标点),降低误匹配。仍无法完全消除,但单字名极少且此规则过滤绝大多数
+        //   "树林/竹林"类误命中。匹配失败则保持旧热度(不虚高)。
+        let appeared: boolean;
+        if (name.length >= 2) {
+          appeared = chapterContent.includes(name);
+        } else if (name.length === 1) {
+          // 单字名: 要求后跟称谓词或标点才算出场(避免"树林"误匹配"林")
+          appeared = new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:说|道|看|笑|想|某|师父|师兄|师姐|师弟|师妹|老|小|公子|小姐|爷|叔|婶|公|儿|[，。！？,!?])`).test(chapterContent);
+        } else {
+          appeared = false;
+        }
+        // recentAppearCount 同样: 单字名用称谓边界匹配摘要,避免"林"在每章摘要都命中
+        const countName = (s: string): boolean => {
+          if (name.length < 2) {
+            return new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:说|道|看|笑|想|某|师父|师兄|师姐|师弟|师妹|老|小|公子|小姐|爷|叔|婶|公|儿|[，。！？,!?])`).test(s);
+          }
+          return s.includes(name);
+        };
+        const recentAppearCount = windowSummaries.filter(s => s.summary && countName(s.summary)).length;
         const lastSeenAt = appeared ? justFinishedIdx : c.lastSeenAt;
         return { ...c, lastSeenAt, recentAppearCount };
       });
