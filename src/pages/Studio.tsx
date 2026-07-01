@@ -4,7 +4,7 @@
  */
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Send, Sparkles, Plus, ChevronRight, Brain, Activity, MessageSquare, Cpu, Globe, Server, Tag, TrendingUp } from 'lucide-react';
+import { Send, Sparkles, Plus, ChevronRight, Brain, Activity, MessageSquare, Cpu, Globe, Server, Tag, TrendingUp, Square, RotateCcw } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
 // 第二十二轮修复(react-bits 集成): Welcome 区用 SplitText/Particles/ShinyButton 替代 BlurText
@@ -23,6 +23,11 @@ export default function Studio() {
   const [input, setInput] = useState('');
   const [streaming, setStreaming] = useState(false);
   const [streamText, setStreamText] = useState('');
+  // 停止生成 / 失败重试相关状态
+  // interruptedMsgId：用户主动停止后，标记后端已保存的那条 partial assistant 消息为"已中断"
+  // localPartial：本地兜底气泡（后端未落库的 partial），kind='stopped' 显示"已中断"，kind='failed' 显示"生成失败"+重试
+  const [interruptedMsgId, setInterruptedMsgId] = useState<string | null>(null);
+  const [localPartial, setLocalPartial] = useState<{ content: string; kind: 'stopped' | 'failed' } | null>(null);
   const [state, setState] = useState<AgentState | null>(null);
   const [webSearch, setWebSearch] = useState(false);
   const [rightTab, setRightTab] = useState<'state' | 'tasks'>('state');
@@ -32,6 +37,10 @@ export default function Studio() {
   // BUG-7 修复：保存 chat.stream handle，unmount 时 cancel
   // 否则切换项目/路由后旧流仍在后台消费 LLM token（烧钱），setStreamText 等更新到已卸载组件触发 React 警告
   const streamHandleRef = useRef<{ cancel: () => void } | null>(null);
+  // 停止生成：stopRequestedRef 区分"用户主动 cancel"与"真实流错误"（catch 中分支处理）
+  // lastInputRef 缓存上一次发送的文本，供失败后重试直接复用
+  const stopRequestedRef = useRef(false);
+  const lastInputRef = useRef('');
   // BUG-13 修复：navigate setTimeout 句柄，unmount 时 clear
   const navTimerRef = useRef<number | null>(null);
   // F6 修复：切项目请求序号，防竞态（旧 promise 后到则丢弃）
@@ -74,6 +83,9 @@ export default function Studio() {
   // F6 修复：(1) 用请求序号防竞态，快速切 A→B 时若 A 的 promise 后到，序号不匹配则丢弃
   // (2) 静默失败 catch(() => {}) 改为 toast 提示，避免后端 500 时用户看不到任何反馈
   useEffect(() => {
+    // 切项目时清空停止/失败标记，避免上一个项目的状态串到新项目
+    setInterruptedMsgId(null);
+    setLocalPartial(null);
     if (!currentProject) { setMessages([]); setState(null); return; }
     const reqSeq = ++loadSeqRef.current;
     api.projects.messages(currentProject.id)
@@ -120,22 +132,35 @@ export default function Studio() {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, streamText]);
 
-  const send = useCallback(async () => {
-    if (!input.trim() || streaming) return;
+  // overrideText：重试时直接传入上一次输入，绕过 input state（setInput 异步，同 tick 不可用）
+  const send = useCallback(async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
+    if (!text || streaming) return;
     if (!currentProject) { toast('请先选择或创建项目', 'err'); return; }
     // BUG-1 修复：捕获当前请求序号，流式完成后校验项目是否已切换，
     // 避免「项目 A 发起对话 → 流式中切到 B → A 的流结束 setMessages(A) 后到」覆盖 B 的列表
     const reqSeq = loadSeqRef.current;
-    const text = input.trim();
+    lastInputRef.current = text;
+    // 清理上一次的停止/失败标记，避免新请求串显示
+    stopRequestedRef.current = false;
+    setInterruptedMsgId(null);
+    setLocalPartial(null);
     setInput('');
     setStreaming(true);
     setStreamText('');
 
+    // 本地累积 partial：catch 中需读取已生成文本（streamText state 闭包陈旧）
+    // 用户停止 → 后端已存 partial 为 assistant 消息，刷新拉取即可
+    // 真实失败 → 后端不存，用 partial 本地兜底显示 + 重试按钮
+    let partial = '';
     const handle = api.chat.stream(
       { projectId: currentProject.id, message: text, model: currentModel, providerId: currentProviderId || undefined, webSearch },
       (delta) => {
         // 防御：组件已卸载或项目已切换则不更新状态(避免串号覆盖 + React 警告)
-        if (mountedRef.current && reqSeq === loadSeqRef.current) setStreamText(s => s + delta);
+        if (mountedRef.current && reqSeq === loadSeqRef.current) {
+          partial += delta;
+          setStreamText(s => s + delta);
+        }
       },
       (meta) => {
         // 守护进程意图：后端返回 navigate 动作，自动跳转
@@ -165,15 +190,56 @@ export default function Studio() {
       const s = await api.projects.state(currentProject.id);
       if (mountedRef.current && reqSeq === loadSeqRef.current) setState(s);
     } catch (e) {
-      if (mountedRef.current) toast((e as Error).message, 'err');
+      if (!mountedRef.current) return;
+      if (stopRequestedRef.current) {
+        // 用户主动停止：后端 chat.ts 在 req 'close' 后异步保存 partial（break for-await → messageRepo.create）
+        // 短暂等待让后端落库，再刷新拉取；命中则标记"已中断"，未命中用本地 partial 兜底防丢失
+        await new Promise(r => setTimeout(r, 400));
+        let saved = false;
+        try {
+          const msgs = await api.projects.messages(currentProject.id);
+          if (mountedRef.current && reqSeq === loadSeqRef.current) {
+            setMessages(msgs);
+            const last = msgs[msgs.length - 1];
+            // 内容吻合才标记，防竞态误标上一条旧 assistant 消息
+            if (last && last.role === 'assistant' && partial.trim() && last.content.includes(partial.slice(0, 40))) {
+              setInterruptedMsgId(last.id);
+              saved = true;
+            }
+          }
+        } catch { /* 刷新失败,走本地兜底 */ }
+        if (!saved && partial.trim() && mountedRef.current) {
+          setLocalPartial({ content: partial, kind: 'stopped' });
+        }
+        toast('已停止生成');
+      } else {
+        // 真实流式错误：后端不会保存 assistant 消息，本地保留 partial + 重试按钮
+        setLocalPartial({ content: partial, kind: 'failed' });
+        toast((e as Error).message, 'err');
+      }
     } finally {
       streamHandleRef.current = null;
+      stopRequestedRef.current = false;
       if (mountedRef.current) {
         setStreaming(false);
         setStreamText('');
       }
     }
   }, [input, streaming, currentProject, currentModel, currentProviderId, webSearch, toast, navigate]);
+
+  // 停止生成：标记后调 cancel，send 的 catch 据 stopRequestedRef 分支处理
+  const stop = useCallback(() => {
+    stopRequestedRef.current = true;
+    streamHandleRef.current?.cancel();
+  }, []);
+
+  // 重试：用缓存的 lastInput 重新调 send，清空失败态
+  const retry = useCallback(() => {
+    const last = lastInputRef.current;
+    if (!last) return;
+    setLocalPartial(null);
+    void send(last);
+  }, [send]);
 
   const toggleWebSearch = async () => {
     if (!currentProject) return;
@@ -296,8 +362,28 @@ export default function Studio() {
                 />
               ) : (
                 <div className="space-y-5">
-                  {messages.map(m => <MessageBubble key={m.id} role={m.role} content={m.content} />)}
+                  {messages.map(m => (
+                    <MessageBubble key={m.id} role={m.role} content={m.content} interrupted={m.id === interruptedMsgId} />
+                  ))}
                   {streaming && <MessageBubble role="assistant" content={streamText} streaming />}
+                  {/* 本地兜底气泡：停止竞态未落库的 partial（已中断）或真实失败 partial（生成失败 + 重试） */}
+                  {localPartial && !streaming && (
+                    <div className="flex animate-fade-up justify-start">
+                      <div className="max-w-[85%] rounded-lg px-4 py-3 panel-elevated">
+                        {localPartial.content.trim() && (
+                          <p className="text-sm leading-relaxed prose-ink">{localPartial.content}</p>
+                        )}
+                        <div className="mt-2 flex items-center gap-2 border-t pt-2" style={{ borderColor: 'var(--ink-600)' }}>
+                          <span className="badge badge-red text-[10px]">{localPartial.kind === 'failed' ? '生成失败' : '已中断'}</span>
+                          {localPartial.kind === 'failed' && (
+                            <button className="btn-ghost px-2 py-1 text-xs" onClick={retry} title="用上一次输入重新生成">
+                              <RotateCcw size={12} /> 重试
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -323,9 +409,15 @@ export default function Studio() {
                   disabled={!currentProject || streaming}
                   rows={1}
                 />
-                <button className="btn-primary py-3" onClick={send} disabled={!input.trim() || streaming || !currentProject}>
-                  {streaming ? <Spinner className="h-4 w-4" /> : <Send size={16} />}
-                </button>
+                {streaming ? (
+                  <button className="btn-danger py-3 px-4" onClick={stop} title="停止生成">
+                    <Square size={13} fill="currentColor" className="mr-1" /> 停止
+                  </button>
+                ) : (
+                  <button className="btn-primary py-3" onClick={() => send()} disabled={!input.trim() || !currentProject}>
+                    <Send size={16} />
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -381,7 +473,7 @@ function Welcome({ onCreate }: { onCreate: () => void }) {
   );
 }
 
-function MessageBubble({ role, content, streaming }: { role: string; content: string; streaming?: boolean }) {
+function MessageBubble({ role, content, streaming, interrupted }: { role: string; content: string; streaming?: boolean; interrupted?: boolean }) {
   const isUser = role === 'user';
   return (
     <div className={cn('flex animate-fade-up', isUser ? 'justify-end' : 'justify-start')}>
@@ -390,6 +482,11 @@ function MessageBubble({ role, content, streaming }: { role: string; content: st
         <p className={cn('text-sm leading-relaxed', isUser ? 'text-paper' : 'prose-ink', streaming && 'caret')}>
           {content || (streaming ? '' : '…')}
         </p>
+        {interrupted && (
+          <div className="mt-2 flex items-center gap-1.5 border-t pt-1.5" style={{ borderColor: 'var(--ink-600)' }}>
+            <span className="badge badge-red text-[10px]">已中断</span>
+          </div>
+        )}
       </div>
     </div>
   );

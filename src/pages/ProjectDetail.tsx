@@ -3,7 +3,7 @@
  */
 import { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play, Sliders, Image as ImageIcon, Download, RotateCw } from 'lucide-react';
+import { ArrowLeft, Plus, Sparkles, Wand2, Camera, Eye, Pencil, Globe, Trash2, Play, Sliders, Image as ImageIcon, Download, RotateCw, ListChecks } from 'lucide-react';
 import { api } from '@/api/client';
 import { useApp } from '@/stores/app';
 import { Spinner, ProgressBar, fmtWords, Modal, useToast, Switch, Field, SegmentedControl, Slider } from '@/components/ui';
@@ -12,7 +12,7 @@ import type { Project, Chapter, ChapterNode, AgentState, ProviderKind } from '@s
 import { cn } from '@/lib/utils';
 // L1 修复(第二十轮): 抽取自 @/lib/project 的共享常量,与 Projects.tsx 共用
 import { TYPE_LABEL, TYPE_BADGE } from '@/lib/project';
-import ChapterTree, { flatten, countSnapshots, mutateNode } from './ChapterTree';
+import ChapterTree, { flatten, countSnapshots, mutateNode, type DropPosition } from './ChapterTree';
 import { POSITIONING_LABEL, POSITIONING_TARGET_RATIO, POSITIONING_BAR_COLOR, POSITIONING_ORDER } from '@/lib/positioning';
 
 const STATUS: Record<string, [string, string]> = {
@@ -58,6 +58,13 @@ export default function ProjectDetail() {
   //   现在编辑器顶栏加「删除」按钮,弹出 Modal 二次确认
   const [chapterDeleteTarget, setChapterDeleteTarget] = useState<ChapterNode | null>(null);
   const [chapterDeleteBusy, setChapterDeleteBusy] = useState(false);
+  // 批量操作模式：toggle 默认关闭，避免影响单选交互；批量模式禁用拖拽
+  const [batchMode, setBatchMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
+  const [batchDeleteBusy, setBatchDeleteBusy] = useState(false);
+  const [batchRefineBusy, setBatchRefineBusy] = useState(false);
+  const [batchStatusBusy, setBatchStatusBusy] = useState(false);
   const [continueBusy, setContinueBusy] = useState(false);
   const [refineBookBusy, setRefineBookBusy] = useState(false);
   // BUG1 修复: 续写时让用户选 chapterWordBudget(默认从项目历史章节平均字数推断)
@@ -306,6 +313,87 @@ export default function ProjectDetail() {
       setChapterDeleteTarget(null);
     } catch (e) { toast((e as Error).message, 'err'); }
     finally { setChapterDeleteBusy(false); }
+  };
+
+  // 切项目时重置批量模式与多选（避免上一项目的 selectedIds 串到新项目）
+  useEffect(() => {
+    setBatchMode(false);
+    setSelectedIds(new Set());
+  }, [id]);
+
+  // 批量选择 toggle：Set<string> 管理多选
+  const toggleSelect = useCallback((cid: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(cid)) next.delete(cid); else next.add(cid);
+      return next;
+    });
+  }, []);
+
+  // 章节树拖拽排序：调 api.chapters.move 重算同级 order_idx，刷新树
+  const onMoveNode = useCallback(async (sourceId: string, targetId: string, position: DropPosition) => {
+    if (!id) return;
+    try {
+      await api.chapters.move(sourceId, targetId, position);
+      const fresh = await api.projects.chapters(id);
+      setTree(fresh);
+      setSelected(prev => prev ? (flatten(fresh).find(c => c.id === prev.id) ?? prev) : prev);
+      toast('已移动章节');
+    } catch (e) { toast((e as Error).message, 'err'); }
+  }, [id, toast]);
+
+  // 批量精修：循环派发 refine 任务到守护进程（复用 api.chapters.refine，限定 selectedIds）
+  const batchRefine = async () => {
+    if (selectedIds.size === 0) return;
+    setBatchRefineBusy(true);
+    let okCount = 0, failCount = 0;
+    try {
+      for (const cid of selectedIds) {
+        try { await api.chapters.refine(cid); okCount++; }
+        catch { failCount++; }
+      }
+      toast(`已派发 ${okCount} 个精修任务${failCount ? `，${failCount} 个失败（可能已有任务在跑）` : ''}`);
+      if (id) loadTasks(id);
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setBatchRefineBusy(false); }
+  };
+
+  // 批量改状态：循环调 api.chapters.update 设为草稿
+  const batchSetDraft = async () => {
+    if (selectedIds.size === 0) return;
+    setBatchStatusBusy(true);
+    let okCount = 0, failCount = 0;
+    try {
+      for (const cid of selectedIds) {
+        try { await api.chapters.update(cid, { status: 'draft' }); okCount++; }
+        catch { failCount++; }
+      }
+      toast(`已将 ${okCount} 个章节设为草稿${failCount ? `，${failCount} 个失败` : ''}`);
+      await load();
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setBatchStatusBusy(false); }
+  };
+
+  // 批量删除确认：弹 Modal "确认删除 N 个章节？"，循环调 api.chapters.delete
+  const confirmBatchDelete = async () => {
+    if (!id || selectedIds.size === 0) return;
+    setBatchDeleteBusy(true);
+    let okCount = 0, failCount = 0;
+    try {
+      for (const cid of selectedIds) {
+        try { await api.chapters.delete(cid); okCount++; }
+        catch { failCount++; }
+      }
+      toast(`已删除 ${okCount} 个章节${failCount ? `，${failCount} 个失败` : ''}`);
+      setBatchDeleteOpen(false);
+      setSelectedIds(new Set());
+      const fresh = await api.projects.chapters(id);
+      setTree(fresh);
+      const flat = flatten(fresh);
+      setSnapshotCount(countSnapshots(flat));
+      setSelected(prev => prev ? (flat.find(c => c.id === prev.id) ?? flat[0] ?? null) : null);
+    } catch (e) { toast((e as Error).message, 'err'); }
+    finally { setBatchDeleteBusy(false); }
   };
 
   const toggleWebSearch = async () => {
@@ -747,11 +835,49 @@ export default function ProjectDetail() {
         <aside className="hidden w-72 shrink-0 flex-col border-r md:flex" style={{ borderColor: 'var(--ink-600)', background: 'var(--ink-800)' }}>
           <div className="flex items-center justify-between border-b px-3 py-2.5" style={{ borderColor: 'var(--ink-600)' }}>
             <span className="text-xs font-medium text-paper-mute">章节</span>
-            <button className="flex items-center gap-1 text-xs text-amber hover:text-amber-bright" onClick={newChapter}><Plus size={13} /> 新建</button>
+            <div className="flex items-center gap-2">
+              {/* 批量操作 toggle：开启后每行显示 checkbox，禁用拖拽；默认关闭不影响单选 */}
+              <button
+                className={cn('flex items-center gap-1 text-xs', batchMode ? 'text-amber' : 'text-paper-mute hover:text-paper-dim')}
+                onClick={() => { setBatchMode(v => !v); if (batchMode) setSelectedIds(new Set()); }}
+                title={batchMode ? '退出批量操作' : '批量操作模式（拖拽将被禁用）'}
+              >
+                <ListChecks size={13} /> {batchMode ? '退出批量' : '批量'}
+              </button>
+              <button className="flex items-center gap-1 text-xs text-amber hover:text-amber-bright" onClick={newChapter}><Plus size={13} /> 新建</button>
+            </div>
           </div>
+          {/* 批量操作工具栏：批量精修 / 批量删除 / 批量改状态 / 取消选择 */}
+          {batchMode && (
+            <div className="flex flex-wrap items-center gap-1.5 border-b px-3 py-2" style={{ borderColor: 'var(--ink-600)' }}>
+              <span className="text-[11px] text-paper-mute">已选 {selectedIds.size}</span>
+              <button className="btn-ghost py-1 text-[11px]" onClick={batchRefine} disabled={batchRefineBusy || selectedIds.size === 0} title="批量派发精修任务到守护进程">
+                {batchRefineBusy ? <Spinner className="h-3 w-3" /> : <Wand2 size={11} />} 批量精修
+              </button>
+              <button className="btn-ghost py-1 text-[11px]" onClick={batchSetDraft} disabled={batchStatusBusy || selectedIds.size === 0} title="把选中章节状态改为草稿">
+                {batchStatusBusy ? <Spinner className="h-3 w-3" /> : null} 设为草稿
+              </button>
+              <button className="btn-ghost py-1 text-[11px] text-cinnabar" onClick={() => setBatchDeleteOpen(true)} disabled={selectedIds.size === 0}>
+                <Trash2 size={11} /> 批量删除
+              </button>
+              <button className="btn-ghost py-1 text-[11px] ml-auto" onClick={() => setSelectedIds(new Set())} disabled={selectedIds.size === 0}>
+                取消选择
+              </button>
+            </div>
+          )}
           <div className="flex-1 overflow-y-auto p-2">
             {tree.length === 0 ? <p className="px-2 py-4 text-center text-xs text-paper-mute">尚无章节</p> :
-              <ChapterTree nodes={tree} collapsed={collapsed} setCollapsed={setCollapsed} selectedId={selected?.id} onSelect={onSelect} />}
+              <ChapterTree
+                nodes={tree}
+                collapsed={collapsed}
+                setCollapsed={setCollapsed}
+                selectedId={selected?.id}
+                onSelect={onSelect}
+                batchMode={batchMode}
+                selectedIds={selectedIds}
+                onToggleSelect={toggleSelect}
+                onMoveNode={onMoveNode}
+              />}
           </div>
           <div className="border-t px-3 py-2 text-[11px] text-paper-mute" style={{ borderColor: 'var(--ink-600)' }}>
             共 {chapterCount} 章 · 快照 {snapshotCount}
@@ -1439,6 +1565,22 @@ export default function ProjectDetail() {
           <button className="btn-ghost" onClick={() => setChapterDeleteTarget(null)} disabled={chapterDeleteBusy}>取消</button>
           <button className="btn-danger" onClick={confirmDeleteChapter} disabled={chapterDeleteBusy}>
             {chapterDeleteBusy ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 删除章节
+          </button>
+        </div>
+      </Modal>
+
+      {/* 批量删除确认弹窗：复用 chapterDeleteTarget 逻辑但改为数组，弹 Modal 确认 N 个章节 */}
+      <Modal open={batchDeleteOpen} onClose={() => setBatchDeleteOpen(false)} title="批量删除章节">
+        <p className="text-sm leading-relaxed text-paper-dim">
+          确定删除选中的 <span className="font-display text-cinnabar">{selectedIds.size}</span> 个章节吗？
+        </p>
+        <p className="mt-2 text-xs leading-relaxed text-paper-mute">
+          该操作不可恢复，将一并删除其子章节（若存在）与正文快照。
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <button className="btn-ghost" onClick={() => setBatchDeleteOpen(false)} disabled={batchDeleteBusy}>取消</button>
+          <button className="btn-danger" onClick={confirmBatchDelete} disabled={batchDeleteBusy}>
+            {batchDeleteBusy ? <Spinner className="h-4 w-4" /> : <Trash2 size={14} />} 删除 {selectedIds.size} 章
           </button>
         </div>
       </Modal>

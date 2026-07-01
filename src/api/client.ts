@@ -63,6 +63,9 @@ export const api = {
     generate: (id: string, prompt?: string) =>
       req<Task>(`/chapters/${id}/generate`, { method: 'POST', body: JSON.stringify({ prompt }) }),
     refine: (id: string) => req<Task>(`/chapters/${id}/refine`, { method: 'POST' }),
+    // 拖拽排序：把 id 移到 targetId 之前/之后/内部，后端重算同级 order_idx
+    move: (id: string, targetId: string, position: 'before' | 'after' | 'inside') =>
+      req<Chapter>(`/chapters/${id}/move`, { method: 'PATCH', body: JSON.stringify({ targetId, position }) }),
   },
   chat: {
     // SSE 流式对话：正确解析 event:/data: 事件块

@@ -6,7 +6,7 @@
  */
 import { streamComplete, type LLMOptions } from './llm.js';
 import { stateRepo, chapterRepo, genreRepo, projectRepo } from './repos.js';
-import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, ChapterSummary, ChapterPositioning, VolumeOutline } from '@shared/types';
+import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, CharacterState, ChapterSummary, ChapterPositioning, VolumeOutline, ChapterMemo } from '@shared/types';
 
 // 题材元信息注入: 反查 genreId 拿 description + emotionMap,拼成 prompt 段
 // 原实现: 主线生成只用 config.genre(label),题材说明/情绪映射完全未注入,LLM 写作风格缺少题材特征引导
@@ -176,25 +176,82 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
   }
 
   // —— 角色实时状态（防人设漂移 / 位置穿帮）——
-  // M1 修复(第十五轮): characterState 限最近活跃 15 角色,防长篇后期 prompt 被撑爆
-  // 原: 全量注入,200 章长篇累积 50+ 角色 × 250 字 = 12500 字/章 → 200 章 250 万字浪费
-  // 现: 按 characterState 数组顺序(最近更新的在后)取末尾 15 个;实际最近活跃角色多在末尾
-  //   注:characterState 是 LLM 每章后 merge 的,末尾的是最近出场角色
+  // 第二十六轮重写(角色热度四态,参考 oh-story 热度四态 + inkos 角色矩阵):
+  //   原: characterState.slice(-15) 全量注入最近 15 个 + 头部 5 个名字预警(M1 第十五轮)。
+  //   问题: 主角若连续 6 章未出场被配角挤掉 slice(-15),buildDynamicContext 看不到主角状态 → 人设漂移。
+  //   现: 按 lastSeenAt/recentAppearCount(updateStateFromGeneration 规则式补全)分四态分层注入:
+  //     核心(rac>=5 或 lastSeenAt===curIdx) + 活跃(rac 2-4): 完整状态注入(最多 15 个)
+  //     边缘(rac 1 或 lastSeenAt 在最近 20 章内) + 失踪(lastSeenAt 距 curIdx>20 章 或 rac 0): 仅名字(最多 10 个)
+  //     主角保底: state.characters 第一个名字强制完整注入,即使被分到边缘/失踪
+  //   旧数据无 lastSeenAt/recentAppearCount 时降级到原 slice(-15) + 防遗忘预警逻辑(向后兼容)。
   if (state.characterState && state.characterState.length > 0) {
-    const recentChars = state.characterState.slice(-15);
-    const omitted = state.characterState.length - recentChars.length;
-    sections.push(`【角色当前状态${omitted > 0 ? `（最近 ${recentChars.length} 个,省略 ${omitted} 个更早角色）` : ''}】\n${recentChars.map(c => `· ${c.name}：位置「${c.location}」/ 状态「${c.mood}」/ 关系「${c.relationships}」`).join('\n')}`);
-    // 第二十五轮优化(记忆错乱,参考 oh-story 热度四态 + inkos 角色矩阵):
-    //   characterState 经 splice+push 重排,数组头部=久未出场、尾部=最近活跃。
-    //   长篇后期角色 30+,被 slice(-15) 省略的头部角色长期不在 prompt → LLM 遗忘其存在
-    //   → 出现"已登场角色被当新角色介绍""配角消失后再不出现"等记忆错乱。
-    //   补「久未出场」预警:列出头部最多 5 个角色名,提示 LLM 本章可考虑让其一出场回顾,
-    //   既防遗忘又不撑爆 token(仅名字,无状态详情)。
-    if (omitted > 0) {
-      const forgotten = state.characterState.slice(0, Math.min(5, omitted)).map(c => c.name).filter(Boolean);
-      if (forgotten.length > 0) {
-        sections.push(`【久未出场角色 · 防遗忘】${forgotten.join('、')}（已超过 15 章未在最近活跃列表;若本章剧情涉及,可让其出场回顾,避免读者遗忘）`);
+    const allChars = state.characterState;
+    const hasHeat = allChars.some(c => typeof c.lastSeenAt === 'number' || typeof c.recentAppearCount === 'number');
+    const fmtFull = (c: CharacterState) => `· ${c.name}：位置「${c.location}」/ 状态「${c.mood}」/ 关系「${c.relationships}」`;
+    if (!hasHeat) {
+      // 旧数据降级: 原 slice(-15) + 头部 5 个防遗忘预警
+      const recentChars = allChars.slice(-15);
+      const omitted = allChars.length - recentChars.length;
+      sections.push(`【角色当前状态${omitted > 0 ? `（最近 ${recentChars.length} 个,省略 ${omitted} 个更早角色）` : ''}】\n${recentChars.map(fmtFull).join('\n')}`);
+      if (omitted > 0) {
+        const forgotten = allChars.slice(0, Math.min(5, omitted)).map(c => c.name).filter(Boolean);
+        if (forgotten.length > 0) {
+          sections.push(`【久未出场角色 · 防遗忘】${forgotten.join('、')}（已超过 15 章未在最近活跃列表;若本章剧情涉及,可让其出场回顾,避免读者遗忘）`);
+        }
       }
+    } else {
+      // 热度四态分组(优先级 core > active > edge > missing,互斥)
+      const core: CharacterState[] = [];
+      const active: CharacterState[] = [];
+      const edge: CharacterState[] = [];
+      const missing: CharacterState[] = [];
+      for (const c of allChars) {
+        const rac = typeof c.recentAppearCount === 'number' ? c.recentAppearCount : 0;
+        const lsa = typeof c.lastSeenAt === 'number' ? c.lastSeenAt : -1;
+        if (rac >= 5 || lsa === curIdx) core.push(c);
+        else if (rac >= 2) active.push(c);                  // 2-4(rac>=5 已进 core)
+        else if (rac >= 1 || (lsa >= 0 && lsa >= curIdx - 20)) edge.push(c);
+        else missing.push(c);                                // lsa 距 curIdx>20 章 或 rac 0
+      }
+      // 主角识别: state.characters 第一个中文人名(2-4 字 + 后续 :/：/换行),失败降级 characterState[0]
+      let protagonistName: string | null = null;
+      if (state.characters) {
+        const m = state.characters.match(/([\u4e00-\u9fa5]{2,4})\s*[：:\n]/);
+        if (m && m[1]) protagonistName = m[1];
+      }
+      if (!protagonistName) protagonistName = allChars[0]?.name || null;
+
+      // 完整注入: core + active,按 recentAppearCount 降序(同则 lastSeenAt 降序),最多 15
+      const fullList = [...core, ...active]
+        .sort((a, b) => (b.recentAppearCount ?? 0) - (a.recentAppearCount ?? 0) || (b.lastSeenAt ?? -1) - (a.lastSeenAt ?? -1))
+        .slice(0, 15);
+      // 名字注入: edge + missing,按 lastSeenAt 降序(最近见过优先),最多 10
+      const nameList = [...edge, ...missing]
+        .sort((a, b) => (b.lastSeenAt ?? -1) - (a.lastSeenAt ?? -1))
+        .slice(0, 10);
+      // 主角保底: 若主角不在完整注入集,且确实存在于 characterState,强制补完整状态
+      const fullNames = new Set(fullList.map(c => c.name));
+      const protagonist = protagonistName && !fullNames.has(protagonistName)
+        ? allChars.find(c => c.name === protagonistName) ?? null
+        : null;
+
+      const lines: string[] = [];
+      if (fullList.length > 0) {
+        const coreNames = new Set(core.map(c => c.name));
+        lines.push(`【角色当前状态 · 核心与活跃】（核心${core.length}/活跃${active.length},完整注入 ${fullList.length} 个）`);
+        for (const c of fullList) {
+          lines.push(`${coreNames.has(c.name) ? '【核心】' : '【活跃】'}${fmtFull(c)}`);
+        }
+      }
+      if (protagonist) {
+        lines.push(`【主角保底】${fmtFull(protagonist)}`);
+      }
+      if (nameList.length > 0) {
+        const edgeNames = new Set(edge.map(c => c.name));
+        const parts = nameList.map(c => edgeNames.has(c.name) ? `${c.name}【边缘】` : `${c.name}【失踪·可考虑回归】`);
+        lines.push(`【边缘与失踪角色 · 仅名】（边缘${edge.length}/失踪${missing.length},列出 ${nameList.length} 个）：${parts.join('、')}`);
+      }
+      if (lines.length > 0) sections.push(lines.join('\n'));
     }
   }
 
@@ -313,6 +370,183 @@ export async function reconcileState(
     }
   }
   return { backfilled, issues: allIssues };
+}
+
+// ============ chapter_memo 七段契约（inkos chapter_memo + hook 账本硬对账）============
+// 与 buildChapterAnchor 软约束互补: anchor 是 prompt 段落(软约束,靠 LLM 自觉遵守),
+// memo 是结构化字段(硬契约,生成后由 verifyMemoCompliance 规则式硬对账)。
+// 七段: ① 目标 ② 钩子 ③ 伏笔(埋/收/推) ④ 角色弧线 ⑤ 字数预算 ⑥ 情绪强度 ⑦ 承接要点
+//
+// 持久化说明: AgentState.chapterMemos 是逻辑字段(任务要求新增)。
+// agent_state 表无 chapter_memos 列(任务约束 DB schema 不变 + 只改 3 个文件),
+// 故此处用模块级 Map 作为物理存储(进程内有效,重启后丢失 - 可接受,memo 是补充非替代,
+// 重启续写时 reconcileState 会补全章节摘要,下一章重新生成 memo 即可)。
+// upsertChapterMemo 同步调 stateRepo.update 透传 chapterMemos(当前为 DB 持久化空操作,
+// 若未来 agent_state 加 chapter_memos_json 列则自动落库,无需改 daemon.ts)。
+const _chapterMemosByProject = new Map<string, ChapterMemo[]>();
+
+export function getChapterMemos(projectId: string): ChapterMemo[] {
+  return _chapterMemosByProject.get(projectId) || [];
+}
+
+export function getChapterMemo(projectId: string, idx: number): ChapterMemo | undefined {
+  return (_chapterMemosByProject.get(projectId) || []).find(m => m.idx === idx);
+}
+
+export function upsertChapterMemo(projectId: string, memo: ChapterMemo): ChapterMemo[] {
+  const cur = _chapterMemosByProject.get(projectId) || [];
+  const updated = [...cur.filter(m => m.idx !== memo.idx), memo];
+  _chapterMemosByProject.set(projectId, updated);
+  // 透传到 state.chapterMemos(逻辑字段,当前 DB 无对应列,此调用为空操作但保留以兼容未来 schema 扩展)
+  try { stateRepo.update(projectId, { chapterMemos: updated }); } catch { /* 忽略,不影响主流程 */ }
+  return updated;
+}
+
+// 生成章节 memo(调 LLM 输出七段契约 JSON)。失败返回 null,不阻断生成(调用方跳过 memo 流程)。
+// model/providerId 由调用方传入(daemon.ts 章节循环里已有),与 updateStateFromGeneration 的 LLM 调用模式一致。
+export async function generateChapterMemo(
+  projectId: string,
+  currentIdx: number,
+  totalChapters: number,
+  chapterTitle: string,
+  chapterOutline: string,
+  positioning: ChapterPositioning | undefined,
+  coreEmotion: string | undefined,
+  wordBudget: number,
+  wordMin: number | undefined,
+  wordMax: number | undefined,
+  model: string,
+  providerId?: string,
+): Promise<ChapterMemo | null> {
+  // 取上一章末尾用于承接(参考 buildChapterAnchor 的 getTail)
+  const prevTail = currentIdx > 0 ? chapterRepo.getTail(projectId, currentIdx - 1) : '';
+  // 取待回收伏笔(参考 buildDynamicContext 的 pending 列表)
+  const state = stateRepo.get(projectId);
+  const pending = (state?.foreshadowing || [])
+    .filter(f => f.status === 'planted')
+    .slice(0, 15)
+    .map(f => `- ${f.desc}（第${f.plantedAt + 1}章埋设${f.importance === 'high' ? '·主线' : ''}）`)
+    .join('\n');
+
+  const prompt = `请为以下章节生成「chapter_memo 七段契约」JSON,作为本章正文生成的硬契约。后续会做规则式硬对账(伏笔 desc 前 4 字关键词必须出现在正文,章末 200 字必须含钩子信号词)。
+
+【章节信息】第 ${currentIdx + 1} / ${totalChapters} 章《${chapterTitle}》
+【本章大纲】${chapterOutline}
+【章节定位】${positioning || '未指定'}
+【核心情绪】${coreEmotion || '未指定'}
+【字数预算】${wordBudget} 字${wordMin && wordMax ? `（区间 ${wordMin}-${wordMax}）` : ''}
+
+【上一章末尾 300 字】（用于承接要点,首章无）
+${prevTail || '（首章,无上一章）'}
+
+【待回收伏笔】（本章可考虑回收其一,过期伏笔不可再埋）
+${pending || '（无）'}
+
+输出 JSON,严格遵循以下七段契约结构(只输出 JSON,不要 markdown 代码块,不要其他文字):
+{
+  "objectives": "1.本章目标:必达情节点(从大纲提炼,2-4 个用分号分隔,具体到事件)",
+  "hook": "2.本章钩子:章末 200 字悬念元素具体描述(具体到动作/物件/未解问题,不要笼统说'留悬念')",
+  "plantForeshadows": ["3.本章埋设的伏笔 desc 列表(每个 desc 8-30 字,描述具体物件/线索/谜团,可空数组)"],
+  "payForeshadows": ["3.本章回收的伏笔 desc 列表(从上方待回收伏笔中选,desc 尽量与原文一致,可空数组)"],
+  "advanceForeshadows": ["3.本章推进的伏笔 desc 列表(已有伏笔的进一步线索推进,可空数组)"],
+  "characterArcs": [{"name": "角色名", "arc": "本章弧线节点(如 V形坠谷反弹/递进新台阶/延迟满足拐点等)"}],
+  "emotionIntensity": "6.情绪强度 + 核心情绪(如 '4级·爽感释放' / '2级·治愈',1-5 级)",
+  "carryOver": "7.承接要点:上一章末尾场景 + 必须自然衔接的元素(首章可写'开篇直入主线')"
+}`;
+
+  const ctxPrompt = buildContextPrompt(projectId, currentIdx);
+  const systemStable = ctxPrompt
+    ? `${ctxPrompt}\n\n你是长篇写作结构化契约设计师,遵循 inkos chapter_memo 七段契约方法论。输出必须是合法 JSON,不要 markdown 代码块。`
+    : '你是长篇写作结构化契约设计师,遵循 inkos chapter_memo 七段契约方法论。输出必须是合法 JSON,不要 markdown 代码块。';
+  const messages: ChatCompletionMessage[] = [{ role: 'user', content: prompt }];
+
+  try {
+    const { complete } = await import('./llm.js');
+    // maxTokens 控制在 800(任务要求精简,每章 +1 次 LLM 调用成本可控)
+    const { text } = await complete({
+      providerId, model, messages, systemStable, projectId,
+      temperature: 0.4, maxTokens: 800,
+    });
+    // 提取 JSON(兼容 ```json 代码块包裹 + 末尾多余说明)
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    let parsed: any;
+    try {
+      parsed = JSON.parse(match[0]);
+    } catch {
+      // 截断兜底:从后向前找合法对象边界 } 补全后尝试 parse(参考 updateStateFromGeneration)
+      const start = match[0].indexOf('{');
+      if (start < 0) return null;
+      const tail = match[0].slice(start);
+      let ok = false;
+      for (let i = tail.length - 1; i >= 0; i--) {
+        if (tail[i] !== '}') continue;
+        const next = tail[i + 1];
+        if (next === undefined || next === ',' || next === ' ' || next === '\n' || next === '\r' || next === '\t') {
+          try { parsed = JSON.parse(tail.slice(0, i + 1)); ok = true; break; } catch { /* 继续找更早边界 */ }
+        }
+      }
+      if (!ok) return null;
+    }
+
+    const asArr = (v: unknown): string[] => Array.isArray(v) ? v.map(x => String(x || '').slice(0, 120)).filter(Boolean) : [];
+    const asCharArcs = (v: unknown): { name: string; arc: string }[] => {
+      if (!Array.isArray(v)) return [];
+      return v
+        .filter((x: any) => x && typeof x.name === 'string')
+        .map((x: any) => ({ name: String(x.name).slice(0, 40), arc: String(x.arc || '').slice(0, 80) }));
+    };
+
+    const memo: ChapterMemo = {
+      idx: currentIdx,
+      objectives: String(parsed.objectives || '').slice(0, 300) || `（第${currentIdx + 1}章目标,见大纲）`,
+      hook: String(parsed.hook || '').slice(0, 200),
+      plantForeshadows: asArr(parsed.plantForeshadows),
+      payForeshadows: asArr(parsed.payForeshadows),
+      advanceForeshadows: asArr(parsed.advanceForeshadows),
+      characterArcs: asCharArcs(parsed.characterArcs),
+      wordBudget,
+      emotionIntensity: String(parsed.emotionIntensity || '').slice(0, 60) || (coreEmotion || '未指定'),
+      carryOver: String(parsed.carryOver || '').slice(0, 200),
+      createdAt: Date.now(),
+    };
+    return memo;
+  } catch (e) {
+    console.warn(`[generateChapterMemo] 第 ${currentIdx + 1} 章 memo 生成失败(跳过 memo 流程):`, (e as Error).message);
+    return null;
+  }
+}
+
+// 规则式硬对账(纯函数,不调 LLM): 检查正文是否兑现 memo 契约。
+// ① plantForeshadows / payForeshadows 的每个 desc 取前 4 字作关键词,必须在正文出现
+// ② hook 信号词检测: 章末 200 字含 ？/！/省略号/然而/不料 等之一(复用 checkChapterQuality 的 hookSignals 思路)
+// 返回 passed=false + missing 列表(未兑现的伏笔 desc + 钩子缺失描述),供 checkChapterQuality 拼到重写 prompt。
+export function verifyMemoCompliance(content: string, memo: ChapterMemo): { passed: boolean; missing: string[] } {
+  const missing: string[] = [];
+  // ① 伏笔 desc 关键词检测(取 desc 前 4 字作关键词,中文 desc 通常前 4 字足以定位)
+  const checkForeshadow = (desc: string, kind: '埋设' | '回收' | '推进'): void => {
+    if (!desc) return;
+    const kw = desc.slice(0, 4);
+    // 短 desc(< 4 字)走全等包含,避免短关键词误匹配
+    const hit = kw.length < 4 ? content.includes(desc) : content.includes(kw);
+    if (!hit) missing.push(`伏笔未兑现(${kind}):「${desc}」关键词「${kw}」未在正文出现`);
+  };
+  for (const d of memo.plantForeshadows) checkForeshadow(d, '埋设');
+  for (const d of memo.payForeshadows) checkForeshadow(d, '回收');
+  // advanceForeshadows 也检测(推进的伏笔应有线索出现)
+  for (const d of memo.advanceForeshadows) checkForeshadow(d, '推进');
+
+  // ② hook 信号词检测(章末 200 字)
+  if (content.length > 500 && memo.hook) {
+    const tail200 = content.slice(-200);
+    const hookSignals = ['？', '！', '...', '……', '然而', '可是', '不料', '突然', '只见', '下一', '未完', '究竟', '难道', '谁知', '倒底', '到底'];
+    const hasHook = hookSignals.some(s => tail200.includes(s));
+    if (!hasHook) {
+      missing.push(`章末钩子缺失:memo 钩子「${memo.hook.slice(0, 40)}」未在章末 200 字检测到悬念信号词(？/！/省略号/然而/不料等)`);
+    }
+  }
+
+  return { passed: missing.length === 0, missing };
 }
 
 // 章节生成前的位置锚点：告诉 LLM 当前在第几章、已完成多少、本章目标 + 上一章结尾用于自然衔接
@@ -667,8 +901,11 @@ export async function checkChapterQuality(opts: {
   // 第二十六轮新增: 用户配置的上下限(若有),字数门按此做硬判定而非 wordBudget*1.5
   chapterWordMin?: number;
   chapterWordMax?: number;
+  // chapter_memo 七段契约(inkos): 若提供,则调用 verifyMemoCompliance 做规则式硬对账,
+  // missing 项作为 issues 拼到重写 prompt 让 LLM 补齐(伏笔 desc 关键词 + 章末钩子信号词)
+  memo?: ChapterMemo;
 }): Promise<ChapterQualityResult> {
-  const { projectId, model, providerId, chapterIdx, chapterTitle, outline, positioning, coreEmotion, content, wordBudget, chapterWordMin, chapterWordMax } = opts;
+  const { projectId, model, providerId, chapterIdx, chapterTitle, outline, positioning, coreEmotion, content, wordBudget, chapterWordMin, chapterWordMax, memo } = opts;
   const issues: string[] = [];
   const actualLen = content.length;
 
@@ -738,6 +975,21 @@ export async function checkChapterQuality(opts: {
       issues.push(`工程词疑似泄漏（tier2 advisory,不重写）：${tier2Hits.join('、')} 出现在正文,请人工确认是否角色在故事内讨论章节`);
     }
   }
+
+  // —— Gate 1.5：chapter_memo 七段契约硬对账（inkos hook 账本）——
+  // 若调用方提供 memo,则调用 verifyMemoCompliance 做规则式硬对账:
+  //   ① 伏笔 desc 关键词(前 4 字)必须在正文出现(埋设/回收/推进)
+  //   ② 章末 200 字必须含钩子信号词(？/！/省略号/然而/不料等)
+  // missing 项作为 issues 拼到重写 prompt 让 LLM 补齐;memoHardFail 触发 needRewrite。
+  let memoHardFail = false;
+  if (memo) {
+    const compliance = verifyMemoCompliance(content, memo);
+    if (!compliance.passed) {
+      for (const m of compliance.missing) issues.push(`memo 契约未兑现：${m}`);
+      memoHardFail = true;
+    }
+  }
+
   if (actualLen >= minHard) {
     // H1 修复(第十四轮): 跑题门增第 5 维「伏笔回收度」,relationship 章未回收扣分
     // H2 修复(第十五轮): 增第 6 维「AI 味检测」,正则预筛禁用词/翻转句/总结升华
@@ -890,7 +1142,9 @@ ${content.slice(0, 1500)}
   const wordHardFail = actualLen < minHard || actualLen > hardMax;
   const topicHardFail = topicScore < 0.6;
   // 第二十五轮: 模型退化(末尾截断 / tier1 工程词泄漏)也触发重写
-  const needRewrite = wordHardFail || topicHardFail || degenerationHardFail;
+  // chapter_memo: 七段契约硬对账未兑现(伏笔 desc 关键词缺失/章末钩子缺失)也触发重写,
+  //   missing 项已拼入 issues,重写时 LLM 会补齐(inkos hook 账本硬对账)
+  const needRewrite = wordHardFail || topicHardFail || degenerationHardFail || memoHardFail;
   const score = Math.min(actualLen / wordBudget, 1) * 0.5 + topicScore * 0.5;
 
   return {
@@ -984,8 +1238,14 @@ export async function compactVolumeSummary(
   //   characterState 经 splice+push 重排后数组末尾才是最近活跃角色(L178-179 注释已说明)。
   //   喂 LLM 最久未出场角色的状态生成"卷级角色弧线"对当前卷毫无指导意义。
   //   现改 slice(-8) 取最近活跃角色,与 buildDynamicContext 的 slice(-15) 一致。
-  const volChars = (state.characterState || [])
-    .slice(-8)
+  // 第二十六轮优化(角色热度四态): 有 recentAppearCount 时优先取热度高的角色(对当前卷更有指导意义),
+  //   无热度字段(旧数据)降级到原 slice(-8)(数组末尾=最近活跃)。均取 8 个上限不变。
+  const volCharsSource = state.characterState || [];
+  const volHasHeat = volCharsSource.some(c => typeof c.lastSeenAt === 'number' || typeof c.recentAppearCount === 'number');
+  const volCharsPicked = volHasHeat
+    ? volCharsSource.slice().sort((a, b) => (b.recentAppearCount ?? 0) - (a.recentAppearCount ?? 0) || (b.lastSeenAt ?? -1) - (a.lastSeenAt ?? -1)).slice(0, 8)
+    : volCharsSource.slice(-8);
+  const volChars = volCharsPicked
     .map(c => `- ${c.name}：${c.location} / ${c.mood} / ${c.relationships}`)
     .join('\n');
 
@@ -1728,6 +1988,26 @@ ${pendingList || '（无）'}
       // 原: 永不裁剪,200 章累积 80+ 角色 → stateRepo JSON 序列化变慢,但注入已裁剪
       // 现: 50 上限足够覆盖长篇所有活跃角色,超出的多为一次性龙套
       if (characterState.length > 50) characterState = characterState.slice(-50);
+    }
+
+    // 第二十六轮新增(角色热度四态): merge 后补 lastSeenAt / recentAppearCount(规则式计算)
+    // LLM 返回的 characterState 仅含 name/location/mood/relationships,merge 时 nu 是新对象会丢热度字段,
+    // 需在 merge 后遍历重算并补回。recentAppearCount 用含本章的新 summaries 滑动窗口(最近10章出场次数)。
+    // lastSeenAt: 角色名出现在本章正文(target.content) → 更新为 justFinishedIdx;否则保留旧值
+    //   (非出场角色经 [...curCharacters] 浅拷贝保留旧 ref,lastSeenAt 不丢;出场角色 nu 丢字段但本章必命中)
+    // 性能: O(N角色 × 10摘要),N≤50 时可接受;只在每章后算一次,buildDynamicContext 直接读缓存值
+    {
+      const justFinishedIdx = target.orderIdx;
+      const chapterContent = target.content || '';
+      const windowStart = justFinishedIdx - 9;
+      const windowSummaries = summaries.filter(s => s.idx >= windowStart && s.idx <= justFinishedIdx);
+      characterState = characterState.map(c => {
+        const name = c.name;
+        const appeared = name.length > 0 && chapterContent.includes(name);
+        const recentAppearCount = windowSummaries.filter(s => s.summary && s.summary.includes(name)).length;
+        const lastSeenAt = appeared ? justFinishedIdx : c.lastSeenAt;
+        return { ...c, lastSeenAt, recentAppearCount };
+      });
     }
 
     // 4. 卷级大纲 keyForeshadows 填充（oh-story：把本章新埋/回收的伏笔 desc 归入对应卷的伏笔集群）

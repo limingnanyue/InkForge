@@ -73,6 +73,10 @@ export interface CharacterState {
   location: string;      // 当前所在
   mood: string;          // 当前情绪/状态
   relationships: string; // 与其他角色当前关系
+  // 第二十六轮新增(角色热度四态): 规则式计算的出场热度字段,由 updateStateFromGeneration 补全,
+  // LLM 不返回(merge 时会丢,需在 merge 后重算补回)。旧数据无此字段,buildDynamicContext 降级到原 slice(-15)。
+  lastSeenAt?: number;        // 最后出场章节序号(0-based),用于热度计算与失踪判定
+  recentAppearCount?: number; // 最近10章出场次数(滑动窗口),用于热度分级
 }
 
 // 章节定位六类（oh-story）：决定本章情绪强度与字数预算，防止每章像短篇、防止情绪扎堆
@@ -91,6 +95,25 @@ export interface ChapterSummary {
   positioning?: ChapterPositioning; // 章节定位类型（用于节奏分布统计）
   wordBudget?: number;   // 本章字数预算（实际写多少，用于 Σ 契约校验）
   coreEmotion?: string;  // 本章核心情绪（爽感释放/震撼/痛快/怅然等）
+}
+
+// chapter_memo 七段契约（参考 inkos chapter_memo + hook 账本硬对账）
+// 作为本章正文生成的硬契约，与 buildChapterAnchor 软约束互补：
+//   - anchor 是 prompt 段落（软约束，靠 LLM 自觉遵守）
+//   - memo 是结构化字段（硬契约，生成后由 verifyMemoCompliance 规则式硬对账）
+// 七段：① 目标 ② 钩子 ③ 伏笔(埋/收/推) ④ 角色弧线 ⑤ 字数预算 ⑥ 情绪强度 ⑦ 承接要点
+export interface ChapterMemo {
+  idx: number;              // 章节序号(0-based)
+  objectives: string;       // 1. 本章目标(必达情节点)
+  hook: string;             // 2. 本章钩子(章末200字悬念元素具体描述)
+  plantForeshadows: string[];  // 3. 本章埋设的伏笔 desc 列表
+  payForeshadows: string[];    // 3. 本章回收的伏笔 desc 列表
+  advanceForeshadows: string[];// 3. 本章推进的伏笔 desc 列表
+  characterArcs: { name: string; arc: string }[];  // 4. 本章角色弧线节点
+  wordBudget: number;       // 5. 字数预算
+  emotionIntensity: string; // 6. 情绪强度 + 核心情绪
+  carryOver: string;        // 7. 承接要点(上一章末尾场景+必须自然衔接的元素)
+  createdAt: number;
 }
 
 // 卷级大纲（oh-story 三层结构：全书大纲 → 卷纲 → 细纲）
@@ -121,6 +144,7 @@ export interface AgentState {
   foreshadowing: Foreshadow[];       // 伏笔状态机（结构化，防遗忘 + 过期检测）
   characterState: CharacterState[];   // 角色实时状态表（防人设漂移）
   chapterSummaries: ChapterSummary[]; // 三层摘要归档（近5章详记 / 十章概要 / 卷总览）
+  chapterMemos?: ChapterMemo[];       // 每章 memo 契约(inkos chapter_memo 七段契约, hook 账本硬对账)
   volumeOutlines?: VolumeOutline[];   // 卷级大纲（长篇专用）
   outline?: string;  // 全书大纲（H1 修复第十二轮：原仅落 task.checkpoint，正文生成 prompt 看不到全书主线 → 长篇中段跑题/遗忘主线）
   updatedAt: number;

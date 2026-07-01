@@ -38,6 +38,23 @@ router.delete('/:id', (req: Request, res: Response) => {
   }
 });
 
+// 拖拽排序：把 :id 章节移到 targetId 之前/之后/内部，后端重算同级 order_idx
+// 入参: { targetId: string, position: 'before'|'after'|'inside' }
+router.patch('/:id/move', (req: Request, res: Response) => {
+  try {
+    const { targetId, position } = req.body || {};
+    if (typeof targetId !== 'string' || !targetId) return fail(res, 'INVALID', 'targetId 必填');
+    if (!['before', 'after', 'inside'].includes(position)) {
+      return fail(res, 'INVALID', "position 必须为 'before' | 'after' | 'inside'");
+    }
+    const chapter = chapterRepo.move(req.params.id, targetId, position);
+    if (!chapter) return fail(res, 'NOT_FOUND', '章节不存在', 404);
+    ok(res, chapter);
+  } catch (e) {
+    return fail(res, 'DB_ERROR', `移动章节失败：${(e as Error).message}`, 500);
+  }
+});
+
 router.post('/:id/snapshot', (req: Request, res: Response) => {
   try {
     chapterRepo.snapshot(req.params.id);

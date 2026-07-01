@@ -8,9 +8,10 @@
  *   仅渲染视口附近 ±OVERSCAN 项，用 paddingTop/paddingBottom 撑起总高度。
  *   DOM 数量恒定（~视口可见数 + 2*OVERSCAN），2000+ 章不再卡顿。
  * - 列表较短时走普通平铺渲染，保持小项目体验。
+ * - 支持原生 HTML5 拖拽排序（桌面端，不引入新依赖）与批量选择模式（两者互斥）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { ReactNode, DragEvent } from 'react';
 import { ChevronRight, ChevronDown } from 'lucide-react';
 import type { ChapterNode } from '@shared/types';
 import { cn } from '@/lib/utils';
@@ -23,6 +24,9 @@ const STATUS_DOT: Record<string, string> = { draft: 'bg-ink-400', generating: 'b
 const ITEM_HEIGHT = 36;          // 单行高度（含间距），用于虚拟滚动定位
 const OVERSCAN = 5;              // 视口上下额外渲染项数
 const VIRTUAL_THRESHOLD = 100;   // 超过此项数才启用虚拟滚动
+
+// 拖拽放置位置：目标行上方('before') / 下方('after')
+export type DropPosition = 'before' | 'after';
 
 // 扁平化所有节点（忽略折叠状态，导出工具函数，保持原行为）
 export function flatten(nodes: ChapterNode[]): ChapterNode[] {
@@ -62,25 +66,72 @@ function flattenVisible(nodes: ChapterNode[], collapsed: Set<string>, depth: num
   return out;
 }
 
-// 单行按钮（保持与原递归版本一致的样式与交互）
-function Row({ item, collapsed, setCollapsed, selectedId, onSelect }: {
+// 单行渲染（支持原生 HTML5 拖拽 + 批量选择 checkbox）
+// 原 Row 是 <button>，改为 <div> 以兼容 draggable 与内嵌 checkbox
+function Row({
+  item, collapsed, setCollapsed, selectedId, onSelect,
+  draggable, batchMode, selectedIds, onToggleSelect,
+  dragSourceId, dragOverId, dragOverPos,
+  onDragStart, onDragOver, onDrop, onDragEnd,
+}: {
   item: FlatItem;
   collapsed: Set<string>;
   setCollapsed: (s: Set<string>) => void;
   selectedId?: string;
   onSelect: (n: ChapterNode) => void;
+  draggable: boolean;
+  batchMode: boolean;
+  selectedIds: Set<string>;
+  onToggleSelect?: (id: string) => void;
+  dragSourceId?: string | null;
+  dragOverId?: string | null;
+  dragOverPos?: DropPosition | null;
+  onDragStart?: (e: DragEvent<HTMLDivElement>, id: string) => void;
+  onDragOver?: (e: DragEvent<HTMLDivElement>, id: string) => void;
+  onDrop?: (e: DragEvent<HTMLDivElement>, id: string) => void;
+  onDragEnd?: () => void;
 }) {
   const { node: n, depth } = item;
   const hasChildren = !!n.children?.length;
   const isCollapsed = collapsed.has(n.id);
+  const isDragging = dragSourceId === n.id;
+  const isDragOver = dragOverId === n.id;
+  const isSel = selectedIds.has(n.id);
+
   return (
-    <button
-      onClick={() => onSelect(n)}
-      className={cn('group flex w-full items-center gap-1.5 rounded-md py-1.5 pr-2 text-left text-sm transition-colors hover:bg-ink-700',
-        selectedId === n.id ? 'bg-ink-700 text-amber' : 'text-paper-dim')}
+    <div
+      draggable={draggable}
+      onDragStart={e => onDragStart?.(e, n.id)}
+      onDragOver={e => onDragOver?.(e, n.id)}
+      onDrop={e => onDrop?.(e, n.id)}
+      onDragEnd={onDragEnd}
+      onClick={() => (batchMode ? onToggleSelect?.(n.id) : onSelect(n))}
+      className={cn(
+        'group relative flex w-full cursor-pointer items-center gap-1.5 rounded-md py-1.5 pr-2 text-left text-sm transition-colors hover:bg-ink-700',
+        selectedId === n.id && !batchMode ? 'bg-ink-700 text-amber' : 'text-paper-dim',
+        batchMode && isSel && 'bg-ink-700 text-amber',
+        isDragging && 'opacity-50',
+      )}
       style={{ paddingLeft: depth * 12 + 8 }}
     >
-      {hasChildren ? (
+      {/* 拖拽时目标行上方/下方 amber 分隔线（视觉指示放置位置） */}
+      {isDragOver && dragOverPos === 'before' && (
+        <span className="pointer-events-none absolute inset-x-0 top-0 h-0.5" style={{ background: 'var(--amber)' }} />
+      )}
+      {isDragOver && dragOverPos === 'after' && (
+        <span className="pointer-events-none absolute inset-x-0 bottom-0 h-0.5" style={{ background: 'var(--amber)' }} />
+      )}
+
+      {/* 批量模式：checkbox 替换折叠箭头位置（批量模式不折叠，节省横向空间） */}
+      {batchMode ? (
+        <input
+          type="checkbox"
+          checked={isSel}
+          onChange={e => { e.stopPropagation(); onToggleSelect?.(n.id); }}
+          onClick={e => e.stopPropagation()}
+          className="h-3.5 w-3.5 shrink-0 accent-amber"
+        />
+      ) : hasChildren ? (
         <span
           onClick={(e) => { e.stopPropagation(); const s = new Set(collapsed); s.has(n.id) ? s.delete(n.id) : s.add(n.id); setCollapsed(s); }}
           className="text-paper-mute hover:text-paper"
@@ -98,17 +149,24 @@ function Row({ item, collapsed, setCollapsed, selectedId, onSelect }: {
         </span>
       )}
       <span className="font-mono text-[10px] text-paper-mute">{fmtWords(n.wordCount)}</span>
-    </button>
+    </div>
   );
 }
 
-export default function ChapterTree({ nodes, collapsed, setCollapsed, selectedId, onSelect, depth = 0 }: {
+export default function ChapterTree({
+  nodes, collapsed, setCollapsed, selectedId, onSelect, depth = 0,
+  batchMode = false, selectedIds, onToggleSelect, onMoveNode,
+}: {
   nodes: ChapterNode[];
   collapsed: Set<string>;
   setCollapsed: (s: Set<string>) => void;
   selectedId?: string;
   onSelect: (n: ChapterNode) => void;
   depth?: number;
+  batchMode?: boolean;
+  selectedIds?: Set<string>;
+  onToggleSelect?: (id: string) => void;
+  onMoveNode?: (sourceId: string, targetId: string, position: DropPosition) => void;
 }) {
   // 折叠状态变化时重新扁平化
   const flatList = useMemo(
@@ -119,6 +177,19 @@ export default function ChapterTree({ nodes, collapsed, setCollapsed, selectedId
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(600);
+
+  // 拖拽状态：dragSourceId 被拖拽的节点 / dragOverId 悬停目标 / dragOverPos 上/下
+  const [dragSourceId, setDragSourceId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [dragOverPos, setDragOverPos] = useState<DropPosition | null>(null);
+
+  // 移动端触摸设备检测：HTML5 drag-drop 在触摸端体验差，仅桌面端启用
+  const [isTouch, setIsTouch] = useState(false);
+  useEffect(() => {
+    setIsTouch(typeof window !== 'undefined' && (('ontouchstart' in window) || navigator.maxTouchPoints > 0));
+  }, []);
+  // 拖拽 + 批量模式互斥；批量模式或触摸端禁用拖拽
+  const dragEnabled = !batchMode && !isTouch && !!onMoveNode;
 
   // 挂载后测量真实视口高度
   useEffect(() => {
@@ -141,7 +212,59 @@ export default function ChapterTree({ nodes, collapsed, setCollapsed, selectedId
     });
   }, []);
 
+  // onDragStart：把被拖拽节点 id 存到 dataTransfer，记录 sourceId
+  const handleDragStart = useCallback((e: DragEvent<HTMLDivElement>, nodeId: string) => {
+    setDragSourceId(nodeId);
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', nodeId); } catch { /* IE 兜底 */ }
+  }, []);
+
+  // onDragOver：preventDefault 允许 drop，按鼠标 Y 位置计算 before/after 高亮目标行
+  const handleDragOver = useCallback((e: DragEvent<HTMLDivElement>, nodeId: string) => {
+    if (!dragSourceId || dragSourceId === nodeId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = e.currentTarget.getBoundingClientRect();
+    const offset = e.clientY - rect.top;
+    const pos: DropPosition = offset < rect.height / 2 ? 'before' : 'after';
+    setDragOverId(nodeId);
+    setDragOverPos(pos);
+  }, [dragSourceId]);
+
+  // onDrop：把被拖拽节点移到目标节点之前/之后（同级），调用 onMoveNode 回调
+  const handleDrop = useCallback((e: DragEvent<HTMLDivElement>, nodeId: string) => {
+    e.preventDefault();
+    const src = dragSourceId;
+    const pos = dragOverPos;
+    setDragSourceId(null);
+    setDragOverId(null);
+    setDragOverPos(null);
+    if (!src || src === nodeId || !pos || !onMoveNode) return;
+    onMoveNode(src, nodeId, pos);
+  }, [dragSourceId, dragOverPos, onMoveNode]);
+
+  // onDragEnd：拖拽结束（无论是否 drop）清状态
+  const handleDragEnd = useCallback(() => {
+    setDragSourceId(null);
+    setDragOverId(null);
+    setDragOverPos(null);
+  }, []);
+
   const useVirtual = flatList.length > VIRTUAL_THRESHOLD;
+
+  // 行公共 props（虚拟与非虚拟共用）
+  const rowProps = (item: FlatItem) => ({
+    item, collapsed, setCollapsed, selectedId, onSelect,
+    draggable: dragEnabled,
+    batchMode: !!batchMode,
+    selectedIds: selectedIds ?? new Set<string>(),
+    onToggleSelect,
+    dragSourceId, dragOverId, dragOverPos,
+    onDragStart: handleDragStart,
+    onDragOver: handleDragOver,
+    onDrop: handleDrop,
+    onDragEnd: handleDragEnd,
+  });
 
   let content: ReactNode;
   if (useVirtual) {
@@ -159,7 +282,7 @@ export default function ChapterTree({ nodes, collapsed, setCollapsed, selectedId
       <div style={{ paddingTop, paddingBottom }}>
         {slice.map(item => (
           <div key={item.node.id} style={{ height: ITEM_HEIGHT }} className="flex items-center">
-            <Row item={item} collapsed={collapsed} setCollapsed={setCollapsed} selectedId={selectedId} onSelect={onSelect} />
+            <Row {...rowProps(item)} />
           </div>
         ))}
       </div>
@@ -169,7 +292,7 @@ export default function ChapterTree({ nodes, collapsed, setCollapsed, selectedId
       <div className="space-y-0.5">
         {flatList.map(item => (
           <div key={item.node.id}>
-            <Row item={item} collapsed={collapsed} setCollapsed={setCollapsed} selectedId={selectedId} onSelect={onSelect} />
+            <Row {...rowProps(item)} />
           </div>
         ))}
       </div>

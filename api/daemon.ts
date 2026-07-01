@@ -6,9 +6,9 @@
  */
 import { EventEmitter } from 'events';
 import { taskRepo, taskLogRepo, chapterRepo, projectRepo, stateRepo, providerRepo } from './repos.js';
-import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality, checkPositioningDistribution, compactVolumeSummary, SKILL_PROMPTS } from './engine.js';
+import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality, checkPositioningDistribution, compactVolumeSummary, SKILL_PROMPTS, generateChapterMemo, upsertChapterMemo } from './engine.js';
 import { complete } from './llm.js';
-import type { Task, StreamEvent, ProviderKind, ProjectType } from '@shared/types';
+import type { Task, StreamEvent, ProviderKind, ProjectType, ChapterMemo } from '@shared/types';
 
 // ============ Cancel Token（worker 主动停止信号）============
 // 任务开始时 registerToken，cancel/pause 端点调 cancelToken 把 cancelled=true
@@ -539,6 +539,17 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     const volumeCtx = curVol
       ? { idx: curVol.idx, title: curVol.title, premise: curVol.premise, emotionArc: curVol.emotionArc, keyForeshadows: curVol.keyForeshadows }
       : null;
+    // chapter_memo 七段契约(inkos): 在 buildChapterAnchor 之前生成结构化 memo 作为硬契约。
+    //   memo 失败不阻断生成(try/catch,失败 memo=null 跳过 memo 流程)。
+    //   持久化到 state.chapterMemos(模块级 Map 物理存储 + stateRepo.update 透传逻辑字段)。
+    //   生成正文后用 memo 做硬对账(verifyMemoCompliance),missing 项拼到重写 prompt。
+    let chapterMemo: ChapterMemo | null = null;
+    try {
+      chapterMemo = await generateChapterMemo(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, ch.coreEmotion, chapterWordBudget, chapterWordMin, chapterWordMax, model, providerId);
+      if (chapterMemo) upsertChapterMemo(projectId, chapterMemo);
+    } catch (e) {
+      logTask(task.id, 'warn', `第 ${i + 1} 章 memo 生成异常（跳过 memo 流程,不阻断）：${(e as Error).message.slice(0, 80)}`);
+    }
     const anchor = buildChapterAnchor(projectId, i, chapters.length, ch.title, ch.outline, ch.positioning, chapterWordBudget, ch.coreEmotion, volumeCtx, chapterWordMin, chapterWordMax);
     // 章末钩子提示 + 定位对位的字数提示
     const positioningHint = ch.positioning
@@ -611,13 +622,14 @@ ${prompt}`;
         for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: prompt, chapterContext: ch.outline, history: prevHistory, maxTokens: chapterMaxTokens, webSearch, currentChapterIdx: i }))) {
           content += chunk;
         }
-        // 质量门检测（字数门 + 跑题门）
+        // 质量门检测（字数门 + 跑题门 + memo 硬对账）
         try {
           const quality = await checkChapterQuality({
             projectId, model, providerId,
             chapterIdx: i, chapterTitle: ch.title, outline: ch.outline,
             positioning: ch.positioning, coreEmotion: ch.coreEmotion,
             content, wordBudget, chapterWordMin, chapterWordMax,
+            memo: chapterMemo || undefined,
           });
           if (quality.ok) {
             if (quality.issues.length > 0) {
@@ -895,6 +907,15 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     }
     chapterRepo.update(chapter.id, { status: 'generating' });
     let content = '';
+    // chapter_memo 七段契约(inkos): 短篇虽无 buildChapterAnchor,仍生成 memo 作为硬契约。
+    //   失败不阻断(memo=null 跳过 memo 流程);持久化到 state.chapterMemos。
+    let segMemo: ChapterMemo | null = null;
+    try {
+      segMemo = await generateChapterMemo(projectId, i, segments.length, seg.title, seg.outline, seg.positioning, seg.coreEmotion, chapterWordBudget, chapterWordMin, chapterWordMax, model, providerId);
+      if (segMemo) upsertChapterMemo(projectId, segMemo);
+    } catch (e) {
+      logTask(task.id, 'warn', `第 ${i + 1} 段 memo 生成异常（跳过 memo 流程,不阻断）：${(e as Error).message.slice(0, 80)}`);
+    }
     // BUG-1 修复：用 existingShortMap.get(i-1) 而非 existingShort[i-1]
     const segPrev = i > 0 ? existingShortMap.get(i - 1) : undefined;
     const segPrevHistory = segPrev?.content
@@ -936,13 +957,14 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
         for await (const chunk of withHeartbeat(task.id, runSkill({ projectId, skill: 'write', model, providerId, userPrompt: segPrompt, history: segPrevHistory, maxTokens: segMaxTokens, webSearch }))) {
           content += chunk;
         }
-        // 质量门检测（字数门 + 跑题门）
+        // 质量门检测（字数门 + 跑题门 + memo 硬对账）
         try {
           const quality = await checkChapterQuality({
             projectId, model, providerId,
             chapterIdx: i, chapterTitle: seg.title, outline: seg.outline,
             positioning: seg.positioning, coreEmotion: seg.coreEmotion,
             content, wordBudget: chapterWordBudget, chapterWordMin, chapterWordMax,
+            memo: segMemo || undefined,
           });
           if (quality.ok) {
             if (quality.issues.length > 0) {
@@ -1044,6 +1066,17 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
   chapterRepo.update(chapter.id, { status: 'generating' });
   progress(task.id, 0.3, `生成《${chapter.title}》`);
   let content = '';
+  // chapter_memo 七段契约(inkos): 单章生成也生成 memo 作为硬契约。
+  //   失败不阻断(memo=null 跳过 memo 流程);持久化到 state.chapterMemos。
+  //   totalChapters 取项目当前章节数(单章续写场景下作为全书规模上下文)。
+  let singleChapterMemo: ChapterMemo | null = null;
+  try {
+    const totalChaptersForMemo = chapterRepo.listByProject(chapter.projectId).length;
+    singleChapterMemo = await generateChapterMemo(chapter.projectId, chapter.orderIdx, Math.max(totalChaptersForMemo, chapter.orderIdx + 1), chapter.title, chapter.outline, chapter.positioning, chapter.coreEmotion, chapterWordBudget, chapterWordMin, chapterWordMax, model, providerId);
+    if (singleChapterMemo) upsertChapterMemo(chapter.projectId, singleChapterMemo);
+  } catch (e) {
+    logTask(task.id, 'warn', `《${chapter.title}》memo 生成异常（跳过 memo 流程,不阻断）：${(e as Error).message.slice(0, 80)}`);
+  }
   // D1 修复：流失败时回滚 status='failed'，避免 chapter 永远卡 'generating' 显示「生成中」
   // 与 runBookPipeline / runShortPipeline 行为一致
   // 单章质量门：与流水线一致，不达标重写一次（wordBudget=chapterWordBudget）
@@ -1065,6 +1098,7 @@ async function runChapterGeneration(task: Task, model: string, providerId?: stri
           projectId: chapter.projectId, model, providerId,
           chapterIdx: chapter.orderIdx, chapterTitle: chapter.title, outline: chapter.outline,
           content, wordBudget: chapterWordBudget, chapterWordMin, chapterWordMax,
+          memo: singleChapterMemo || undefined,
         });
         if (quality.ok) {
           if (quality.issues.length > 0) {

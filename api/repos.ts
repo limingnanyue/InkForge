@@ -141,6 +141,51 @@ export const chapterRepo = {
     });
     return roots;
   },
+  // 拖拽排序：把 source 章节移到 target 之前/之后/内部，重算同级 order_idx
+  // position: 'before'|'after' 作为同级兄弟；'inside' 作为 target 子节点（追加到末尾）
+  // 旧数据无 order_idx 时默认 0，listByProject 用 ORDER BY order_idx ASC, created_at ASC 保持向后兼容
+  move(id: string, targetId: string, position: 'before' | 'after' | 'inside'): Chapter | null {
+    const src = this.get(id);
+    const tgt = this.get(targetId);
+    if (!src || !tgt) return null;
+    if (src.id === tgt.id) return src; // 自身 → no-op
+    if (src.projectId !== tgt.projectId) throw new Error('不能跨项目移动章节');
+    // 防循环：target 不能是 source 的子孙（before/after/inside 均适用）
+    let cur: Chapter | null = tgt;
+    while (cur) {
+      if (cur.parentId === id) throw new Error('不能把章节移到自己的子孙节点位置');
+      cur = cur.parentId ? this.get(cur.parentId) : null;
+    }
+
+    const newParentId = position === 'inside' ? tgt.id : tgt.parentId;
+    // 新父节点下的所有子节点（不含 source），按 order_idx 排序
+    const siblings = this.listByProject(src.projectId)
+      .filter(c => c.id !== id && c.parentId === newParentId)
+      .sort((a, b) => a.orderIdx - b.orderIdx);
+
+    let insertIdx: number;
+    if (position === 'inside') {
+      insertIdx = siblings.length; // 追加到末尾
+    } else {
+      const idx = siblings.findIndex(c => c.id === tgt.id);
+      insertIdx = idx === -1 ? siblings.length : (position === 'before' ? idx : idx + 1);
+    }
+    siblings.splice(insertIdx, 0, src);
+
+    // 事务内重排 order_idx + 更新 source.parentId
+    db.transaction(() => {
+      siblings.forEach((c, i) => {
+        if (c.id === id) {
+          db.prepare('UPDATE chapter SET parent_id=?, order_idx=?, updated_at=? WHERE id=?')
+            .run(newParentId, i, now(), id);
+        } else if (c.orderIdx !== i) {
+          db.prepare('UPDATE chapter SET order_idx=? WHERE id=?').run(i, c.id);
+        }
+      });
+    })();
+
+    return this.get(id);
+  },
 };
 
 // ============ 智能体状态 ============
