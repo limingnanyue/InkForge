@@ -10,6 +10,7 @@ import { Spinner, useToast, Field, Switch, SegmentedControl, Slider } from '@/co
 import GenreSelect from '@/components/GenreSelect';
 import { useApp } from '@/stores/app';
 import { cn } from '@/lib/utils';
+import { TONE_PRESETS, getTonePreset, filterTonesByProjectType } from '@shared/tone-presets';
 import type { GenerateKind, GenerateConfig } from '@shared/types';
 
 interface Form {
@@ -430,8 +431,14 @@ function Step2({ kind, form, set, estChapters, busy, onBack, onSubmit, webSearch
         </Field>
         <Field label="文风">
           <select className="input" value={form.tone} onChange={e => set('tone', e.target.value)}>
-            <option>爽文</option><option>慢热</option><option>正剧</option><option>恶搞</option><option>黑色幽默</option>
+            {filterTonesByProjectType(TONE_PRESETS, kind === 'book' ? 'long' : 'short').map(t => (
+              <option key={t.id} value={t.label}>{t.label}</option>
+            ))}
           </select>
+          {/* 文风写作要求摘要：取 instruction 前 40 字，让用户知道选这个文风会怎么写 */}
+          <p className="mt-1.5 text-[10px] text-paper-mute leading-relaxed">
+            · {getTonePreset(form.tone).instruction.slice(0, 40)}…
+          </p>
         </Field>
       </div>
 

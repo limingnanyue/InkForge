@@ -33,7 +33,11 @@ router.get('/', (_req: Request, res: Response) => ok(res, projectRepo.list()));
 router.post('/', (req: Request, res: Response) => {
   const { title, type, targetWords, summary, webSearchEnabled, genre, genreId } = req.body || {};
   if (!title || !type) return fail(res, 'INVALID', '标题和类型必填');
-  if (!['long', 'short', 'script'].includes(type)) return fail(res, 'INVALID', '类型不合法');
+  // P1 修复(BUG2): 禁止 type='script' —— script 剧本类型无专用 pipeline,
+  //   createContinueTask 会把它当 book 处理输出小说而非剧本(半实现陷阱)。
+  //   短期不实现 script pipeline(改动太大),彻底禁止创建以避免误用。
+  //   只允许 long/short,前端已同步移除"剧本"选项。
+  if (!['long', 'short'].includes(type)) return fail(res, 'INVALID', '类型不合法,仅支持长篇 long / 短篇 short(剧本 script 类型暂未实现,已禁用创建)');
   // H3 修复(第二十轮): 校验 targetWords 范围，防 0/负数/NaN 落库导致后续 daemon 章数为 0
   if (typeof targetWords !== 'number' || !Number.isFinite(targetWords) || targetWords <= 0) {
     return fail(res, 'INVALID', '目标字数须为正整数');
@@ -369,9 +373,10 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
       method: 'POST',
       headers,
       body: JSON.stringify(reqBody),
-      // M2 修复(第二十轮): 加 30s 超时,防第三方图像 provider 握手后挂起导致 Express 连接被永久占满
+      // M2 修复(第二十轮): 加超时,防第三方图像 provider 握手后挂起导致 Express 连接被永久占满
       //   多个 cover-preview 请求堆积可耗尽连接池,影响其他路由
-      signal: AbortSignal.timeout(30000),
+      // P2 修复: 30s→90s,高质量图像模型(gpt-image-2/dall-e-3 高分辨率)常需 30-60s,30s 误杀
+      signal: AbortSignal.timeout(90000),
     });
     if (!upstream.ok) {
       const errText = await upstream.text().catch(() => '');
@@ -390,8 +395,8 @@ router.post('/:id/cover-preview', async (req: Request, res: Response) => {
       dataUrl = `data:image/png;base64,${item.b64_json}`;
     } else if (item.url) {
       // 部分 provider 返回 url, 后端再下载转 base64
-      // M2 修复(第二十轮): 同样加 30s 超时防挂起
-      const imgResp = await fetch(item.url, { signal: AbortSignal.timeout(30000) });
+      // M2 修复(第二十轮): 同样加超时防挂起;P2 修复: 30s→90s 与生成一致,覆盖高质量图像下载
+      const imgResp = await fetch(item.url, { signal: AbortSignal.timeout(90000) });
       if (!imgResp.ok) return fail(res, 'UPSTREAM_ERROR', `下载图像失败（${imgResp.status}）`, 502);
       const buf = Buffer.from(await imgResp.arrayBuffer());
       dataUrl = `data:image/png;base64,${buf.toString('base64')}`;

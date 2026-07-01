@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS agent_state (
   character_state_json TEXT DEFAULT '[]',
   chapter_summaries_json TEXT DEFAULT '[]',
   volume_outlines_json TEXT DEFAULT '[]',
+  chapter_memos_json TEXT DEFAULT '[]',
+  emotion_beats_json TEXT DEFAULT '[]',
+  conflict_lines_json TEXT DEFAULT '[]',
   updated_at INTEGER NOT NULL
 );
 
@@ -213,8 +216,13 @@ function migrateLegacySchema(): void {
   if (!stateCols.includes('character_state_json')) db.exec("ALTER TABLE agent_state ADD COLUMN character_state_json TEXT DEFAULT '[]'");
   if (!stateCols.includes('chapter_summaries_json')) db.exec("ALTER TABLE agent_state ADD COLUMN chapter_summaries_json TEXT DEFAULT '[]'");
   if (!stateCols.includes('volume_outlines_json')) db.exec("ALTER TABLE agent_state ADD COLUMN volume_outlines_json TEXT DEFAULT '[]'");
+  // chapter_memos 持久化: 内存 Map 重启丢失,加列落库 agent_state.chapter_memos_json
+  if (!stateCols.includes('chapter_memos_json')) db.exec("ALTER TABLE agent_state ADD COLUMN chapter_memos_json TEXT DEFAULT '[]'");
   // H1 修复(第十二轮): agent_state 加 outline 列存全书大纲,防长篇主线遗忘
   if (!stateCols.includes('outline')) db.exec("ALTER TABLE agent_state ADD COLUMN outline TEXT DEFAULT ''");
+  // 情感线节点 + 矛盾网三层状态机持久化（CP向作品情感节奏 + 防单元剧化）
+  if (!stateCols.includes('emotion_beats_json')) db.exec("ALTER TABLE agent_state ADD COLUMN emotion_beats_json TEXT DEFAULT '[]'");
+  if (!stateCols.includes('conflict_lines_json')) db.exec("ALTER TABLE agent_state ADD COLUMN conflict_lines_json TEXT DEFAULT '[]'");
 
   // M5 修复(第十三轮): 旧库 chapter 表补 positioning/core_emotion 列,让 oh-story 章节定位六类持久化
   const chapterCols = (db.prepare("PRAGMA table_info(chapter)").all() as { name: string }[]).map(c => c.name);

@@ -28,7 +28,8 @@ function safeDeleteFile(filePath: string): void {
 router.post('/', (req: Request, res: Response) => {
   const { projectId, format, chapterRange } = req.body || {};
   if (!projectId || !format) return fail(res, 'INVALID', 'projectId 和 format 必填');
-  if (!['txt', 'markdown', 'epub', 'docx'].includes(format)) return fail(res, 'INVALID', '格式不合法');
+  // P1 修复(BUG1): 接受 'html'(网页版,新诚实标识);保留 'epub' 兼容旧客户端请求(会被 exporter 转为 'html' 存储)
+  if (!['txt', 'markdown', 'html', 'epub', 'docx'].includes(format)) return fail(res, 'INVALID', '格式不合法');
   try {
     const result = exportProject({ projectId, format: format as ExportFormat, chapterRange });
     ok(res, result);

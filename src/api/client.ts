@@ -73,7 +73,11 @@ export const api = {
       onChunk: (delta: string) => void, onMeta?: (m: { messageId: string; intent: string; webSearch?: boolean; action?: 'navigate'; target?: string; taskId?: string; daemonError?: string }) => void): { cancel: () => void; done: Promise<string> } => {
       const controller = new AbortController();
       let full = '';
-      const done = (async () => {
+      // P1 修复(BUG4): 抽取单次请求逻辑为 attempt(),供弱网重连复用。
+      //   断网时 reader.read()/fetch reject,原代码无重试 → 弱网体验割裂。
+      //   现策略: 未收到任何 chunk(full 为空)且非用户主动 cancel → 指数退避 1s 重试 1 次;
+      //   已收到部分 chunk 不重试(避免重复内容);用户主动 cancel 不重试。
+      const attempt = async (): Promise<string> => {
         const resp = await fetch(`${BASE}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -126,6 +130,21 @@ export const api = {
           }
         }
         return full;
+      };
+      const done = (async () => {
+        try {
+          return await attempt();
+        } catch (e) {
+          // P1 修复(BUG4): 弱网重连 —— 仅当未收到任何 chunk(full 为空)且非用户主动取消时,
+          //   指数退避 1s 后重试 1 次。已收到部分 chunk 不重试(避免重复内容)。
+          if (!full && !controller.signal.aborted) {
+            await new Promise(r => setTimeout(r, 1000));
+            // sleep 期间用户可能已取消,二次确认避免无谓重试
+            if (controller.signal.aborted) throw e;
+            return await attempt();
+          }
+          throw e;
+        }
       })();
       return { cancel: () => controller.abort(), done };
     },

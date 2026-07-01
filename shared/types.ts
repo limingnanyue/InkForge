@@ -132,6 +132,29 @@ export interface VolumeOutline {
   compactedSummary?: string;
 }
 
+// 情感线节点追踪（CP向作品专用，甜宠/虐恋文风下激活）
+// 每个 beat 标记情感推进的关键节点，防 CP 互动节奏失控
+// 持久化: agent_state.emotion_beats_json（db.ts SCHEMA + migrateLegacySchema）
+export interface EmotionBeat {
+  idx: number;          // 章节序号
+  type: '心动' | '靠近' | '误解' | '分离' | '和好' | '升华' | '日常糖' | '虐点';
+  characters: string[]; // 涉及角色名（CP双方）
+  desc: string;         // 情感节点描述
+}
+
+// 矛盾网三层追踪（oh-story 方法论：章级/卷级/书级矛盾同时运行）
+// 每解决一个矛盾必须激活或加深另一个，防单元剧化
+// 持久化: agent_state.conflict_lines_json（db.ts SCHEMA + migrateLegacySchema）
+export interface ConflictLine {
+  id: string;
+  desc: string;          // 矛盾描述
+  level: 'chapter' | 'volume' | 'book';  // 三层
+  status: 'active' | 'resolved' | 'escalated';  // 激活/已解决/已升级
+  introducedAt: number;  // 引入章节
+  resolvedAt?: number;   // 解决章节
+  escalatedTo?: string;  // 升级到的矛盾 id（解决一个必须激活另一个）
+}
+
 export interface AgentState {
   projectId: string;
   idea: string;       // 创意：核心点子、题材定位
@@ -146,6 +169,8 @@ export interface AgentState {
   chapterSummaries: ChapterSummary[]; // 三层摘要归档（近5章详记 / 十章概要 / 卷总览）
   chapterMemos?: ChapterMemo[];       // 每章 memo 契约(inkos chapter_memo 七段契约, hook 账本硬对账)
   volumeOutlines?: VolumeOutline[];   // 卷级大纲（长篇专用）
+  emotionBeats?: EmotionBeat[];       // 情感线节点追踪（CP向作品专用，防 CP 互动节奏失控）
+  conflictLines?: ConflictLine[];     // 矛盾网三层追踪（防单元剧化，每解决一个矛盾必须激活另一个）
   outline?: string;  // 全书大纲（H1 修复第十二轮：原仅落 task.checkpoint，正文生成 prompt 看不到全书主线 → 长篇中段跑题/遗忘主线）
   updatedAt: number;
 }
@@ -288,7 +313,9 @@ export interface GenerateRequest {
 }
 
 // 导出
-export type ExportFormat = 'txt' | 'markdown' | 'epub' | 'docx';
+// P1 修复(BUG1): 新增 'html' —— epub 导出实际生成 HTML,format 字段需诚实标注为 'html'
+// 保留 'epub' 仅为兼容历史导出记录,新导出不再产出该标识
+export type ExportFormat = 'txt' | 'markdown' | 'html' | 'epub' | 'docx';
 
 export interface ExportRequest {
   projectId: string;

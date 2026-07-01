@@ -15,6 +15,10 @@ const fail = (res: Response, code: string, message: string, status = 400) =>
   res.status(status).json({ ok: false, error: { code, message } });
 
 router.post('/', async (req: Request, res: Response) => {
+  // P1 修复(BUG3): 外层 try/catch 保护 —— projectRepo.get/providerRepo.getDefault 等 DB 调用
+  //   抛 SQLITE_BUSY 时原无捕获变成 unhandledRejection,客户端永远转圈。现统一捕获:
+  //   SSE 未开始 → 返回 JSON 错误;SSE 已开始 → 发 event:error 再 end。
+  try {
   // 第二十六轮 P2 修复(daemon_create 丢失字数配置): 原 req.body 只解构 5 个字段,
   //   daemon_create 调 createContinueTask 时漏传 chapterWordBudget/Min/Max,
   //   用户在 Generate 页配置的每章字数上下限走 chat 派发时全部丢失,daemon 回落 infer。
@@ -181,6 +185,12 @@ router.post('/', async (req: Request, res: Response) => {
   } finally {
     try { res.end(); } catch { /* 客户端已断开 */ }
   }
+  } catch (err) {
+    // P1 修复(BUG3): 捕获 SSE 建立前(DB 调用等)抛出的异常,避免 unhandledRejection
+    if (!res.headersSent) return fail(res, 'INTERNAL', `服务异常：${(err as Error).message}`, 500);
+    try { res.write(`event:error\ndata:${JSON.stringify({ message: (err as Error).message })}\n\n`); } catch { /* 客户端已断开 */ }
+    try { res.end(); } catch { /* 客户端已断开 */ }
+  }
 });
 
 // 流式透传（调试/直接调用）
@@ -188,17 +198,19 @@ router.post('/completions', async (req: Request, res: Response) => {
   const { messages, providerId, model, temperature, maxTokens } = req.body || {};
   if (!messages || !model) return fail(res, 'INVALID', 'messages 和 model 必填');
 
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  // P1 修复(BUG3): writeHead 与动态 import 一并移入 try,避免 DB/网络异常变 unhandledRejection
   try {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const { streamComplete } = await import('../llm.js');
     for await (const chunk of streamComplete({ providerId, model, messages: messages as ChatCompletionMessage[], temperature, maxTokens })) {
       res.write(`data:${JSON.stringify({ delta: chunk })}\n\n`);
     }
     res.write('data:[DONE]\n\n');
   } catch (e) {
-    res.write(`data:${JSON.stringify({ error: (e as Error).message })}\n\n`);
+    if (!res.headersSent) return fail(res, 'INTERNAL', `服务异常：${(e as Error).message}`, 500);
+    try { res.write(`data:${JSON.stringify({ error: (e as Error).message })}\n\n`); } catch { /* 客户端已断开 */ }
   }
-  res.end();
+  try { res.end(); } catch { /* 客户端已断开 */ }
 });
 
 function detectIntent(message: string): 'write' | 'refine' | 'analyze' | 'chat' | 'daemon_create' | 'daemon_view' {

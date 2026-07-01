@@ -9,11 +9,14 @@ import { Spinner, EmptyState, fmtTime, useToast, Modal } from '@/components/ui';
 import { cn } from '@/lib/utils';
 import type { Project, ExportRecord, ExportFormat } from '@shared/types';
 
+// P1 修复(BUG1): 名实不符 —— 原 'epub' 实际生成 HTML(阅读器无法识别),'docx' 实际生成 .html。
+//   改为诚实标注:'html' = 网页版HTML(原 epub 位),实际产出 .html;'docx' = Word兼容,实际产出 .doc(Word 可打开的 HTML)。
+//   不再让用户误以为拿到的是真正 .epub 实际却是 HTML。
 const FORMATS: { id: ExportFormat; label: string; icon: typeof FileText; ext: string }[] = [
   { id: 'txt', label: 'TXT', icon: FileText, ext: '纯文本' },
   { id: 'markdown', label: 'Markdown', icon: FileCode, ext: '.md' },
-  { id: 'epub', label: 'EPUB', icon: BookOpen, ext: '电子书' },
-  { id: 'docx', label: 'DOCX', icon: FileType, ext: 'Word' },
+  { id: 'html', label: '网页版HTML', icon: BookOpen, ext: '网页' },
+  { id: 'docx', label: 'Word兼容', icon: FileType, ext: '.doc' },
 ];
 
 export default function ExportCenter() {

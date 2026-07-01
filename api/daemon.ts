@@ -8,6 +8,7 @@ import { EventEmitter } from 'events';
 import { taskRepo, taskLogRepo, chapterRepo, projectRepo, stateRepo, providerRepo } from './repos.js';
 import { runSkill, generateOutline, generateSetup, parseOutline, updateStateFromGeneration, buildChapterAnchor, reconcileState, buildVolumeOutlines, checkChapterQuality, checkPositioningDistribution, compactVolumeSummary, SKILL_PROMPTS, generateChapterMemo, upsertChapterMemo } from './engine.js';
 import { complete } from './llm.js';
+import { getToneInstruction } from '@shared/tone-presets';
 import type { Task, StreamEvent, ProviderKind, ProjectType, ChapterMemo } from '@shared/types';
 
 // ============ Cancel Token（worker 主动停止信号）============
@@ -52,6 +53,26 @@ function logTask(taskId: string, level: 'info' | 'warn' | 'error', message: stri
 function progress(taskId: string, progress: number, message: string): void {
   taskRepo.update(taskId, { progress, message });
   emit({ type: 'task:progress', taskId, progress, message });
+}
+
+// 文风指令段(第二十七轮新增): 在 runSkill('write') 前的 prompt 拼接处注入【文风指令】段。
+//   原 SKILL_PROMPTS.write 末尾 L720 只有通用去AI味要求,选什么文风对正文零影响。
+//   现: 在正文 prompt 头部注入【文风指令】段,让 LLM 按文风指令写作(甜宠每章必撒糖/悬疑每章埋揭谜等)。
+//   getToneInstruction 对未知 tone 降级返回正剧指令,保证向后兼容。
+function buildToneInstructionSection(tone?: string): string {
+  const label = tone || '正剧';
+  return `【文风指令】当前文风：${label}\n${getToneInstruction(tone)}\n请严格按此文风指令写作,文风优先级高于通用风格要求但低于剧情忠实度。`;
+}
+
+// 升级2(情感线节点追踪 · CP向作品专用): 当 config.tone 是甜宠/虐恋时,在 prompt 注入提示,
+//   让 LLM 知道本章须产出可被结构化提取的 CP 情感节点(心动/靠近/误解/分离/和好/升华/日常糖/虐点)。
+//   正文写完后 updateStateFromGeneration 会从正文提取 emotionBeats merge 到 state.emotionBeats,
+//   buildDynamicContext 注入【情感线节奏】段(最近5个 beat + 下一章建议),形成节奏闭环。
+//   非 CP 向作品不注入(避免 prompt 膨胀),LLM 自然不输出 emotionBeats,系统跳过 merge。
+const CP_TONES = ['甜宠', '虐恋'];
+function buildEmotionBeatHint(tone?: string): string {
+  if (!tone || !CP_TONES.includes(tone)) return '';
+  return `\n【情感线节点提示 · CP向作品】本文风为${tone},本章须有明确的 CP 情感推进节点(心动/靠近/误解/分离/和好/升华/日常糖/虐点之一)。正文写完后系统会从本章提取 emotionBeats(含 type/characters/desc),请确保本章 CP 互动有可被识别的具体情感节点(动作/对话/心理),而非笼统的"两人互动"。节奏参考上方【情感线节奏】段的下一章建议 beat 类型。`;
 }
 
 // M7：长流式 chunk 累加包装，每 30s 调一次 taskRepo.heartbeat 防 claimNext 误回收
@@ -461,7 +482,10 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
   // oh-story：长篇 >20 章时生成卷级大纲并落库（供 buildDynamicContext 注入【卷级总览】）
   const existingState = stateRepo.get(projectId);
   if (!existingState?.volumeOutlines || existingState.volumeOutlines.length === 0) {
-    const volOutlines = buildVolumeOutlines(chapters.length);
+    // 升级1(卷级伏笔集群填充): 传 existingState.foreshadowing 让卷创建时按 chapterRange 预填
+    //   keyForeshadows(reconcileState/续写场景下 foreshadowing 已有数据时立即可见本卷伏笔集群)。
+    //   首次大纲生成时 foreshadowing 为空 → keyForeshadows 为空数组(正常,后续逐章增量填充)。
+    const volOutlines = buildVolumeOutlines(chapters.length, existingState?.foreshadowing);
     if (volOutlines.length > 0) {
       stateRepo.update(projectId, { volumeOutlines: volOutlines });
       logTask(task.id, 'info', `生成长篇卷纲：${volOutlines.length} 卷`);
@@ -560,7 +584,9 @@ async function runBookPipeline(task: Task, model: string, providerId?: string, w
     //   现: attempt === 0 重写前把 quality.issues 拼到 prompt,LLM 知道要修正什么(字数/人设/伏笔/跑题等)
     // 第二十五轮优化(oh-story 黄金三章纪律 + inkos 开篇约束):
     //   网文黄金三章决定追读留存,前 3 章必须有专用硬约束,不能按普通推进章写
-    let prompt = `${anchor}
+    let prompt = `${buildToneInstructionSection(cfg.config?.tone)}${buildEmotionBeatHint(cfg.config?.tone)}
+
+${anchor}
 
 请写本章正文${positioningHint}。章末钩子：${ch.hook}
 
@@ -928,7 +954,9 @@ async function runShortPipeline(task: Task, model: string, providerId?: string, 
     //   受虐段直白宣泄、反击段冷静审判,允许主角主观审判句/火葬场前瞻预告/剧透勾子。
     //   只删中立无情绪的作者讲解,不删带主角偏色的审判/预告。
     //   短篇段约 800+ 字/节,情绪直给 + 体感焊接,不要写成梗概。
-    let segPrompt = `【短篇叙事姿态】本段属短篇,默认第一人称在场（除非大纲显式第三人称）。允许主角主观审判句、火葬场前瞻预告、剧透勾子;受虐段直白宣泄,反击段冷静审判。只删中立无情绪的作者讲解,保留带主角偏色的审判/预告。情绪直给 + 体感焊接,不要写成梗概。
+    let segPrompt = `${buildToneInstructionSection(cfg.config?.tone)}${buildEmotionBeatHint(cfg.config?.tone)}
+
+【短篇叙事姿态】本段属短篇,默认第一人称在场（除非大纲显式第三人称）。允许主角主观审判句、火葬场前瞻预告、剧透勾子;受虐段直白宣泄,反击段冷静审判。只删中立无情绪的作者讲解,不删带主角偏色的审判/预告。情绪直给 + 体感焊接,不要写成梗概。
 
 【三维度揉进】(oh-story short-craft)每个子事件将"发生/感知/反应"揉进同一段连续正文,子事件合计≥150字,禁止"先写发生再补感知再补反应"的堆叠写法。`;
 

@@ -5,8 +5,9 @@
  * 核心理念：套路 = 确定性的情绪满足
  */
 import { streamComplete, type LLMOptions } from './llm.js';
-import { stateRepo, chapterRepo, genreRepo, projectRepo } from './repos.js';
-import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, CharacterState, ChapterSummary, ChapterPositioning, VolumeOutline, ChapterMemo } from '@shared/types';
+import { stateRepo, chapterRepo, genreRepo, projectRepo, providerRepo } from './repos.js';
+import type { AgentState, GenerateConfig, ChatCompletionMessage, Foreshadow, CharacterState, ChapterSummary, ChapterPositioning, VolumeOutline, ChapterMemo, ProviderKind, EmotionBeat, ConflictLine } from '@shared/types';
+import { getToneInstruction, getToneDensity, getToneDensityHint } from '@shared/tone-presets';
 
 // 题材元信息注入: 反查 genreId 拿 description + emotionMap,拼成 prompt 段
 // 原实现: 主线生成只用 config.genre(label),题材说明/情绪映射完全未注入,LLM 写作风格缺少题材特征引导
@@ -24,6 +25,25 @@ function buildGenreHint(config: GenerateConfig): string {
   if (g.description) parts.push(`题材说明：${g.description}`);
   if (g.emotionMap) parts.push(`核心情绪：${g.emotionMap}`);
   return parts.length ? `\n【题材元信息】\n${parts.join('\n')}` : '';
+}
+
+// 文风指令注入(第二十七轮新增): 原 config.tone 只透传不消费,选什么文风对生成结果零影响。
+//   现: 在 setup/outline/write 三个核心 prompt 阶段注入【文风】段,含 tone label + instruction。
+//   getToneInstruction 对未知 tone(如用户旧数据)降级返回正剧指令,保证向后兼容。
+function buildToneHint(config: GenerateConfig): string {
+  const tone = config.tone;
+  if (!tone) return '';
+  const instruction = getToneInstruction(tone);
+  return `\n【文风】${tone}\n${instruction}`;
+}
+
+// 大纲 Σ 契约密疏点配比建议(根据 tone 的 emotionDensity 调整)
+//   dense  → 密点×3 疏点×2(爽文/恶搞/甜宠/无限流/系统流)
+//   normal → 密点×2 疏点×3(正剧/黑色幽默/虐恋/群像/悬疑)
+//   sparse → 密点×1 疏点×4(慢热/治愈/年代文)
+function buildToneDensityHint(config: GenerateConfig): string {
+  const density = getToneDensity(config.tone);
+  return getToneDensityHint(density);
 }
 
 // 伏笔过期阈值：埋设超过 N 章未回收 → 自动标记 expired（oh-story 状态机）
@@ -324,6 +344,53 @@ export function buildDynamicContext(projectId: string, currentChapterIdx?: numbe
     }).join('\n')}`);
   }
 
+  // 升级2(情感线节奏 · CP向作品专用): 注入最近 5 个 beat + 下一章建议 beat 类型。
+  //   节奏规律: 心动→靠近→日常糖→误解→分离→和好→升华(循环或递进),给 CP 向作品提供节奏锚点。
+  //   state.emotionBeats 为空时跳过(非 CP 向作品不注入,避免 prompt 膨胀)。
+  if (state.emotionBeats && state.emotionBeats.length > 0) {
+    const beats = state.emotionBeats.slice().sort((a, b) => a.idx - b.idx);
+    const recent5 = beats.slice(-5);
+    // 下一章建议 beat 类型: 按节奏规律,取最近 beat 的下一个类型
+    const rhythm: EmotionBeat['type'][] = ['心动', '靠近', '日常糖', '误解', '分离', '和好', '升华'];
+    const lastType = recent5[recent5.length - 1]?.type;
+    const lastIdx = lastType ? rhythm.indexOf(lastType) : -1;
+    const nextSuggest = lastIdx >= 0 && lastIdx < rhythm.length - 1
+      ? rhythm[lastIdx + 1]
+      : (lastIdx === rhythm.length - 1 ? rhythm[2] /* 升华后回日常糖 */ : '心动');
+    const beatsLines = recent5.map(b => `· 第${b.idx + 1}章[${b.type}]${b.characters.length ? `(${b.characters.join('×')})` : ''}：${b.desc}`).join('\n');
+    sections.push(`【情感线节奏 · CP向作品】（最近 ${recent5.length} 个 beat）\n${beatsLines}\n→ 下一章建议 beat 类型:【${nextSuggest}】(节奏规律: 心动→靠近→日常糖→误解→分离→和好→升华,可循环或递进)`);
+  }
+
+  // 升级3(矛盾网状态 · 三层状态机): 注入 active 矛盾 + 最近 3 个 resolved 矛盾(检查 escalatedTo)。
+  //   oh-story: 每解决一个矛盾必须激活或加深另一个,防单元剧化。
+  //   resolved 矛盾若无 escalatedTo → 标【警告: 解决未激活新矛盾,可能单元剧化】硬提醒。
+  //   state.conflictLines 为空时跳过(避免 prompt 膨胀)。
+  if (state.conflictLines && state.conflictLines.length > 0) {
+    const cls = state.conflictLines;
+    const active = cls.filter(c => c.status === 'active');
+    const resolved = cls.filter(c => c.status === 'resolved')
+      .sort((a, b) => (b.resolvedAt ?? 0) - (a.resolvedAt ?? 0))
+      .slice(0, 3);
+    const levelLabel = (lv: string) => lv === 'book' ? '书级' : (lv === 'volume' ? '卷级' : '章级');
+    const lines: string[] = [];
+    if (active.length > 0) {
+      lines.push(`· 当前运行中(active ${active.length} 个):`);
+      for (const c of active.slice(0, 10)) {
+        lines.push(`  - [${levelLabel(c.level)}] ${c.desc}${c.escalatedTo ? `(→升级自 ${c.escalatedTo})` : ''}`);
+      }
+    }
+    if (resolved.length > 0) {
+      lines.push(`· 最近解决(resolved ${resolved.length} 个,检查是否激活新矛盾):`);
+      for (const c of resolved) {
+        const warn = c.escalatedTo ? `(→已激活 ${c.escalatedTo})` : '【警告: 解决未激活新矛盾,可能单元剧化】';
+        lines.push(`  - [${levelLabel(c.level)}] ${c.desc} ${warn}`);
+      }
+    }
+    if (lines.length > 0) {
+      sections.push(`【矛盾网状态 · 三层状态机】\n${lines.join('\n')}\n→ 铁律: 本章若解决矛盾,必须指定 escalatedTo 激活或加深新矛盾,防单元剧化`);
+    }
+  }
+
   if (state.memory) sections.push(`【前情总览记忆】\n${state.memory}`);
   if (state.review) sections.push(`【审稿要点】\n${state.review}`);
   if (state.revision) sections.push(`【修订方向】\n${state.revision}`);
@@ -377,16 +444,24 @@ export async function reconcileState(
 // memo 是结构化字段(硬契约,生成后由 verifyMemoCompliance 规则式硬对账)。
 // 七段: ① 目标 ② 钩子 ③ 伏笔(埋/收/推) ④ 角色弧线 ⑤ 字数预算 ⑥ 情绪强度 ⑦ 承接要点
 //
-// 持久化说明: AgentState.chapterMemos 是逻辑字段(任务要求新增)。
-// agent_state 表无 chapter_memos 列(任务约束 DB schema 不变 + 只改 3 个文件),
-// 故此处用模块级 Map 作为物理存储(进程内有效,重启后丢失 - 可接受,memo 是补充非替代,
-// 重启续写时 reconcileState 会补全章节摘要,下一章重新生成 memo 即可)。
-// upsertChapterMemo 同步调 stateRepo.update 透传 chapterMemos(当前为 DB 持久化空操作,
-// 若未来 agent_state 加 chapter_memos_json 列则自动落库,无需改 daemon.ts)。
+// 持久化说明: AgentState.chapterMemos 落库到 agent_state.chapter_memos_json(db.ts SCHEMA + migrateLegacySchema)。
+// stateRepo.update 序列化 chapterMemos 写入该列,rowToState 反序列化回填。
+// 此处模块级 Map 作为热缓存: getChapterMemos 优先读内存,miss(如重启后首次访问)时从 stateRepo.get
+// 回填内存 Map。upsertChapterMemo 写内存 + 透传 stateRepo.update 落库,重启后不丢失。
 const _chapterMemosByProject = new Map<string, ChapterMemo[]>();
 
 export function getChapterMemos(projectId: string): ChapterMemo[] {
-  return _chapterMemosByProject.get(projectId) || [];
+  const cached = _chapterMemosByProject.get(projectId);
+  if (cached) return cached;
+  // 热缓存 miss(如重启后首次访问): 从 stateRepo.get 读已落库的 chapterMemos 回填内存 Map
+  try {
+    const fromDb = stateRepo.get(projectId)?.chapterMemos;
+    if (fromDb && fromDb.length > 0) {
+      _chapterMemosByProject.set(projectId, fromDb);
+      return fromDb;
+    }
+  } catch { /* 忽略,不影响主流程 */ }
+  return [];
 }
 
 export function getChapterMemo(projectId: string, idx: number): ChapterMemo | undefined {
@@ -397,7 +472,7 @@ export function upsertChapterMemo(projectId: string, memo: ChapterMemo): Chapter
   const cur = _chapterMemosByProject.get(projectId) || [];
   const updated = [...cur.filter(m => m.idx !== memo.idx), memo];
   _chapterMemosByProject.set(projectId, updated);
-  // 透传到 state.chapterMemos(逻辑字段,当前 DB 无对应列,此调用为空操作但保留以兼容未来 schema 扩展)
+  // 落库到 agent_state.chapter_memos_json,重启后 getChapterMemos 从 stateRepo.get 回填内存
   try { stateRepo.update(projectId, { chapterMemos: updated }); } catch { /* 忽略,不影响主流程 */ }
   return updated;
 }
@@ -644,7 +719,13 @@ ${prevTail}
 【核心冲突节奏保护】（oh-story 三规则）
 · 非大结局章节(第 ${currentIdx + 1}/${totalChapters})禁止彻底解决全书核心冲突,只能推进或转折
 · 章末 200 字必须包含悬念元素(钩子/未解问题/新威胁),不得平淡收尾
-· 局部胜利必须伴随新的代价或风险(打赢了但暴露身份/获得宝物但引来强敌),不得纯爽收`;
+· 局部胜利必须伴随新的代价或风险(打赢了但暴露身份/获得宝物但引来强敌),不得纯爽收
+
+【矛盾网三层状态机】（oh-story: 章级/卷级/书级矛盾同时运行,防单元剧化）
+· 本章若引入新矛盾: 在正文写出矛盾的对立双方 + 矛盾层级(章级/卷级/书级)
+· 本章若解决矛盾: 必须激活或加深另一个矛盾(escalatedTo),禁止"解决一个矛盾后无后续"的单元剧式收尾
+· 三层矛盾须同时运行: 章级矛盾本章解决,卷级/书级矛盾持续推进,不得只写章级矛盾忽视长线
+· 正文写完后,系统会提取本章 conflictLines 状态变化(见状态更新 prompt)`;
 }
 
 // 构建最近章节记忆（防止上下文过长，仅取最近 N 章摘要）
@@ -820,7 +901,7 @@ export async function generateSetup(opts: {
   const prompt = `请为以下作品生成「世界观设定」与「角色档案」，供后续大纲与正文创作参考。
 
 【核心创意】${idea}
-【题材风格】${config.genre}${buildGenreHint(config)}
+【题材风格】${config.genre}${buildGenreHint(config)}${buildToneHint(config)}
 【主要角色（用户提供）】${config.characters || '（未指定，请自行设计主角 + 对手 + 关键配角）'}
 【钩子风格】${config.hookStyle}
 【节奏要求】${config.pace}
@@ -843,7 +924,15 @@ ${scanInsight ? `【扫榜洞察】\n${scanInsight}` : ''}
 - 能力：xxx（关键能力/资源/缺陷）
 - 弧线：xxx（V形/递进/延迟满足等 + 拐点说明）
 - 关系：xxx（与谁有恩怨/师徒/情愫等）
-（角色之间用空行分隔）`;
+（角色之间用空行分隔）
+
+【文风基因注入要求】世界观与角色档案须自带上方【文风】基因：
+- 甜宠/虐恋风：角色档案须显式标注 CP 关系（暧昧/情愫/对立吸引）、误会根源或情感纠葛
+- 群像风：须含 2-3 个并列主角与势力关系图，无绝对主角
+- 悬疑风：世界观须含 1-2 个待解谜题钩子，角色档案可含秘密/动机
+- 系统流风：世界观须含系统规则（签到/任务/奖励体系），金手指依托系统
+- 年代文风：世界观须含具体年代(70-90 年代)与时代符号（粮票/供销社等），金手指受限
+- 恶搞风：角色档案可自带喜感标签与吐槽属性`;
 
   const ctxPrompt = buildContextPrompt(projectId);
   const systemStable = ctxPrompt
@@ -886,6 +975,27 @@ export interface ChapterQualityResult {
   needRewrite: boolean;
   issues: string[];       // 命中的问题列表（用于日志和反馈）
   score: number;          // 0-1 综合评分
+}
+
+// tokenCharRatio: 质检 maxTokens 适配国产模型(与 daemon.ts 同名函数同逻辑)
+// 国产模型(deepseek/qwen/glm 等)中文 1 字≈1.5 token,OpenAI 系≈1.2,未知保守 1.5
+// 缓存避免长篇循环内反复查 provider 表
+const _tokenRatioCache = new Map<string, number>();
+function tokenCharRatio(providerId?: string): number {
+  if (!providerId) return 1.5;
+  const cached = _tokenRatioCache.get(providerId);
+  if (cached !== undefined) return cached;
+  const provider = providerRepo.get(providerId);
+  let ratio = 1.5;
+  if (provider) {
+    const CN_KINDS: ProviderKind[] = ['deepseek', 'qwen', 'glm', 'doubao', 'kimi', 'hunyuan', 'ernie'];
+    const LIGHT_KINDS: ProviderKind[] = ['openai', 'anthropic', 'gemini', 'kilo'];
+    if (CN_KINDS.includes(provider.kind)) ratio = 1.5;
+    else if (LIGHT_KINDS.includes(provider.kind)) ratio = 1.2;
+    else ratio = 1.5;
+  }
+  _tokenRatioCache.set(providerId, ratio);
+  return ratio;
 }
 export async function checkChapterQuality(opts: {
   projectId: string;
@@ -1114,7 +1224,7 @@ ${content.slice(0, 1500)}
       const { complete } = await import('./llm.js');
       const { text } = await complete({
         providerId, model, messages, systemStable, projectId,
-        temperature: 0.3, maxTokens: 256,  // 质检只需短输出，省 token
+        temperature: 0.3, maxTokens: Math.round(384 * tokenCharRatio(providerId)),  // 质检只需短输出，省 token；384 基础值×tokenCharRatio 适配国产模型避免 JSON 截断
       });
       const match = text.match(/\{[\s\S]*\}/);
       if (match) {
@@ -1191,16 +1301,37 @@ function computeVolumeRanges(chapterCount: number): { range: [number, number]; e
 
 // 构建卷级大纲（oh-story 三层结构之卷纲）：长篇 >20 章时生成分卷，每卷带情绪弧线
 // 落库到 state.volumeOutlines，供 buildDynamicContext 注入【卷级总览】
-export function buildVolumeOutlines(chapterCount: number): VolumeOutline[] {
+//
+// 升级1(卷级伏笔集群填充): 原 keyForeshadows 创建时为空,完全依赖 updateStateFromGeneration
+//   事后增量填充。问题: 首次大纲生成后 LLM 在 buildDynamicContext 看不到本卷伏笔规划;
+//   reconcileState/续写场景下 foreshadowing 已有数据时,卷创建时仍是空的,要等逐章回填才补全。
+//   现: 接受可选 foreshadowing 参数,卷创建时按 chapterRange 预填:
+//     · plantedAt 落在本卷的伏笔(埋设来源) → 加入该卷 keyForeshadows
+//     · expectedRecycleAt 落在本卷的伏笔(预计回收规划) → 加入该卷 keyForeshadows
+//   首次大纲生成时 foreshadowing 为空 → keyForeshadows 为空数组(正常,后续逐章增量填充)
+//   reconcileState/续写时 foreshadowing 已有数据 → 创建即预填,LLM 立即可见本卷伏笔集群
+export function buildVolumeOutlines(chapterCount: number, foreshadowing?: Foreshadow[]): VolumeOutline[] {
   const ranges = computeVolumeRanges(chapterCount);
-  return ranges.map((v, i) => ({
-    idx: i,
-    title: `第${i + 1}卷`,
-    premise: i === 0 ? '开篇立人设、抛核心冲突与主线伏笔' : (i === ranges.length - 1 ? '终局决战、回收所有主线伏笔、收束情绪弧线' : '中段推进、新伏笔集群、关系深化'),
-    emotionArc: v.emotionArc,
-    chapterRange: v.range,
-    keyForeshadows: [], // 由 updateStateFromGeneration 在每章后动态填充
-  }));
+  const fs = foreshadowing || [];
+  return ranges.map((v, i) => {
+    const [start, end] = v.range;
+    // 收集本卷伏笔: plantedAt 落在本卷(埋设来源) + expectedRecycleAt 落在本卷(回收规划)
+    const volKfs = new Set<string>();
+    for (const f of fs) {
+      const plantedInVol = f.plantedAt >= start && f.plantedAt <= end;
+      const recycleInVol = typeof f.expectedRecycleAt === 'number'
+        && f.expectedRecycleAt >= start && f.expectedRecycleAt <= end;
+      if (plantedInVol || recycleInVol) volKfs.add(f.desc);
+    }
+    return {
+      idx: i,
+      title: `第${i + 1}卷`,
+      premise: i === 0 ? '开篇立人设、抛核心冲突与主线伏笔' : (i === ranges.length - 1 ? '终局决战、回收所有主线伏笔、收束情绪弧线' : '中段推进、新伏笔集群、关系深化'),
+      emotionArc: v.emotionArc,
+      chapterRange: v.range,
+      keyForeshadows: [...volKfs], // 预填: 来自 state.foreshadowing 的本卷伏笔集群(后续 updateStateFromGeneration 增量补充)
+    };
+  });
 }
 
 // H6 修复(第十四轮): 远期卷摘要真压缩
@@ -1324,7 +1455,7 @@ async function generateOutlineForVolume(opts: {
   const prompt = `请为以下小说生成「第 ${volIndex + 1} 卷」的细纲（本卷共 ${volChapterCount} 章，每章约 ${chapterWordMin}-${chapterWordMax} 字；全书第 ${globalStartIdx + 1}-${globalStartIdx + volChapterCount} 章；全书共 ${volTotal} 卷）。
 
 【核心创意】${idea}
-【题材风格】${config.genre}${buildGenreHint(config)}
+【题材风格】${config.genre}${buildGenreHint(config)}${buildToneHint(config)}
 【主要角色】${config.characters}
 【钩子风格】${config.hookStyle}
 【节奏要求】${config.pace}
@@ -1344,6 +1475,7 @@ ${distLine}
 - 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
 - positioning 分布严格符合上方约束
 - 【字数预算Σ契约】(oh-story v0.6.19):每章大纲 outline 末尾标注本章情节点密/疏配比,如"密点×2(爽点/反转,各≥250字) + 疏点×3(过场,各≈40字)";密点展开写、疏点带过,Σ 落在[${chapterWordMin}, ${chapterWordMax}]内
+- 【文风密度配比】当前文风为「${config.tone || '正剧'}」,按其 emotionDensity 调整每章密疏点配比建议：${buildToneDensityHint(config)}(示例配比,可按章节定位微调,但总体倾向须符合文风)
 - 【黄金三章】第1章大纲必须 800 字内触发主线冲突且前 300 字最后一句反转;第2章金手指"做出来";第3章锁定可量化短期目标
 - 【矛盾网三层】全书保持 2-3 条矛盾线同时运行(章级 2-3 章解决/卷级卷末解决/书级大结局解决),每次解决一个矛盾必须激活或加深另一个
 - 只输出 JSON，不要其他文字`;
@@ -1433,7 +1565,7 @@ export async function generateOutline(opts: {
     const prompt = `请为以下小说生成细纲（共 ${chapterCount} 章，每章约 ${chapterWordMin}-${chapterWordMax} 字）。
 
 【核心创意】${idea}
-【题材风格】${config.genre}${buildGenreHint(config)}
+【题材风格】${config.genre}${buildGenreHint(config)}${buildToneHint(config)}
 【主要角色】${config.characters}
 【钩子风格】${config.hookStyle}
 【节奏要求】${config.pace}
@@ -1450,6 +1582,7 @@ ${distLine}
 - 伏笔与回收交织（标 positioning=relationship 的章必须回收至少 1 个前文伏笔）
 - positioning 分布严格符合上方约束
 - 【字数预算Σ契约】(oh-story v0.6.19):每章大纲 outline 末尾标注本章情节点密/疏配比,如"密点×2(爽点/反转,各≥250字) + 疏点×3(过场,各≈40字)";密点展开写、疏点带过,Σ 落在[${chapterWordMin}, ${chapterWordMax}]内
+- 【文风密度配比】当前文风为「${config.tone || '正剧'}」,按其 emotionDensity 调整每章密疏点配比建议：${buildToneDensityHint(config)}(示例配比,可按章节定位微调,但总体倾向须符合文风)
 - 【黄金三章】第1章大纲必须 800 字内触发主线冲突且前 300 字最后一句反转;第2章金手指"做出来";第3章锁定可量化短期目标
 - 【矛盾网三层】全书保持 2-3 条矛盾线同时运行(章级 2-3 章解决/卷级卷末解决/书级大结局解决),每次解决一个矛盾必须激活或加深另一个
 - 只输出 JSON，不要其他文字`;
@@ -1866,8 +1999,11 @@ ${pendingList || '（无）'}
   "newForeshadows": [{"desc": "本章新埋设的伏笔描述", "plantedAt": ${target.orderIdx}, "importance": "high|mid|low", "expectedRecycleAt": 预计回收章序号(主线伏笔建议 ${target.orderIdx + 5}-${target.orderIdx + 15} 章后回收,支线 ${target.orderIdx + 3}-${target.orderIdx + 8} 章,长线伏笔可设 ${target.orderIdx + 20}-${target.orderIdx + 30} 章或 null)}],
   "paidForeshadowDescs": ["本章回收的伏笔描述（尽量匹配已有伏笔的 desc 原文,允许小幅出入）"],
   "characterState": [{"name": "角色名", "location": "当前所在", "mood": "情绪状态", "relationships": "与他人当前关系"}],
+  "emotionBeats": [{"type": "心动|靠近|误解|分离|和好|升华|日常糖|虐点", "characters": ["CP角色名1","CP角色名2"], "desc": "本章情感节点描述(8-30字)"}],
+  "conflictLines": [{"id": "c-{章节}-{序号}", "desc": "本章矛盾描述", "level": "chapter|volume|book", "status": "active|resolved|escalated", "introducedAt": 引入章序号, "resolvedAt": 解决章序号(仅resolved填), "escalatedTo": "升级到的矛盾id(解决一个矛盾必须激活或加深另一个,防单元剧化)"}],
   "memory": "更新后的全局记忆（已发生关键事件+伏笔+待回收点），200 字内"
-}`;
+}
+注意:emotionBeats/conflictLines 为可选字段,本章确有情感节点/矛盾状态变化时才输出,无则省略或输出空数组。CP向作品(甜宠/虐恋)优先输出 emotionBeats;所有题材都应输出 conflictLines(若本章有矛盾引入/解决/升级)。`;
   // M7 修复(第十四轮): expectedRecycleAt 加预算引导 + paidForeshadowDescs 允许小幅出入
   // 原: prompt 仅说"预计回收章序号或null",LLM 不知该填多少 → 经常不填或乱填
   //   → 过期检测失效(无 expectedRecycleAt 时只能用统一容忍期,主线/支线不分级)
@@ -2081,11 +2217,69 @@ ${pendingList || '（无）'}
       }
     }
 
+    // 升级2(情感线节点追踪): 解析 LLM 返回的 emotionBeats(CP向作品),merge 到 state.emotionBeats
+    //   LLM 不返回时跳过(非 CP 向作品不强制)。try/catch 容错,字段缺失/类型错不阻断主流程。
+    //   merge 策略: 按 idx 去重(同章覆盖),保留旧 beat 保留新 beat 推进。
+    let emotionBeats = [...(state?.emotionBeats || [])];
+    try {
+      if (Array.isArray(parsed.emotionBeats) && parsed.emotionBeats.length > 0) {
+        const validTypes = ['心动', '靠近', '误解', '分离', '和好', '升华', '日常糖', '虐点'];
+        const newBeats: EmotionBeat[] = [];
+        for (const eb of parsed.emotionBeats) {
+          if (!eb || typeof eb !== 'object') continue;
+          const type = validTypes.includes(eb.type) ? eb.type : '日常糖';
+          const characters = Array.isArray(eb.characters)
+            ? eb.characters.filter((c: any) => typeof c === 'string').map((c: string) => c.slice(0, 20)).slice(0, 4)
+            : [];
+          const desc = String(eb.desc || '').slice(0, 80);
+          if (!desc) continue;
+          newBeats.push({ idx: target.orderIdx, type, characters, desc });
+        }
+        if (newBeats.length > 0) {
+          // 按 idx 去重: 同章旧 beat 移除,新 beat 追加(保留其他章节)
+          const otherBeats = emotionBeats.filter(b => b.idx !== target.orderIdx);
+          emotionBeats = [...otherBeats, ...newBeats];
+          // 防御: 超过 200 个时裁剪保留末尾 200 个(最近 beat 优先)
+          if (emotionBeats.length > 200) emotionBeats = emotionBeats.slice(-200);
+        }
+      }
+    } catch { /* 容错: emotionBeats 解析失败不阻断状态更新 */ }
+
+    // 升级3(矛盾网三层状态机): 解析 LLM 返回的 conflictLines,merge 到 state.conflictLines
+    //   LLM 不返回时跳过。try/catch 容错。merge 策略: 按 id 去重(同 id 覆盖状态)。
+    let conflictLines = [...(state?.conflictLines || [])];
+    try {
+      if (Array.isArray(parsed.conflictLines) && parsed.conflictLines.length > 0) {
+        const validLevels = ['chapter', 'volume', 'book'];
+        const validStatuses = ['active', 'resolved', 'escalated'];
+        for (const cl of parsed.conflictLines) {
+          if (!cl || typeof cl !== 'object') continue;
+          const id = String(cl.id || `c-${target.orderIdx}-${conflictLines.length}`).slice(0, 40);
+          const desc = String(cl.desc || '').slice(0, 120);
+          if (!desc) continue;
+          const level = validLevels.includes(cl.level) ? cl.level : 'chapter';
+          const status = validStatuses.includes(cl.status) ? cl.status : 'active';
+          const introducedAt = typeof cl.introducedAt === 'number' ? cl.introducedAt : target.orderIdx;
+          const resolvedAt = typeof cl.resolvedAt === 'number' ? cl.resolvedAt : undefined;
+          const escalatedTo = typeof cl.escalatedTo === 'string' && cl.escalatedTo ? String(cl.escalatedTo).slice(0, 40) : undefined;
+          // 按 id 去重覆盖(状态从 active→resolved/escalated 时更新)
+          const existing = conflictLines.findIndex(c => c.id === id);
+          const newCl: ConflictLine = { id, desc, level, status, introducedAt, ...(resolvedAt !== undefined ? { resolvedAt } : {}), ...(escalatedTo !== undefined ? { escalatedTo } : {}) };
+          if (existing >= 0) conflictLines[existing] = newCl;
+          else conflictLines.push(newCl);
+        }
+        // 防御: 超过 100 个时裁剪保留末尾 100 个(活跃矛盾优先)
+        if (conflictLines.length > 100) conflictLines = conflictLines.slice(-100);
+      }
+    } catch { /* 容错: conflictLines 解析失败不阻断状态更新 */ }
+
     stateRepo.update(projectId, {
       chapterSummaries: summaries,
       foreshadowing,
       characterState,
       volumeOutlines,
+      emotionBeats,
+      conflictLines,
       memory: parsed.memory ? String(parsed.memory).slice(0, 600) : (state?.memory || ''),
     });
     return { issues };

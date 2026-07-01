@@ -28,6 +28,10 @@ export function createContinueTask(projectId: string, webSearch?: boolean, model
   // H2 修复(第二十轮): 同项目已有 queued/running book/short 任务时拒绝二次派发
   // 防 Studio 工作台 daemon_create 意图重复触发 + 用户 Generate 页手动重复派发 → 多 task 串行覆盖章节
   // 返回特殊标记 { duplicate: true } 让调用方(chat 路由)区分"项目不存在"和"已存在任务"
+  // P1 修复(BUG2)说明: 这里把非 short(含 script)统一当 book 处理。
+  //   script 剧本类型无专用 pipeline,本应输出剧本却输出小说(半实现陷阱)。
+  //   现已在前端移除"剧本"选项 + projects.ts 创建路由禁止 type='script',
+  //   故正常流程不会出现 script 项目;此处保持现状兜底,避免历史 script 项目续写时 500。
   const kind: GenerateKind = project.type === 'short' ? 'short' : 'book';
   const dup = taskRepo.list(projectId).some(t =>
     (t.type === 'book' || t.type === 'short') && (t.status === 'queued' || t.status === 'running'));

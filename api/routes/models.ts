@@ -69,8 +69,12 @@ router.delete('/providers/:id', (req: Request, res: Response) => {
 });
 
 router.post('/providers/:id/test', async (req: Request, res: Response) => {
-  const result = await testProvider(req.params.id);
-  ok(res, result);
+  try {
+    const result = await testProvider(req.params.id);
+    ok(res, result);
+  } catch (e) {
+    fail(res, 'INTERNAL', (e as Error).message, 500);
+  }
 });
 
 router.post('/providers/:id/default', (req: Request, res: Response) => {
@@ -80,22 +84,30 @@ router.post('/providers/:id/default', (req: Request, res: Response) => {
 
 // 余额查询（仅 DeepSeek / Kimi 提供接口，其余返回说明）
 router.get('/providers/:id/balance', async (req: Request, res: Response) => {
-  const result = await getBalance(req.params.id);
-  ok(res, result);
+  try {
+    const result = await getBalance(req.params.id);
+    ok(res, result);
+  } catch (e) {
+    fail(res, 'INTERNAL', (e as Error).message, 500);
+  }
 });
 
 // 拉取远端可用模型列表（写入 provider.models）
 router.post('/providers/:id/fetch-models', async (req: Request, res: Response) => {
-  const provider = providerRepo.get(req.params.id);
-  if (!provider) return fail(res, 'NOT_FOUND', '提供商不存在', 404);
-  const result = await listAvailableModels(req.params.id);
-  if (!result.ok || result.models.length === 0) {
-    return ok(res, { ok: false, models: provider.models, message: result.message || '未拉取到模型' });
+  try {
+    const provider = providerRepo.get(req.params.id);
+    if (!provider) return fail(res, 'NOT_FOUND', '提供商不存在', 404);
+    const result = await listAvailableModels(req.params.id);
+    if (!result.ok || result.models.length === 0) {
+      return ok(res, { ok: false, models: provider.models, message: result.message || '未拉取到模型' });
+    }
+    // 合并去重后写回
+    const merged = Array.from(new Set([...result.models, ...provider.models]));
+    const updated = providerRepo.update(req.params.id, { models: merged });
+    ok(res, { ok: true, models: merged, fetched: result.models.length, provider: updated });
+  } catch (e) {
+    fail(res, 'INTERNAL', (e as Error).message, 500);
   }
-  // 合并去重后写回
-  const merged = Array.from(new Set([...result.models, ...provider.models]));
-  const updated = providerRepo.update(req.params.id, { models: merged });
-  ok(res, { ok: true, models: merged, fetched: result.models.length, provider: updated });
 });
 
 router.get('/', (_req: Request, res: Response) => ok(res, listModels()));

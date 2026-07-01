@@ -17,19 +17,32 @@ export function exportProject(req: { projectId: string; format: ExportFormat; ch
     chapters = filterChapters(chapters, req.chapterRange);
   }
 
-  const ext = req.format === 'markdown' ? 'md' : req.format === 'epub' ? 'html' : req.format === 'docx' ? 'html' : 'txt';
+  // P1 修复(BUG1): 名实不符 —— 原代码 epub/docx 都映射成 'html' 扩展名 + toHtml 内容,
+  //   用户导出 EPUB 后阅读器无法识别(实际是 HTML 文件)。短期不引入 epub-gen/docx 重依赖,
+  //   改为诚实标注:
+  //   - epub → 扩展名 .html(网页版),format 字段存 'html'(诚实),UI 标注"网页版HTML"
+  //   - docx → 扩展名 .doc(Word 可打开的 HTML),format 字段存 'docx',UI 标注"Word兼容"
+  //   不再让用户误以为拿到的是真正的 .epub 实际却是 HTML。
+  const ext = req.format === 'markdown' ? 'md'
+    : (req.format === 'epub' || req.format === 'html') ? 'html'
+    : req.format === 'docx' ? 'doc'
+    : 'txt';
   const fileName = `${sanitize(project.title)}_${Date.now()}.${ext}`;
   const filePath = path.join(EXPORT_DIR, fileName);
 
   let content: string;
   switch (req.format) {
     case 'markdown': content = toMarkdown(project, chapters); break;
+    case 'html':
     case 'epub':
     case 'docx':
       content = toHtml(project, chapters); break;
     case 'txt':
     default: content = toTxt(project, chapters); break;
   }
+
+  // 诚实标注实际产出的格式: epub 请求 → 记录为 'html'(实际就是网页版 HTML)
+  const storedFormat: ExportFormat = req.format === 'epub' ? 'html' : req.format;
 
   // 第二十二轮修复(M后端): writeFileSync 失败时清理磁盘残留文件
   //   原 bug: writeFileSync 不在 try/catch/finally 中,磁盘满/权限/路径过长时:
@@ -38,7 +51,7 @@ export function exportProject(req: { projectId: string; format: ExportFormat; ch
   //   现: 失败时主动 unlink 已部分写入的文件,避免 EXPORT_DIR 累积垃圾
   try {
     fs.writeFileSync(filePath, content, 'utf-8');
-    exportRepo.create({ projectId: req.projectId, format: req.format, chapterRange: req.chapterRange || '', filePath });
+    exportRepo.create({ projectId: req.projectId, format: storedFormat, chapterRange: req.chapterRange || '', filePath });
   } catch (e) {
     try {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);

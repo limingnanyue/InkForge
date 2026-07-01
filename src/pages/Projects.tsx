@@ -238,7 +238,7 @@ function CreateModal({ open, onClose, onCreated }: { open: boolean; onClose: () 
             <select className="input" value={type} onChange={e => setType(e.target.value as ProjectType)}>
               <option value="long">长篇</option>
               <option value="short">短篇</option>
-              <option value="script">剧本</option>
+              {/* P1 修复(BUG2): 移除"剧本"选项 —— script 类型无专用 pipeline,会被当 book 处理输出小说,已禁用创建 */}
             </select>
           </Field>
           <Field label="目标字数">
